@@ -1,0 +1,128 @@
+//+------------------------------------------------------------------+
+//| Grid Trader Simplificado                                        |
+//+------------------------------------------------------------------+
+#property copyright "Manus Agent"
+#property link      ""
+#property version   "1.00"
+#include <Trade\Trade.mqh>
+
+//--- Parâmetros básicos
+input double GridSize = 20;           // Tamanho da grade em pips
+input int GridLevels = 5;             // Níveis acima/abaixo
+input double InitialLotSize = 0.01;   // Tamanho inicial do lote
+input double LotMultiplier = 1.0;     // Multiplicador de lote
+input int MaximumOrders = 10;         // Máximo de ordens por direção
+input int TradingHoursStart = 0;      // Início do horário de trading
+input int TradingHoursEnd = 24;       // Fim do horário de trading
+
+//--- Variáveis globais
+double g_point;
+int g_digits;
+CTrade trade;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   g_digits = _Digits;
+   g_point = _Point;
+   if (g_digits == 3 || g_digits == 5)
+      g_point *= 10;
+   
+   PlaceInitialOrders();
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // Limpeza básica
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if (!IsTradeAllowed())
+      return;
+   
+   CheckAndReplaceOrders();
+}
+
+//+------------------------------------------------------------------+
+//| Colocar ordens iniciais                                          |
+//+------------------------------------------------------------------+
+void PlaceInitialOrders()
+{
+   double centerPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double gridSizeAdjusted = GridSize * g_point;
+   
+   for(int i=1; i<=GridLevels; i++)
+   {
+      double buyPrice = NormalizeDouble(centerPrice - (i * gridSizeAdjusted), g_digits);
+      double sellPrice = NormalizeDouble(centerPrice + (i * gridSizeAdjusted), g_digits);
+      
+      double lotSize = NormalizeDouble(InitialLotSize * MathPow(LotMultiplier, i-1), 2);
+      
+      trade.BuyLimit(lotSize, buyPrice, _Symbol, 0, 0, ORDER_TIME_GTC);
+      trade.SellLimit(lotSize, sellPrice, _Symbol, 0, 0, ORDER_TIME_GTC);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Verificar e repor ordens                                         |
+//+------------------------------------------------------------------+
+void CheckAndReplaceOrders()
+{
+   for(int i=OrdersTotal()-1; i>=0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(OrderSelect(ticket))
+      {
+         if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+            continue;
+         
+         // Reposicionar ordens que foram executadas ou canceladas
+         if(OrderGetInteger(ORDER_STATE) == ORDER_STATE_CANCELED ||
+            OrderGetInteger(ORDER_STATE) == ORDER_STATE_FILLED)
+         {
+            double price = OrderGetDouble(ORDER_PRICE_OPEN);
+            double lotSize = OrderGetDouble(ORDER_VOLUME_INITIAL);
+            ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            
+            if(type == ORDER_TYPE_BUY_LIMIT)
+               trade.BuyLimit(lotSize, price, _Symbol, 0, 0, ORDER_TIME_GTC);
+            else if(type == ORDER_TYPE_SELL_LIMIT)
+               trade.SellLimit(lotSize, price, _Symbol, 0, 0, ORDER_TIME_GTC);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Verificar horário de trading                                     |
+//+------------------------------------------------------------------+
+bool IsTradeAllowed()
+{
+   MqlDateTime time;
+   TimeCurrent(time);
+   
+   int currentHour = time.hour;
+   
+   if(TradingHoursStart <= TradingHoursEnd)
+   {
+      if(currentHour < TradingHoursStart || currentHour >= TradingHoursEnd)
+         return false;
+   }
+   else
+   {
+      if(currentHour < TradingHoursStart && currentHour >= TradingHoursEnd)
+         return false;
+   }
+   
+   return true;
+}
