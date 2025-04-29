@@ -1,0 +1,234 @@
+// Grid Trader EA - Versão Revisada e Otimizada
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\OrderInfo.mqh>
+
+CTrade trade;
+CPositionInfo positionInfo;
+COrderInfo orderInfo;
+
+// Parâmetros de entrada
+input double InitialPrice = 0; // Preço inicial (0 = preço atual)
+input int GridLevels = 10; // Número de níveis da grade
+input double GridSize = 20; // Tamanho da grade em pips
+input bool UseExponentialGrid = false; // Usar grade exponencial
+input double GridExponent = 1.5; // Expoente para grade exponencial (>1)
+input bool UseAsymmetricGrid = false; // Usar grade assimétrica
+input double BuyGridMultiplier = 1.0; // Multiplicador para níveis de compra
+input double SellGridMultiplier = 1.0; // Multiplicador para níveis de venda
+input double RiskPercent = 1.0; // Risco em porcentagem do saldo (0 = usar lote fixo)
+input double InitialLotSize = 0.01; // Tamanho do lote inicial (usado se RiskPercent=0)
+input double LotMultiplier = 1.0; // Multiplicador para níveis subsequentes
+input double MaximumLotSize = 10.0; // Tamanho máximo de lote permitido
+input double TakeProfit = 0; // Take Profit em pips (0 = desativado)
+input double StopLoss = 0; // Stop Loss em pips (0 = desativado)
+input double TrailingStopDistance = 20; // Distância do trailing stop em pips
+input bool UseTrailingStop = false; // Usar trailing stop
+input double MaxDrawdownPercent = 20; // Percentual máximo de drawdown
+
+// Variáveis globais
+double g_initialBalance = 0;
+double g_point = 0;
+int g_digits = 0;
+double g_buyLevels[];
+double g_sellLevels[];
+ulong g_ticket_buy[];
+ulong g_ticket_sell[];
+int g_totalBuyOrders = 0;
+int g_totalSellOrders = 0;
+
+// Inicialização
+int OnInit() {
+    g_initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    g_point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    g_digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+    ArrayResize(g_buyLevels, GridLevels);
+    ArrayResize(g_sellLevels, GridLevels);
+    ArrayResize(g_ticket_buy, GridLevels);
+    ArrayResize(g_ticket_sell, GridLevels);
+
+    CalculateGridLevels();
+    PlaceInitialOrders();
+    return INIT_SUCCEEDED;
+}
+
+// Desinicialização
+void OnDeinit(const int reason) {
+    CloseAllOrders();
+    ArrayFree(g_buyLevels);
+    ArrayFree(g_sellLevels);
+    ArrayFree(g_ticket_buy);
+    ArrayFree(g_ticket_sell);
+}
+
+// Loop principal
+void OnTick() {
+    CheckAndReplaceOrders();
+    ApplyTrailingStop();
+    DisplayInfo();
+}
+
+// Calcular os níveis da grade
+void CalculateGridLevels() {
+    double centerPrice = InitialPrice > 0 ? InitialPrice : (SymbolInfoDouble(_Symbol, SYMBOL_ASK) + SymbolInfoDouble(_Symbol, SYMBOL_BID)) / 2;
+
+    for (int i = 0; i < GridLevels; i++) {
+        if (UseExponentialGrid) {
+            g_buyLevels[i] = NormalizeDouble(centerPrice - GridSize * MathPow(i + 1, GridExponent) * g_point, g_digits);
+            g_sellLevels[i] = NormalizeDouble(centerPrice + GridSize * MathPow(i + 1, GridExponent) * g_point, g_digits);
+        } else {
+            g_buyLevels[i] = NormalizeDouble(centerPrice - GridSize * (i + 1) * g_point, g_digits);
+            g_sellLevels[i] = NormalizeDouble(centerPrice + GridSize * (i + 1) * g_point, g_digits);
+        }
+
+        if (UseAsymmetricGrid) {
+            g_buyLevels[i] *= BuyGridMultiplier;
+            g_sellLevels[i] *= SellGridMultiplier;
+        }
+    }
+}
+
+// Colocar ordens iniciais
+void PlaceInitialOrders() {
+    for (int i = 0; i < GridLevels; i++) {
+        double lotSize = CalculateLotSize(i);
+        PlaceBuyOrder(g_buyLevels[i], lotSize);
+        PlaceSellOrder(g_sellLevels[i], lotSize);
+    }
+}
+
+// Colocar ordem de compra
+void PlaceBuyOrder(double price, double lotSize) {
+    double sl = StopLoss > 0 ? NormalizeDouble(price - StopLoss * g_point, g_digits) : 0;
+    double tp = TakeProfit > 0 ? NormalizeDouble(price + TakeProfit * g_point, g_digits) : 0;
+
+    if (trade.BuyLimit(lotSize, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "Grid EA Buy") == TRADE_RETCODE_DONE) {
+        g_ticket_buy[g_totalBuyOrders++] = trade.ResultOrder();
+        LogMessage("Ordem de compra colocada em " + DoubleToString(price, g_digits) + " com lote " + DoubleToString(lotSize, 2));
+    } else {
+        LogMessage("Erro ao colocar ordem de compra: " + trade.ResultComment());
+    }
+}
+
+// Colocar ordem de venda
+void PlaceSellOrder(double price, double lotSize) {
+    double sl = StopLoss > 0 ? NormalizeDouble(price + StopLoss * g_point, g_digits) : 0;
+    double tp = TakeProfit > 0 ? NormalizeDouble(price - TakeProfit * g_point, g_digits) : 0;
+
+    if (trade.SellLimit(lotSize, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "Grid EA Sell") == TRADE_RETCODE_DONE) {
+        g_ticket_sell[g_totalSellOrders++] = trade.ResultOrder();
+        LogMessage("Ordem de venda colocada em " + DoubleToString(price, g_digits) + " com lote " + DoubleToString(lotSize, 2));
+    } else {
+        LogMessage("Erro ao colocar ordem de venda: " + trade.ResultComment());
+    }
+}
+
+// Verificar e substituir ordens perdidas
+void CheckAndReplaceOrders() {
+    for (int i = 0; i < GridLevels; i++) {
+        bool buyExists = false, sellExists = false;
+
+        for (int j = 0; j < OrdersTotal(); j++) {
+            ulong ticket = OrderGetTicket(j);
+            if (OrderSelect(ticket)) {
+                if (OrderGetString(ORDER_SYMBOL) == _Symbol) {
+                    if (OrderGetInteger(ORDER_TYPE) == ORDER_TYPE_BUY_LIMIT && MathAbs(OrderGetDouble(ORDER_PRICE_OPEN) - g_buyLevels[i]) < g_point) {
+                        buyExists = true;
+                    }
+                    if (OrderGetInteger(ORDER_TYPE) == ORDER_TYPE_SELL_LIMIT && MathAbs(OrderGetDouble(ORDER_PRICE_OPEN) - g_sellLevels[i]) < g_point) {
+                        sellExists = true;
+                    }
+                }
+            }
+        }
+
+        if (!buyExists) PlaceBuyOrder(g_buyLevels[i], CalculateLotSize(i));
+        if (!sellExists) PlaceSellOrder(g_sellLevels[i], CalculateLotSize(i));
+    }
+}
+
+// Aplicar trailing stop
+void ApplyTrailingStop() {
+    if (!UseTrailingStop) return;
+
+    datetime currentTime = TimeCurrent();
+    static datetime lastCheck = 0;
+
+    if (currentTime - lastCheck < 10) return;
+    lastCheck = currentTime;
+
+    for (int i = 0; i < PositionsTotal(); i++) {
+        if (positionInfo.SelectByIndex(i) && positionInfo.Symbol() == _Symbol) {
+            double currentSL = positionInfo.StopLoss();
+            double newSL = positionInfo.Type() == POSITION_TYPE_BUY
+                ? NormalizeDouble(positionInfo.PriceCurrent() - TrailingStopDistance * g_point, g_digits)
+                : NormalizeDouble(positionInfo.PriceCurrent() + TrailingStopDistance * g_point, g_digits);
+
+            if (MathAbs(currentSL - newSL) > g_point) {
+                if (!trade.PositionModify(positionInfo.Ticket(), newSL, positionInfo.TakeProfit())) {
+                    LogMessage("Erro ao modificar trailing stop: " + trade.ResultComment());
+                }
+            }
+        }
+    }
+}
+
+// Fechar todas as ordens
+void CloseAllOrders() {
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        if (positionInfo.SelectByIndex(i) && positionInfo.Symbol() == _Symbol) {
+            if (!trade.PositionClose(positionInfo.Ticket())) {
+                LogMessage("Erro ao fechar posição #" + IntegerToString(positionInfo.Ticket()) + ": " + trade.ResultComment());
+            }
+        }
+    }
+
+    for (int i = OrdersTotal() - 1; i >= 0; i--) {
+        ulong ticket = OrderGetTicket(i);
+        if (OrderSelect(ticket) && OrderGetString(ORDER_SYMBOL) == _Symbol) {
+            if (!trade.OrderDelete(ticket)) {
+                LogMessage("Erro ao excluir ordem #" + IntegerToString(ticket) + ": " + trade.ResultComment());
+            }
+        }
+    }
+}
+
+// Exibir informações no gráfico
+void DisplayInfo() {
+    double totalProfit = 0;
+    int totalPositions = 0, buyPositions = 0, sellPositions = 0;
+
+    for (int i = 0; i < PositionsTotal(); i++) {
+        if (positionInfo.SelectByIndex(i) && positionInfo.Symbol() == _Symbol) {
+            totalProfit += positionInfo.Profit();
+            totalPositions++;
+            if (positionInfo.Type() == POSITION_TYPE_BUY) buyPositions++;
+            if (positionInfo.Type() == POSITION_TYPE_SELL) sellPositions++;
+        }
+    }
+
+    string info = "";
+    info += "=== Informações do Grid EA ===\n";
+    info += "Lucro Atual: " + DoubleToString(totalProfit, 2) + " " + AccountInfoString(ACCOUNT_CURRENCY) + "\n";
+    info += "Saldo Inicial: " + DoubleToString(g_initialBalance, 2) + " " + AccountInfoString(ACCOUNT_CURRENCY) + "\n";
+    info += "Saldo Atual: " + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + " " + AccountInfoString(ACCOUNT_CURRENCY) + "\n";
+    info += "Equity Atual: " + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + " " + AccountInfoString(ACCOUNT_CURRENCY) + "\n";
+    info += "Posições: " + IntegerToString(totalPositions) + " (C: " + IntegerToString(buyPositions) + ", V: " + IntegerToString(sellPositions) + ")\n";
+
+    Comment(info);
+}
+
+// Calcular tamanho do lote
+double CalculateLotSize(int level) {
+    double lotSize = RiskPercent > 0
+        ? NormalizeDouble(AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100 / 1000, 2)
+        : InitialLotSize * MathPow(LotMultiplier, level);
+
+    return MathMin(lotSize, MaximumLotSize);
+}
+
+// Registrar mensagens no log
+void LogMessage(string message) {
+    Print(TimeCurrent(), " - ", message);
+}
