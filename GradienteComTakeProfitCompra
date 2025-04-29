@@ -1,0 +1,299 @@
+//+------------------------------------------------------------------+
+//| Grid Trader Simplificado com Take Profit                         |
+//+------------------------------------------------------------------+
+#property copyright "Manus Agent"
+#property link      ""
+#property version   "1.01"
+#include <Trade\Trade.mqh>
+
+//--- Parâmetros básicos
+input double GridSize = 20;           // Tamanho da grade em pips
+input int GridLevels = 20;            // Níveis acima/abaixo
+input double InitialLotSize = 0.01;   // Tamanho inicial do lote
+input double LotMultiplier = 1.0;     // Multiplicador de lote
+input int MaximumOrders = 15;         // Máximo de ordens por direção
+input int TradingHoursStart = 0;      // Início do horário de trading
+input int TradingHoursEnd = 24;       // Fim do horário de trading
+
+//--- Variáveis globais
+double g_point;
+int g_digits;
+CTrade trade;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   g_digits = _Digits;
+   g_point = _Point;
+   if (g_digits == 3 || g_digits == 5)
+      g_point *= 10;
+   
+   PlaceInitialOrders();
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // Limpeza básica
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if (!IsTradeAllowed())
+      return;
+   
+   CheckAndReplaceOrders();
+   ManageOpenPositions();
+}
+
+//+------------------------------------------------------------------+
+//| Colocar ordens iniciais                                          |
+//+------------------------------------------------------------------+
+void PlaceInitialOrders()
+{
+   double centerPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double gridSizeAdjusted = GridSize * g_point;
+   
+   for(int i=1; i<=GridLevels; i++)
+   {
+      double buyPrice = NormalizeDouble(centerPrice - (i * gridSizeAdjusted), g_digits);
+      double sellPrice = NormalizeDouble(centerPrice + (i * gridSizeAdjusted), g_digits);
+      
+      // Cálculo do take profit para cada ordem (próximo nível da grade)
+      double buyTP = NormalizeDouble(buyPrice + gridSizeAdjusted, g_digits);
+      double sellTP = NormalizeDouble(sellPrice - gridSizeAdjusted, g_digits);
+      
+      double lotSize = NormalizeDouble(InitialLotSize * MathPow(LotMultiplier, i-1), 2);
+      
+      // Incluindo take profit nas ordens
+      trade.BuyLimit(lotSize, buyPrice, _Symbol, 0, buyTP, ORDER_TIME_GTC);
+      trade.SellLimit(lotSize, sellPrice, _Symbol, sellTP, 0, ORDER_TIME_GTC);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Verificar e repor ordens                                         |
+//+------------------------------------------------------------------+
+void CheckAndReplaceOrders()
+{
+   double gridSizeAdjusted = GridSize * g_point;
+   
+   for(int i=OrdersTotal()-1; i>=0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(OrderSelect(ticket))
+      {
+         if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+            continue;
+         
+         // Verificar ordens que foram executadas ou canceladas
+         if(OrderGetInteger(ORDER_STATE) == ORDER_STATE_CANCELED)
+         {
+            double price = OrderGetDouble(ORDER_PRICE_OPEN);
+            double lotSize = OrderGetDouble(ORDER_VOLUME_INITIAL);
+            ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            
+            if(type == ORDER_TYPE_BUY_LIMIT)
+            {
+               double buyTP = NormalizeDouble(price + gridSizeAdjusted, g_digits);
+               trade.BuyLimit(lotSize, price, _Symbol, 0, buyTP, ORDER_TIME_GTC);
+            }
+            else if(type == ORDER_TYPE_SELL_LIMIT)
+            {
+               double sellTP = NormalizeDouble(price - gridSizeAdjusted, g_digits);
+               trade.SellLimit(lotSize, price, _Symbol, sellTP, 0, ORDER_TIME_GTC);
+            }
+         }
+      }
+   }
+   
+   // Verificar se precisamos adicionar novas ordens (para manter sempre o número máximo de ordens)
+   CheckAndPlaceNewOrders();
+}
+
+//+------------------------------------------------------------------+
+//| Verificar e colocar novas ordens para manter os níveis completos |
+//+------------------------------------------------------------------+
+void CheckAndPlaceNewOrders()
+{
+   int buyLimitCount = 0;
+   int sellLimitCount = 0;
+   double lowestBuyLimit = DBL_MAX;
+   double highestSellLimit = 0;
+   
+   // Contar ordens pendentes e encontrar limites
+   for(int i=OrdersTotal()-1; i>=0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(OrderSelect(ticket))
+      {
+         if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+            continue;
+         
+         ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         double price = OrderGetDouble(ORDER_PRICE_OPEN);
+         
+         if(type == ORDER_TYPE_BUY_LIMIT)
+         {
+            buyLimitCount++;
+            if(price < lowestBuyLimit)
+               lowestBuyLimit = price;
+         }
+         else if(type == ORDER_TYPE_SELL_LIMIT)
+         {
+            sellLimitCount++;
+            if(price > highestSellLimit)
+               highestSellLimit = price;
+         }
+      }
+   }
+   
+   double gridSizeAdjusted = GridSize * g_point;
+   
+   // Adicionar novas ordens de compra se necessário
+   while(buyLimitCount < GridLevels && buyLimitCount < MaximumOrders)
+   {
+      double newBuyPrice;
+      double lotSize;
+      
+      if(lowestBuyLimit == DBL_MAX)
+      {
+         // Não há ordens de compra pendentes, criar a primeira
+         newBuyPrice = NormalizeDouble(SymbolInfoDouble(_Symbol, SYMBOL_ASK) - gridSizeAdjusted, g_digits);
+         lotSize = InitialLotSize;
+      }
+      else
+      {
+         // Adicionar um novo nível abaixo do menor existente
+         newBuyPrice = NormalizeDouble(lowestBuyLimit - gridSizeAdjusted, g_digits);
+         lotSize = NormalizeDouble(InitialLotSize * MathPow(LotMultiplier, buyLimitCount), 2);
+      }
+      
+      double buyTP = NormalizeDouble(newBuyPrice + gridSizeAdjusted, g_digits);
+      if(trade.BuyLimit(lotSize, newBuyPrice, _Symbol, 0, buyTP, ORDER_TIME_GTC))
+      {
+         buyLimitCount++;
+         lowestBuyLimit = newBuyPrice;
+      }
+      else
+         break; // Se falhar ao colocar a ordem, sair do loop
+   }
+   
+   // Adicionar novas ordens de venda se necessário
+   while(sellLimitCount < GridLevels && sellLimitCount < MaximumOrders)
+   {
+      double newSellPrice;
+      double lotSize;
+      
+      if(highestSellLimit == 0)
+      {
+         // Não há ordens de venda pendentes, criar a primeira
+         newSellPrice = NormalizeDouble(SymbolInfoDouble(_Symbol, SYMBOL_BID) + gridSizeAdjusted, g_digits);
+         lotSize = InitialLotSize;
+      }
+      else
+      {
+         // Adicionar um novo nível acima do maior existente
+         newSellPrice = NormalizeDouble(highestSellLimit + gridSizeAdjusted, g_digits);
+         lotSize = NormalizeDouble(InitialLotSize * MathPow(LotMultiplier, sellLimitCount), 2);
+      }
+      
+      double sellTP = NormalizeDouble(newSellPrice - gridSizeAdjusted, g_digits);
+      if(trade.SellLimit(lotSize, newSellPrice, _Symbol, sellTP, 0, ORDER_TIME_GTC))
+      {
+         sellLimitCount++;
+         highestSellLimit = newSellPrice;
+      }
+      else
+         break; // Se falhar ao colocar a ordem, sair do loop
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Gerenciar posições abertas e repor ordens após TP                |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+{
+   double gridSizeAdjusted = GridSize * g_point;
+   
+   // Verificar posições fechadas para repor ordens
+   for(int i=PositionsTotal()-1; i>=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+            
+         // Aqui você pode adicionar lógica adicional para gerenciar posições abertas
+         // como ajustar o TP ou verificar se uma posição está prestes a ser fechada
+      }
+   }
+   
+   // Verificar histórico de ordens para repor ordens que atingiram TP
+   HistorySelect(TimeCurrent()-86400, TimeCurrent()); // Últimas 24 horas
+   
+   for(int i=HistoryDealsTotal()-1; i>=0; i--)
+   {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol)
+         continue;
+         
+      // Verificar se o deal é um fechamento de posição por TP
+      if(HistoryDealGetInteger(dealTicket, DEAL_ENTRY) == DEAL_ENTRY_OUT && 
+         HistoryDealGetInteger(dealTicket, DEAL_REASON) == DEAL_REASON_TP)
+      {
+         double dealPrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+         double dealVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+         ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+         
+         // Recolocar a ordem no mesmo nível
+         if(dealType == DEAL_TYPE_BUY)
+         {
+            // Foi uma posição de compra que fechou no TP, colocar nova ordem de compra
+            double newBuyPrice = NormalizeDouble(dealPrice - gridSizeAdjusted, g_digits);
+            double buyTP = NormalizeDouble(newBuyPrice + gridSizeAdjusted, g_digits);
+            trade.BuyLimit(dealVolume, newBuyPrice, _Symbol, 0, buyTP, ORDER_TIME_GTC);
+         }
+         else if(dealType == DEAL_TYPE_SELL)
+         {
+            // Foi uma posição de venda que fechou no TP, colocar nova ordem de venda
+            double newSellPrice = NormalizeDouble(dealPrice + gridSizeAdjusted, g_digits);
+            double sellTP = NormalizeDouble(newSellPrice - gridSizeAdjusted, g_digits);
+            trade.SellLimit(dealVolume, newSellPrice, _Symbol, sellTP, 0, ORDER_TIME_GTC);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Verificar horário de trading                                     |
+//+------------------------------------------------------------------+
+bool IsTradeAllowed()
+{
+   MqlDateTime time;
+   TimeCurrent(time);
+   
+   int currentHour = time.hour;
+   
+   if(TradingHoursStart <= TradingHoursEnd)
+   {
+      if(currentHour < TradingHoursStart || currentHour >= TradingHoursEnd)
+         return false;
+   }
+   else
+   {
+      if(currentHour < TradingHoursStart && currentHour >= TradingHoursEnd)
+         return false;
+   }
+   
+   return true;
+}
