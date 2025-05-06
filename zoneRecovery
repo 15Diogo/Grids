@@ -11,18 +11,19 @@
 input string GeneralSettings = "--- General Settings ---"; // General Settings
 input double InitialLot = 0.01;        // Initial Lot Size
 input int TakeProfit = 20;             // Take Profit in points
-input int ZoneSize = 1000;             // Zone Size in points (distance between trades)
-input double LotMultiplier = 0.3;      // Multiplier for lot size on each level
+input int ZoneSize = 100000;             // Zone Size in points (distance between trades)
+input double LotMultiplier = 0.2;      // Multiplier for lot size on each level
 input int MaxTrades = 20;              // Maximum number of trades
 input ENUM_POSITION_TYPE DefaultDirection = POSITION_TYPE_BUY; // Default trade direction
 
 input string SecondaryGridSettings = "--- Secondary Grid Settings ---"; // Secondary Grid Settings
 input bool UseSecondaryGrid = true;    // Use Secondary Sell Grid
-input int SecondaryGridDistance = 70;  // Distance of Secondary Grid in points
+input int SecondaryGridDistance = 100;  // Distance of Secondary Grid in points
 input double SecondaryGridLot = 0.01;  // Secondary Grid Initial Lot Size
-input double SecondaryGridMultiplier = 0.3; // Secondary Grid Lot Multiplier
-input int SecondaryGridZoneSize = 1000; // Secondary Grid Zone Size
+input double SecondaryGridMultiplier = 0.02; // Secondary Grid Lot Multiplier
+input int SecondaryGridZoneSize = 100000; // Secondary Grid Zone Size
 input int SecondaryGridMaxTrades = 20; // Maximum number of secondary grid trades
+
 
 input string TradeSettings = "--- Trade Management ---"; // Trade Management
 input bool UseTrailingStop = false;    // Use Trailing Stop
