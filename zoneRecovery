@@ -5,30 +5,21 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025"
 #property link      ""
-#property version   "1.03"
+#property version   "1.02"
 
 // Input parameters
 input string GeneralSettings = "--- General Settings ---"; // General Settings
 input double InitialLot = 0.01;        // Initial Lot Size
 input int TakeProfit = 20;             // Take Profit in points
-input int ZoneSize = 100000;             // Zone Size in points (distance between trades)
-input double LotMultiplier = 0.2;      // Multiplier for lot size on each level
-input int MaxTrades = 20;              // Maximum number of trades
+input int ZoneSize = 1000;              // Zone Size in points (distance between trades)
+input double LotMultiplier = 0.3;      // Multiplier for lot size on each level
+input int MaxTrades = 20;               // Maximum number of trades
 input ENUM_POSITION_TYPE DefaultDirection = POSITION_TYPE_BUY; // Default trade direction
-
-input string SecondaryGridSettings = "--- Secondary Grid Settings ---"; // Secondary Grid Settings
-input bool UseSecondaryGrid = true;    // Use Secondary Sell Grid
-input int SecondaryGridDistance = 100;  // Distance of Secondary Grid in points
-input double SecondaryGridLot = 0.01;  // Secondary Grid Initial Lot Size
-input double SecondaryGridMultiplier = 0.02; // Secondary Grid Lot Multiplier
-input int SecondaryGridZoneSize = 100000; // Secondary Grid Zone Size
-input int SecondaryGridMaxTrades = 20; // Maximum number of secondary grid trades
-
 
 input string TradeSettings = "--- Trade Management ---"; // Trade Management
 input bool UseTrailingStop = false;    // Use Trailing Stop
 input int TrailingDistance = 20;       // Trailing Stop Distance in points
-input int BreakEvenProfit = 10;        // Points in profit to move to break even
+input int BreakEvenProfit = 10;         // Points in profit to move to break even
 input int BreakEvenDistance = 3;       // Break even distance in points
 
 // Additional debug settings
@@ -36,22 +27,17 @@ input string DebugSettings = "--- Debug Settings ---"; // Debug Settings
 input bool IsDebugMode = true;         // Enable detailed debug messages
 input bool ForceOpenBuy = false;       // Force open a BUY trade (for testing)
 input bool ForceOpenSell = false;      // Force open a SELL trade (for testing)
-input bool ForceOpenSecondaryGrid = false; // Force open a secondary grid trade (for testing)
 
 // Trading objects
 #include <Trade/Trade.mqh>
 CTrade trade;
 
 // Global variables
-int zoneRecoveryMagic = 123456789;     // Magic number for primary grid orders
-int secondaryGridMagic = 987654321;    // Magic number for secondary grid orders
+int zoneRecoveryMagic = 123456789;        // Magic number for orders
 double point;                          // Point value
-int zoneDirection = 0;                 // Direction of current zone recovery (1=buy, -1=sell, 0=none)
+int zoneDirection = 2;                 // Direction of current zone recovery (1=buy, -1=sell, 0=none)
 int totalTrades = 0;                   // Total number of trades in the current series
-int totalSecondaryTrades = 0;          // Total number of trades in the secondary grid
 datetime lastActionTime = 0;           // Time of last trading action
-datetime lastSecondaryActionTime = 0;  // Time of last secondary grid action
-double primaryGridBasePrice = 0;       // Base price for the primary grid
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -69,13 +55,11 @@ int OnInit()
    
    // Debug messages
    Print("=================================================");
-   Print("Zone Recovery EA initialized with Secondary Grid");
+   Print("Zone Recovery EA initialized (No Filters Version)");
    Print("Symbol: ", _Symbol);
    Print("Point value: ", point);
    Print("Initial lot: ", InitialLot);
-   Print("Primary Magic number: ", zoneRecoveryMagic);
-   Print("Secondary Magic number: ", secondaryGridMagic);
-   Print("Secondary Grid Distance: ", SecondaryGridDistance, " points");
+   Print("Magic number: ", zoneRecoveryMagic);
    
    // Check if AutoTrading is enabled
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
@@ -158,15 +142,6 @@ void ProcessTrading()
       }
    }
    
-   // Force open secondary grid if specified
-   if(ForceOpenSecondaryGrid && UseSecondaryGrid)
-   {
-      Print("DEBUG: Force Secondary Grid enabled - attempting to open a secondary grid trade...");
-      OpenSecondaryGridTrade();
-      ResetForceOpenFlags();
-      return;
-   }
-   
    // If we have no trades, immediately open a trade using default direction
    if(totalTrades == 0)
    {
@@ -175,38 +150,18 @@ void ProcessTrading()
    }
    else
    {
-      // Update base price for secondary grid if we have primary trades
-      if(primaryGridBasePrice == 0)
-      {
-         primaryGridBasePrice = GetAverageEntryPrice();
-         
-         if(IsDebugMode)
-            Print("Set primary grid base price to: ", primaryGridBasePrice);
-      }
-      
       // Print trade status regularly
       if(IsDebugMode)
       {
          double totalProfit = CalculateTotalProfit();
-         double totalSecondaryProfit = CalculateSecondaryTotalProfit();
-         
-         Print("Active primary trades: ", totalTrades, ", Direction: ", 
+         Print("Active trades: ", totalTrades, ", Direction: ", 
                zoneDirection == 1 ? "BUY" : "SELL", ", Total profit: ", 
                DoubleToString(totalProfit, 2), " ", AccountInfoString(ACCOUNT_CURRENCY));
-               
-         Print("Active secondary trades: ", totalSecondaryTrades, ", Direction: SELL, Total profit: ", 
-               DoubleToString(totalSecondaryProfit, 2), " ", AccountInfoString(ACCOUNT_CURRENCY));
       }
    }
    
    // Manage existing trades (recovery, trailing, break even)
    ManageOpenTrades();
-   
-   // Manage secondary grid if enabled
-   if(UseSecondaryGrid && primaryGridBasePrice > 0)
-   {
-      ManageSecondaryGrid();
-   }
 }
 
 //+------------------------------------------------------------------+
@@ -225,7 +180,6 @@ void ResetForceOpenFlags()
 void CountZoneTrades()
 {
    totalTrades = 0;
-   totalSecondaryTrades = 0;
    zoneDirection = 0;
    
    // Loop through all positions
@@ -237,24 +191,17 @@ void CountZoneTrades()
          long magic = PositionGetInteger(POSITION_MAGIC);
          string symbol = PositionGetString(POSITION_SYMBOL);
          
-         if(symbol == _Symbol)
+         if(magic == zoneRecoveryMagic && symbol == _Symbol)
          {
-            if(magic == zoneRecoveryMagic)
+            totalTrades++;
+            
+            // Determine zone direction from the first trade found
+            if(zoneDirection == 0)
             {
-               totalTrades++;
-               
-               // Determine zone direction from the first trade found
-               if(zoneDirection == 0)
-               {
-                  if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-                     zoneDirection = 1;
-                  else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
-                     zoneDirection = -1;
-               }
-            }
-            else if(magic == secondaryGridMagic)
-            {
-               totalSecondaryTrades++;
+               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                  zoneDirection = 1;
+               else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+                  zoneDirection = -1;
             }
          }
       }
@@ -301,10 +248,6 @@ void OpenTrade(ENUM_POSITION_TYPE type)
    // Normalize volume according to lot step
    volume = NormalizeDouble(MathFloor(volume / lotStep) * lotStep, 2);
    
-   // Store initial magic number
-   long currentMagic = zoneRecoveryMagic;
-   trade.SetExpertMagicNumber(currentMagic);
-   
    if(type == POSITION_TYPE_BUY)
    {
       tp = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + TakeProfit * point;
@@ -330,17 +273,6 @@ void OpenTrade(ENUM_POSITION_TYPE type)
       totalTrades = 1;
       zoneDirection = (type == POSITION_TYPE_BUY) ? 1 : -1;
       lastActionTime = TimeCurrent();
-      
-      // Set primary grid base price for the secondary grid
-      primaryGridBasePrice = SymbolInfoDouble(_Symbol, (type == POSITION_TYPE_BUY) ? SYMBOL_ASK : SYMBOL_BID);
-      Print("Set primary grid base price: ", primaryGridBasePrice);
-      
-      // If secondary grid is enabled, check if we should open a secondary grid trade
-      if(UseSecondaryGrid)
-      {
-         // Open secondary grid trade after delay
-         OpenSecondaryGridTrade();
-      }
    }
    else
    {
@@ -398,7 +330,7 @@ void ManageOpenTrades()
    {
       if(CloseAllTrades())
       {
-         Print("Closed all primary trades with profit: ", totalProfit);
+         Print("Closed all trades with profit: ", totalProfit);
          totalTrades = 0;
          zoneDirection = 0;
          return;
@@ -446,187 +378,6 @@ void ManageOpenTrades()
 }
 
 //+------------------------------------------------------------------+
-//| Manage secondary grid trades                                      |
-//+------------------------------------------------------------------+
-void ManageSecondaryGrid()
-{
-   // If no primary trades, don't manage secondary grid
-   if(totalTrades == 0 || primaryGridBasePrice == 0)
-      return;
-      
-   // Calculate total profit of secondary trades
-   double totalSecondaryProfit = CalculateSecondaryTotalProfit();
-   
-   // Check if we should close all secondary trades with profit
-   if(totalSecondaryProfit > 0)
-   {
-      if(CloseAllSecondaryTrades())
-      {
-         Print("Closed all secondary trades with profit: ", totalSecondaryProfit);
-         totalSecondaryTrades = 0;
-         return;
-      }
-   }
-   
-   // Open first secondary grid trade if none exist
-   if(totalSecondaryTrades == 0)
-   {
-      // Check if we need to open a secondary grid trade
-      // For a SELL grid, check if current price is above the base price + distance
-      double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);  // For SELL orders, check ASK price
-      double triggerPrice = primaryGridBasePrice + SecondaryGridDistance * point;
-      
-      if(IsDebugMode)
-      {
-         Print("Secondary grid check - Base price: ", primaryGridBasePrice, ", Current price: ", currentPrice, 
-               ", Trigger price: ", triggerPrice);
-      }
-      
-      if(currentPrice >= triggerPrice)
-      {
-         // Open a secondary grid trade
-         OpenSecondaryGridTrade();
-      }
-   }
-   else if(totalSecondaryTrades < SecondaryGridMaxTrades)
-   {
-      // Check if we need to open a recovery trade for secondary grid
-      double entryPrice = GetSecondaryAverageEntryPrice();
-      double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK); // For SELL orders, check ASK price
-      
-      double distance = MathAbs(currentPrice - entryPrice) / point;
-      
-      if(IsDebugMode)
-      {
-         Print("Secondary grid recovery check - Entry price: ", entryPrice, ", Current price: ", currentPrice, 
-               ", Distance in points: ", distance, ", Required zone size: ", SecondaryGridZoneSize);
-      }
-      
-      // If price moved against us by SecondaryGridZoneSize points, open a recovery trade
-      if(currentPrice > entryPrice + SecondaryGridZoneSize * point)
-      {
-         // Open a secondary grid recovery trade
-         OpenSecondaryRecoveryTrade();
-         lastSecondaryActionTime = TimeCurrent();
-      }
-   }
-   
-   // Apply trailing stop to secondary grid if enabled
-   if(UseTrailingStop && totalSecondaryProfit > 0)
-   {
-      ApplySecondaryTrailingStop();
-   }
-   
-   // Apply break even to secondary grid if enabled
-   if(totalSecondaryProfit > BreakEvenProfit * point)
-   {
-      ApplySecondaryBreakEven();
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Open the first trade in the secondary grid                        |
-//+------------------------------------------------------------------+
-void OpenSecondaryGridTrade()
-{
-   // Only open secondary grid trade if primary grid exists
-   if(totalTrades == 0 || primaryGridBasePrice == 0)
-      return;
-      
-   // Set magic number for secondary grid
-   trade.SetExpertMagicNumber(secondaryGridMagic);
-   
-   // Always open SELL trade for secondary grid
-   double volume = SecondaryGridLot;
-   
-   // Check minimum lot size restrictions
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   
-   volume = MathMin(maxLot, MathMax(minLot, NormalizeDouble(volume, 2)));
-   
-   // Set up trading parameters
-   double sl = 0.0; // No stop loss for grid trading
-   double tp = SymbolInfoDouble(_Symbol, SYMBOL_BID) - TakeProfit * point;
-   
-   Print("Opening secondary SELL grid trade at market price, TP: ", tp, ", Lot: ", volume);
-   
-   // Execute SELL trade using CTrade
-   bool result = trade.Sell(volume, _Symbol, 0, sl, tp, "Secondary Grid");
-   
-   // Check result
-   if(result)
-   {
-      Print("Secondary grid trade executed: SELL, Lot: ", volume, 
-            ", Result: ", trade.ResultRetcode(), ", Ticket: ", trade.ResultOrder());
-      totalSecondaryTrades++;
-      lastSecondaryActionTime = TimeCurrent();
-      
-      // Reset the magic number for primary grid
-      trade.SetExpertMagicNumber(zoneRecoveryMagic);
-   }
-   else
-   {
-      Print("Error opening secondary grid trade: ", GetLastError(), 
-            ", Code: ", trade.ResultRetcode(), ", Comment: ", trade.ResultComment());
-      
-      // Print trade context and error details
-      PrintTradeContextError();
-      
-      // Reset the magic number for primary grid
-      trade.SetExpertMagicNumber(zoneRecoveryMagic);
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Open a recovery trade for secondary grid                          |
-//+------------------------------------------------------------------+
-void OpenSecondaryRecoveryTrade()
-{
-   // Calculate recovery lot size based on previous trades
-   double recoveryLot = SecondaryGridLot * MathPow(SecondaryGridMultiplier, totalSecondaryTrades);
-   
-   // Check minimum lot size restrictions
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   
-   recoveryLot = MathMin(maxLot, MathMax(minLot, NormalizeDouble(recoveryLot, 2)));
-   
-   // Set magic number for secondary grid
-   trade.SetExpertMagicNumber(secondaryGridMagic);
-   
-   // Set up trading parameters
-   double sl = 0.0; // No stop loss for grid trading
-   double tp = SymbolInfoDouble(_Symbol, SYMBOL_BID) - TakeProfit * point;
-   
-   Print("Opening secondary grid recovery trade: SELL, Lot: ", recoveryLot, ", TP: ", tp);
-   
-   // Execute trade using CTrade
-   bool result = trade.Sell(recoveryLot, _Symbol, 0, sl, tp, "Secondary Grid Recovery");
-   
-   // Check result
-   if(result)
-   {
-      Print("Secondary grid recovery trade executed: SELL, Lot: ", recoveryLot, 
-            ", Result: ", trade.ResultRetcode(), ", Ticket: ", trade.ResultOrder());
-      totalSecondaryTrades++;
-   }
-   else
-   {
-      Print("Error opening secondary grid recovery trade: ", GetLastError(), 
-            ", Code: ", trade.ResultRetcode(), ", Comment: ", trade.ResultComment());
-      
-      // Print trade context and error details
-      PrintTradeContextError();
-   }
-   
-   // Reset the magic number for primary grid
-   trade.SetExpertMagicNumber(zoneRecoveryMagic);
-}
-
-//+------------------------------------------------------------------+
 //| Open a recovery trade for zone recovery                           |
 //+------------------------------------------------------------------+
 void OpenRecoveryTrade()
@@ -640,9 +391,6 @@ void OpenRecoveryTrade()
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    
    recoveryLot = MathMin(maxLot, MathMax(minLot, NormalizeDouble(recoveryLot, 2)));
-   
-   // Set magic number for primary grid
-   trade.SetExpertMagicNumber(zoneRecoveryMagic);
    
    // Set up trading parameters
    double sl = 0.0; // No stop loss for zone recovery
@@ -715,31 +463,6 @@ double CalculateTotalProfit()
 }
 
 //+------------------------------------------------------------------+
-//| Calculate the total profit of all secondary grid trades           |
-//+------------------------------------------------------------------+
-double CalculateSecondaryTotalProfit()
-{
-   double profit = 0;
-   
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket))
-      {
-         long magic = PositionGetInteger(POSITION_MAGIC);
-         string symbol = PositionGetString(POSITION_SYMBOL);
-         
-         if(magic == secondaryGridMagic && symbol == _Symbol)
-         {
-            profit += PositionGetDouble(POSITION_PROFIT);
-         }
-      }
-   }
-   
-   return profit;
-}
-
-//+------------------------------------------------------------------+
 //| Get the average entry price of all trades                         |
 //+------------------------------------------------------------------+
 double GetAverageEntryPrice()
@@ -756,39 +479,6 @@ double GetAverageEntryPrice()
          string symbol = PositionGetString(POSITION_SYMBOL);
          
          if(magic == zoneRecoveryMagic && symbol == _Symbol)
-         {
-            double volume = PositionGetDouble(POSITION_VOLUME);
-            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-            
-            totalVolume += volume;
-            volumeWeightedPrice += volume * openPrice;
-         }
-      }
-   }
-   
-   if(totalVolume > 0)
-      return volumeWeightedPrice / totalVolume;
-      
-   return 0;
-}
-
-//+------------------------------------------------------------------+
-//| Get the average entry price of all secondary grid trades          |
-//+------------------------------------------------------------------+
-double GetSecondaryAverageEntryPrice()
-{
-   double totalVolume = 0;
-   double volumeWeightedPrice = 0;
-   
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket))
-      {
-         long magic = PositionGetInteger(POSITION_MAGIC);
-         string symbol = PositionGetString(POSITION_SYMBOL);
-         
-         if(magic == secondaryGridMagic && symbol == _Symbol)
          {
             double volume = PositionGetDouble(POSITION_VOLUME);
             double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
@@ -835,10 +525,7 @@ bool CloseAllTrades()
       }
    }
    
-   Print("Attempting to close ", count, " primary trades");
-   
-   // Set magic number for primary grid
-   trade.SetExpertMagicNumber(zoneRecoveryMagic);
+   Print("Attempting to close ", count, " trades");
    
    // Now close all positions
    for(int i = 0; i < count; i++)
@@ -863,73 +550,10 @@ bool CloseAllTrades()
 }
 
 //+------------------------------------------------------------------+
-//| Close all secondary grid trades                                   |
-//+------------------------------------------------------------------+
-bool CloseAllSecondaryTrades()
-{
-   bool success = true;
-   
-   // Create an array to store positions to close
-   ulong tickets[];
-   int count = 0;
-   
-   // First, collect all position tickets
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket))
-      {
-         long magic = PositionGetInteger(POSITION_MAGIC);
-         string symbol = PositionGetString(POSITION_SYMBOL);
-         
-         if(magic == secondaryGridMagic && symbol == _Symbol)
-         {
-            // Resize array and add ticket
-            ArrayResize(tickets, count + 1);
-            tickets[count] = ticket;
-            count++;
-         }
-      }
-   }
-   
-   Print("Attempting to close ", count, " secondary grid trades");
-   
-   // Set magic number for secondary grid
-   trade.SetExpertMagicNumber(secondaryGridMagic);
-   
-   // Now close all positions
-   for(int i = 0; i < count; i++)
-   {
-      if(PositionSelectByTicket(tickets[i]))
-      {
-         // Use CTrade to close position
-         if(!trade.PositionClose(tickets[i]))
-         {
-            Print("Error closing secondary position ", tickets[i], ": ", GetLastError(), 
-                  ", Code: ", trade.ResultRetcode(), ", Comment: ", trade.ResultComment());
-            success = false;
-         }
-         else
-         {
-            Print("Secondary position closed: ", tickets[i]);
-         }
-      }
-   }
-   
-   // Reset the magic number for primary grid
-   trade.SetExpertMagicNumber(zoneRecoveryMagic);
-   
-   return success;
-}
-
-//+------------------------------------------------------------------+
 //| Apply trailing stop to all trades                                 |
 //+------------------------------------------------------------------+
 void ApplyTrailingStop()
 {
-   // Set magic number for primary grid
-   trade.SetExpertMagicNumber(zoneRecoveryMagic);
-   
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
@@ -996,75 +620,10 @@ void ApplyTrailingStop()
 }
 
 //+------------------------------------------------------------------+
-//| Apply trailing stop to secondary grid trades                      |
-//+------------------------------------------------------------------+
-void ApplySecondaryTrailingStop()
-{
-   // Set magic number for secondary grid
-   trade.SetExpertMagicNumber(secondaryGridMagic);
-   
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket))
-      {
-         long magic = PositionGetInteger(POSITION_MAGIC);
-         string symbol = PositionGetString(POSITION_SYMBOL);
-         
-         if(magic == secondaryGridMagic && symbol == _Symbol)
-         {
-            double currentSL = PositionGetDouble(POSITION_SL);
-            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-            
-            double newSL = 0;
-            bool modifyFlag = false;
-            
-            // Secondary grid is always SELL positions
-            if(posType == POSITION_TYPE_SELL)
-            {
-               double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-               
-               // Only apply trailing stop if price moved in favorable direction
-               if(ask < openPrice - TrailingDistance * point)
-               {
-                  newSL = NormalizeDouble(ask + TrailingDistance * point, _Digits);
-                  
-                  // Only modify if the new SL is lower than the current one or not set
-                  if(currentSL > newSL || currentSL == 0)
-                     modifyFlag = true;
-               }
-            }
-            
-            // Modify position if needed
-            if(modifyFlag)
-            {
-               if(!trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP)))
-               {
-                  Print("Error modifying secondary SL: ", GetLastError(), 
-                        ", Code: ", trade.ResultRetcode(), ", Comment: ", trade.ResultComment());
-               }
-               else
-               {
-                  Print("Modified trailing stop for secondary position ", ticket, " to ", newSL);
-               }
-            }
-         }
-      }
-   }
-   
-   // Reset the magic number for primary grid
-   trade.SetExpertMagicNumber(zoneRecoveryMagic);
-}
-
-//+------------------------------------------------------------------+
 //| Apply break even to all trades                                    |
 //+------------------------------------------------------------------+
 void ApplyBreakEven()
 {
-   // Set magic number for primary grid
-   trade.SetExpertMagicNumber(zoneRecoveryMagic);
-   
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
@@ -1116,61 +675,5 @@ void ApplyBreakEven()
          }
       }
    }
-}
-
-//+------------------------------------------------------------------+
-//| Apply break even to secondary grid trades                         |
-//+------------------------------------------------------------------+
-void ApplySecondaryBreakEven()
-{
-   // Set magic number for secondary grid
-   trade.SetExpertMagicNumber(secondaryGridMagic);
-   
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket))
-      {
-         long magic = PositionGetInteger(POSITION_MAGIC);
-         string symbol = PositionGetString(POSITION_SYMBOL);
-         
-         if(magic == secondaryGridMagic && symbol == _Symbol)
-         {
-            double currentSL = PositionGetDouble(POSITION_SL);
-            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-            
-            double newSL = 0;
-            bool modifyFlag = false;
-            
-            // Secondary grid is always SELL positions
-            if(posType == POSITION_TYPE_SELL)
-            {
-               newSL = openPrice - BreakEvenDistance * point;
-               
-               // Only modify if the new SL is lower than the current one or not set
-               if(currentSL > newSL || currentSL == 0)
-                  modifyFlag = true;
-            }
-            
-            // Modify position if needed
-            if(modifyFlag)
-            {
-               if(!trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP)))
-               {
-                  Print("Error setting secondary break even: ", GetLastError(), 
-                        ", Code: ", trade.ResultRetcode(), ", Comment: ", trade.ResultComment());
-               }
-               else
-               {
-                  Print("Modified secondary position ", ticket, " to break even at ", newSL);
-               }
-            }
-         }
-      }
-   }
-   
-   // Reset the magic number for primary grid
-   trade.SetExpertMagicNumber(zoneRecoveryMagic);
 }
 //+------------------------------------------------------------------+
