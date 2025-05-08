@@ -10,15 +10,15 @@ COrderInfo orderInfo;
 // Parâmetros de entrada
 input double InitialPrice = 0; // Preço inicial (0 = preço atual)
 input int GridLevels = 10; // Número de níveis da grade
-input double GridSize = 4; // Tamanho da grade em pips
+input double GridSize = 5; // Tamanho da grade em pips
 input bool UseExponentialGrid = true; // Usar grade exponencial
-input double GridExponent = 1.5; // Expoente para grade exponencial (>1)
+input double GridExponent = 0.1; // Expoente para grade exponencial (>1)
 input bool UseAsymmetricGrid = true; // Usar grade assimétrica
-input double BuyGridMultiplier = 0.1; // Multiplicador para níveis de compra
-input double SellGridMultiplier = 0.1; // Multiplicador para níveis de venda
+input double BuyGridMultiplier = 0.10; // Multiplicador para níveis de compra
+input double SellGridMultiplier = 0.10; // Multiplicador para níveis de venda
 input double RiskPercent = 1.0; // Risco em porcentagem do saldo (0 = usar lote fixo)
 input double InitialLotSize = 0.01; // Tamanho do lote inicial (usado se RiskPercent=0)
-input double LotMultiplier = 0.1; // Multiplicador para níveis subsequentes
+input double LotMultiplier = 0.09; // Multiplicador para níveis subsequentes
 input double MinimumLotSize = 0.01; // Tamanho mínimo de lote permitido
 input double MaximumLotSize = 10.0; // Tamanho máximo de lote permitido
 input double MinExposureAmount = 100.0; // Valor mínimo de exposição em moeda (para cálculo de lote)
@@ -26,8 +26,8 @@ input bool AdjustLotsForMinExposure = true; // Ajustar lotes para garantir expos
 input double TakeProfit = 0; // Take Profit em pips (0 = desativado)
 input double StopLoss = 0; // Stop Loss em pips (0 = desativado)
 input double TrailingStopDistance = 20; // Distância do trailing stop em pips
-input bool UseTrailingStop = false; // Usar trailing stop
-input double MaxDrawdownPercent = 20; // Percentual máximo de drawdown
+input bool UseTrailingStop = true; // Usar trailing stop
+input double MaxDrawdownPercent = 100; // Percentual máximo de drawdown
 
 // Variáveis globais
 double g_initialBalance = 0;
