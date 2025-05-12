@@ -1,0 +1,395 @@
+//+------------------------------------------------------------------+
+//|                                          GridTraderEA_Fixed.mq5 |
+//|                                      Copyright 2025, Genspark AI |
+//|                                  Estratégia de Grid Corrigida    |
+//+------------------------------------------------------------------+
+#property copyright "Genspark AI"
+#property version   "1.21" // Versão corrigida
+#property strict
+
+//--- Parâmetros de Entrada Configuráveis
+input group "Configurações Básicas do Grid"
+input double LotVolume        = 0.01;  // Volume (lotes) para cada ordem
+input int    GridLevels       = 20;    // Número de níveis do grid em cada direção
+input int    GridSpacingPips  = 25;    // Espaçamento entre as ordens do grid (em Pips)
+input int    TakeProfitPips   = 25;    // Take Profit para cada ordem (em Pips)
+input int    StopLossPips     = 50;    // Stop Loss para cada ordem (em Pips)
+
+input group "Configurações Avançadas"
+input int    MagicNumber      = 20250513; // Identificador único para as ordens deste EA
+input int    MaxReplacementAttempts = 3;  // Máximo de tentativas de reposição de ordem
+input bool   UseStopLoss      = true;     // Usar Stop Loss
+input bool   AggressiveReplacement = true; // Substituição agressiva de ordens
+
+//--- Variáveis Globais
+double g_pip_value;      // Valor de 1 pip (calculado em OnInit)
+bool   g_initial_grid_created = false; // Flag para controle da criação inicial do grid
+double g_price_levels[]; // Array para armazenar os níveis de preço do grid
+int    g_replacement_attempts[]; // Contador de tentativas de reposição por preço
+
+//+------------------------------------------------------------------+
+//| Função de Inicialização do Expert Advisor                        |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Inicializa o array de tentativas de reposição
+   ArrayResize(g_replacement_attempts, GridLevels * 2);
+   ArrayInitialize(g_replacement_attempts, 0);
+   
+   // Inicializa o array de níveis de preço
+   ArrayResize(g_price_levels, GridLevels * 2);
+
+   // Calcula o valor do Pip
+   g_pip_value = (_Digits == 3 || _Digits == 5) ? _Point * 10 : _Point;
+
+   // Validações de Parâmetros
+   if(GridLevels <= 0 || GridSpacingPips <= 0 || TakeProfitPips <= 0)
+   {
+      Print("Erro: Parâmetros de Grid/TP devem ser positivos.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+   
+   if(LotVolume <= 0)
+   {
+       Print("Erro: O Volume (lotes) deve ser positivo.");
+       return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   // Configura o Timer para executar a lógica principal a cada segundo
+   EventSetTimer(1);
+   PrintFormat("EA Grid Trader iniciado. Magic: %d, Níveis: %d, Espaço: %d pips, TP: %d pips, Lote: %.2f",
+               MagicNumber, GridLevels, GridSpacingPips, TakeProfitPips, LotVolume);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Função de Desinicialização do Expert Advisor                     |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   EventKillTimer();
+   Print("EA Grid Trader finalizado. Razão: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Função do Timer (executa a lógica principal)                     |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   // 1. Cria o Grid Inicial (apenas uma vez, se não houver ordens/posições)
+   if(!g_initial_grid_created && OrdersTotal() == 0 && PositionsTotal() == 0)
+   {
+      if(CreateInitialGrid())
+      {
+         g_initial_grid_created = true;
+         PrintFormat("Grid inicial com %d ordens criado com sucesso.", GridLevels * 2);
+      }
+      else
+      {
+         Print("Falha ao criar o grid inicial. Tentando novamente no próximo timer.");
+      }
+   }
+
+   // 2. Monitora e Repõe Ordens com Estratégia Avançada
+   if (g_initial_grid_created || OrdersTotal() > 0 || PositionsTotal() > 0)
+   {
+      MonitorAndReplaceOrdersEnhanced();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Cria o Grid Inicial de Ordens Pendentes                          |
+//+------------------------------------------------------------------+
+bool CreateInitialGrid()
+{
+   double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(current_ask <= 0 || current_bid <= 0)
+   {
+      Print("Erro: Não foi possível obter preços Ask/Bid válidos para ", _Symbol);
+      return false;
+   }
+
+   bool success = true;
+   int orders_placed = 0;
+   int price_index = 0;
+
+   // Cria Ordens Pendentes de Compra (BUY LIMIT)
+   for(int i = 1; i <= GridLevels; i++)
+   {
+      double entry_price = NormalizeDouble(current_bid - i * GridSpacingPips * g_pip_value, _Digits);
+      double take_profit = NormalizeDouble(entry_price + TakeProfitPips * g_pip_value, _Digits);
+      double stop_loss = UseStopLoss ? NormalizeDouble(entry_price - StopLossPips * g_pip_value, _Digits) : 0;
+      
+      // Armazena o nível de preço para referência
+      g_price_levels[price_index++] = entry_price;
+      
+      if (PlacePendingOrder(ORDER_TYPE_BUY_LIMIT, entry_price, take_profit, stop_loss))
+         orders_placed++;
+      else
+         success = false;
+   }
+
+   // Cria Ordens Pendentes de Venda (SELL LIMIT)
+   for(int i = 1; i <= GridLevels; i++)
+   {
+      double entry_price = NormalizeDouble(current_ask + i * GridSpacingPips * g_pip_value, _Digits);
+      double take_profit = NormalizeDouble(entry_price - TakeProfitPips * g_pip_value, _Digits);
+      double stop_loss = UseStopLoss ? NormalizeDouble(entry_price + StopLossPips * g_pip_value, _Digits) : 0;
+      
+      // Armazena o nível de preço para referência
+      g_price_levels[price_index++] = entry_price;
+      
+      if (PlacePendingOrder(ORDER_TYPE_SELL_LIMIT, entry_price, take_profit, stop_loss))
+         orders_placed++;
+      else
+         success = false;
+   }
+
+   PrintFormat("Tentativa de criação do grid: %d ordens colocadas.", orders_placed);
+   return success;
+}
+
+//+------------------------------------------------------------------+
+//| Coloca uma Ordem Pendente com Opção de Stop Loss                 |
+//+------------------------------------------------------------------+
+bool PlacePendingOrder(ENUM_ORDER_TYPE order_type, double price, double tp, double sl)
+{
+   // Verifica se já existe uma ordem pendente EXATAMENTE no mesmo preço e tipo
+   if(PendingOrderExists(order_type, price))
+   {
+      PrintFormat("Aviso: Ordem pendente %s no preço %.5f já existe. Ignorando.", EnumToString(order_type), price);
+      return true;
+   }
+
+   // Estrutura de requisição de ordem
+   MqlTradeRequest request = {};
+   MqlTradeResult  result = {};
+
+   // Preenche os detalhes da requisição
+   request.action       = TRADE_ACTION_PENDING;      // Ação de ordem pendente
+   request.symbol       = _Symbol;                   // Símbolo atual
+   request.volume       = LotVolume;                 // Volume da ordem
+   request.type         = order_type;                // Tipo de ordem (BUY_LIMIT ou SELL_LIMIT)
+   request.price        = price;                     // Preço de entrada
+   request.tp           = tp;                        // Take Profit
+   request.sl           = sl;                        // Stop Loss
+   request.magic        = MagicNumber;               // Número mágico
+   request.type_filling = ORDER_FILLING_RETURN;      // Tipo de preenchimento
+   request.deviation    = 10;                        // Desvio máximo permitido
+   request.comment      = "GridTraderEA";            // Comentário da ordem
+
+   // Envia a ordem
+   bool success = OrderSend(request, result);
+   if(!success)
+   {
+      // Obtém o código de erro específico
+      int error_code = GetLastError();
+      PrintFormat("Erro ao enviar ordem. Código: %d, Descrição: %s", 
+                  error_code, ErrorDescription(error_code));
+      return false;
+   }
+
+   // Verifica o resultado da ordem
+   if(result.retcode != TRADE_RETCODE_DONE)
+   {
+      PrintFormat("Ordem não colocada. Código de retorno: %d, Descrição: %s", 
+                   result.retcode, ErrorDescription(result.retcode));
+      return false;
+   }
+
+   PrintFormat("Ordem %s enviada. Preço: %.5f, TP: %.5f, SL: %.5f. Ticket: %d", 
+               EnumToString(order_type), price, tp, sl, result.order);
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Monitora e Repõe Ordens com Estratégia Avançada                  |
+//+------------------------------------------------------------------+
+void MonitorAndReplaceOrdersEnhanced()
+{
+   datetime end_time = TimeCurrent();
+   datetime start_time = end_time - (24 * 60 * 60); // 24 horas atrás
+
+   if(!HistorySelect(start_time, end_time))
+   {
+      Print("Erro ao selecionar histórico de deals.");
+      return;
+   }
+
+   int total_deals = HistoryDealsTotal();
+
+   for(int i = 0; i < total_deals; i++)
+   {
+      ulong deal_ticket = HistoryDealGetTicket(i);
+      if(deal_ticket == 0) continue;
+
+      // Verifica se o deal pertence a este EA
+      if(HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) != MagicNumber)
+         continue;
+
+      // Verifica se é um deal de saída (fechamento de posição)
+      if(HistoryDealGetInteger(deal_ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT)
+         continue;
+
+      // Verifica lucro
+      double profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+      if(profit <= 0) continue;
+
+      // Obtém informações do deal
+      double original_entry_price = HistoryDealGetDouble(deal_ticket, DEAL_PRICE);
+      ENUM_DEAL_TYPE deal_type = (ENUM_DEAL_TYPE)HistoryDealGetInteger(deal_ticket, DEAL_TYPE);
+
+      ENUM_ORDER_TYPE order_type_to_replace;
+      double new_take_profit;
+      double new_stop_loss = 0;
+
+      // Determina o tipo de ordem pendente e o TP para a reposição
+      if(deal_type == DEAL_TYPE_BUY)
+      {
+         order_type_to_replace = ORDER_TYPE_BUY_LIMIT;
+         new_take_profit = NormalizeDouble(original_entry_price + TakeProfitPips * g_pip_value, _Digits);
+         new_stop_loss = UseStopLoss ? NormalizeDouble(original_entry_price - StopLossPips * g_pip_value, _Digits) : 0;
+      }
+      else if(deal_type == DEAL_TYPE_SELL)
+      {
+         order_type_to_replace = ORDER_TYPE_SELL_LIMIT;
+         new_take_profit = NormalizeDouble(original_entry_price - TakeProfitPips * g_pip_value, _Digits);
+         new_stop_loss = UseStopLoss ? NormalizeDouble(original_entry_price + StopLossPips * g_pip_value, _Digits) : 0;
+      }
+      else
+      {
+         continue;
+      }
+
+      // Verifica o número de tentativas de reposição
+      int price_index = GetPriceIndex(original_entry_price);
+      if(price_index != -1 && g_replacement_attempts[price_index] >= MaxReplacementAttempts)
+      {
+         PrintFormat("Máximo de tentativas de reposição atingido para preço %.5f", original_entry_price);
+         continue;
+      }
+
+      // Tenta repor a ordem
+      PrintFormat("Deal lucrativo #%d (%.2f) detectado. Repondo ordem %s no preço %.5f",
+                   deal_ticket, profit, EnumToString(order_type_to_replace), original_entry_price);
+      
+      bool replacement_success = PlacePendingOrder(order_type_to_replace, original_entry_price, new_take_profit, new_stop_loss);
+      
+      // Atualiza o contador de tentativas
+      if(price_index != -1)
+      {
+         if(replacement_success)
+            g_replacement_attempts[price_index] = 0; // Zera ao ter sucesso
+         else
+            g_replacement_attempts[price_index]++; // Incrementa em caso de falha
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Encontra o índice de um preço no array de níveis                 |
+//+------------------------------------------------------------------+
+int GetPriceIndex(double price)
+{
+   double tolerance = _Point; // Tolerância para comparação de preços
+   
+   for(int i = 0; i < ArraySize(g_price_levels); i++)
+   {
+      if(MathAbs(g_price_levels[i] - price) < tolerance)
+         return i;
+   }
+   
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| Verifica se uma ordem pendente específica já existe              |
+//+------------------------------------------------------------------+
+bool PendingOrderExists(ENUM_ORDER_TYPE order_type, double price)
+{
+   // Use OrdersTotal() para obter o número total de ordens pendentes
+   int total_orders = OrdersTotal();
+   
+   for(int i = 0; i < total_orders; i++)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+
+      // Verifica se esta ordem pertence a este símbolo e EA
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol ||
+         OrderGetInteger(ORDER_MAGIC) != MagicNumber)
+         continue;
+
+      // Verifica se é o mesmo tipo e preço
+      if(OrderGetInteger(ORDER_TYPE) == order_type &&
+         MathAbs(OrderGetDouble(ORDER_PRICE_OPEN) - price) < _Point)
+      {
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Função para Descrição de Erros                                   |
+//+------------------------------------------------------------------+
+string ErrorDescription(int error_code)
+{
+   string error_string;
+   
+   switch(error_code)
+   {
+      case 0:    error_string = "Sem erros"; break;
+      case 4001: error_string = "Erro inesperado"; break;
+      case 4002: error_string = "Função inválida"; break;
+      case 4003: error_string = "Erro de troca de contexto"; break;
+      case 4004: error_string = "Pilha de memória insuficiente"; break;
+      case 4005: error_string = "Buffer de memória muito pequeno"; break;
+      case 4006: error_string = "Erro de configuração de parâmetro"; break;
+      case 4007: error_string = "Parâmetro de programa de erro zero"; break;
+      case 4008: error_string = "Erro de string de matriz"; break;
+      case 4009: error_string = "Erro de contador de referência de matriz"; break;
+      case 4010: error_string = "Erro de armazenamento de matriz"; break;
+      case 4011: error_string = "Erro de conteúdo de array"; break;
+      case 4012: error_string = "Ponteiro de array inexistente"; break;
+      case 4100: error_string = "Erro de array de string"; break;
+      case 4101: error_string = "Erro de array de contadores"; break;
+      case 4102: error_string = "Erro de biblioteca de array"; break;
+      case 4103: error_string = "Erro de biblioteca de série temporal"; break;
+      case 4104: error_string = "Erro de período personalizado"; break;
+
+      // Trade errors
+      case 10001: error_string = "Servidor de negociação ocupado"; break;
+      case 10004: error_string = "Negociação desabilitada"; break;
+      case 10006: error_string = "Negociação rejeitada"; break;
+      case 10007: error_string = "Negociação não permitida"; break;
+      case 10008: error_string = "Parada muito próxima ao preço"; break;
+      case 10009: error_string = "Requisiçao completa"; break;
+      case 10010: error_string = "Requisiçao requer confirmação"; break;
+      case 10011: error_string = "Erro na requisição"; break;
+      case 10012: error_string = "Erro na requisição, parâmetro inválido"; break;
+      case 10013: error_string = "Erro na requisição, ordens não permitidas"; break;
+      case 10014: error_string = "Erro na requisição, ordens proibidas no momento"; break;
+      case 10015: error_string = "Erro na requisição, ordens proibidas por conta"; break;
+      case 10016: error_string = "Erro na requisição, mercado fechado"; break;
+      case 10017: error_string = "Erro na requisição, volume da ordem muito pequeno"; break;
+      case 10018: error_string = "Erro na requisição, ordens de mercado proibidas"; break;
+      case 10019: error_string = "Erro na requisição, ordens pendentes proibidas"; break;
+      case 10020: error_string = "Tipo de ordem de negociação não suportado"; break;
+
+      default: error_string = "Código de erro desconhecido: " + IntegerToString(error_code); break;
+   }
+   return error_string;
+}
+
+//+------------------------------------------------------------------+
+//| Função de Tick (não utilizada na lógica principal deste EA)      |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // A lógica principal é controlada pelo OnTimer para evitar processamento excessivo a cada tick.
+}
+//+------------------------------------------------------------------+
