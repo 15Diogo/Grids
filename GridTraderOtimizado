@@ -1,0 +1,382 @@
+//+------------------------------------------------------------------+
+//|                                             AdaptiveGridEA.mq5 |
+//|                        Copyright 2025, Manus AI Services |
+//|                                             https://manus.ai |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, Manus AI Services"
+#property link      "https://manus.ai"
+#property version   "1.00"
+#property strict
+
+// Include required libraries
+#include <Trade\Trade.mqh>      // For CTrade class
+#include <Trade\SymbolInfo.mqh> // For symbol information functions
+
+//--- Input Parameters ---
+input group "Grid Settings"
+input int      GridLevels      = 10;    // Maximum levels in the grid (each side)
+input double   LotSize         = 0.01;  // Fixed lot size for orders
+input int      GridStepATRPeriod = 14;   // ATR period for grid step calculation
+input double   GridStepATRMultiplier = 1.0; // ATR multiplier for grid step
+input double   TakeProfitPoints = 500; // Take profit in points for each level (0 = disabled)
+
+input group "Risk Management"
+input double   GlobalStopLossPercentage = 2.0; // Global Stop Loss as % of Balance (0 = disabled)
+input int      MaxSpreadToTrade = 50; // Maximum allowed spread in points
+
+input group "Trend Filter Settings"
+input bool     EnableTrendFilter = true; // Enable/Disable Trend Filter
+input int      FastMAPeriod    = 50;    // Fast Moving Average period
+input int      SlowMAPeriod    = 200;   // Slow Moving Average period
+input ENUM_MA_METHOD MA_Method = MODE_EMA; // Moving Average method
+input ENUM_APPLIED_PRICE Applied_Price = PRICE_CLOSE; // Applied price for MAs
+
+input group "Debug Settings"
+input bool     EnableDebugLogs = true;  // Enable detailed debug logs
+
+//--- Global Variables ---
+double atrValue;
+double gridStepPips;
+double globalStopLossLevel = 0;
+int eaMagicNumber = 13579; // Unique magic number for this EA as integer
+int atrHandle;
+int fastMAHandle, slowMAHandle;
+CTrade trade; // Trade object
+bool gridInitialized = false;
+double gridBasePrice = 0;
+datetime lastTradeTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit() {
+   //--- Initialize indicators
+   atrHandle = iATR(_Symbol, PERIOD_CURRENT, GridStepATRPeriod);
+   if(atrHandle == INVALID_HANDLE) {
+      Print("Error initializing ATR indicator");
+      return INIT_FAILED;
+   }
+   
+   if(EnableTrendFilter) {
+      fastMAHandle = iMA(_Symbol, PERIOD_CURRENT, FastMAPeriod, 0, MA_Method, Applied_Price);
+      slowMAHandle = iMA(_Symbol, PERIOD_CURRENT, SlowMAPeriod, 0, MA_Method, Applied_Price);
+      
+      if(fastMAHandle == INVALID_HANDLE || slowMAHandle == INVALID_HANDLE) {
+         Print("Error initializing MA indicators");
+         return INIT_FAILED;
+      }
+   }
+   
+   //--- Initialize trade object
+   trade.SetExpertMagicNumber(eaMagicNumber);
+   
+   //--- Check for reasonable input values
+   if(GridLevels <= 0) {
+      Print("Error: GridLevels must be greater than 0.");
+      return(INIT_FAILED);
+   }
+   if(LotSize <= 0) {
+      Print("Error: LotSize must be greater than 0.");
+      return(INIT_FAILED);
+   }
+   if(GridStepATRPeriod <= 0 && GridStepATRMultiplier <=0) {
+       Print("Error: ATR Period and Multiplier for grid step must be positive if ATR is used.");
+       // Potentially allow fixed step if ATR params are zero, needs more logic
+       // For now, assume ATR is the primary method for step calculation
+       return(INIT_FAILED);
+   }
+
+   Print("Adaptive Grid EA Initialized Successfully.");
+   Print("Magic Number: ", eaMagicNumber);
+   Print("Grid Levels: ", GridLevels);
+   Print("Lot Size: ", LotSize);
+   Print("ATR Period for Step: ", GridStepATRPeriod);
+   Print("ATR Multiplier for Step: ", GridStepATRMultiplier);
+   Print("Take Profit Points: ", TakeProfitPoints);
+   Print("Global SL %: ", GlobalStopLossPercentage);
+   Print("Trend Filter Enabled: ", EnableTrendFilter);
+   if(EnableTrendFilter){
+      Print("Fast MA: ", FastMAPeriod, ", Slow MA: ", SlowMAPeriod);
+   }
+   
+   // Check if grid was already in place from previous run
+   CheckExistingGrid();
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+   //--- Release indicator handles
+   if(atrHandle != INVALID_HANDLE)
+      IndicatorRelease(atrHandle);
+      
+   if(EnableTrendFilter) {
+      if(fastMAHandle != INVALID_HANDLE)
+         IndicatorRelease(fastMAHandle);
+      if(slowMAHandle != INVALID_HANDLE)
+         IndicatorRelease(slowMAHandle);
+   }
+   
+   //--- Remove any objects created (e.g., chart lines if used for visualization)
+   Comment(""); // Clear comment on deinitialization
+   Print("Adaptive Grid EA Deinitialized. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick() {
+   //--- Check if trading is allowed
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED)) {
+      Comment("Trading is not allowed");
+      return;
+   }
+
+   //--- Check spread
+   double currentSpread = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(currentSpread > MaxSpreadToTrade * _Point) {
+      PrintFormat("Spread too high: %.1f points. Max allowed: %d points. No trading.", currentSpread / _Point, MaxSpreadToTrade);
+      return;
+   }
+
+   //--- Calculate ATR for dynamic grid step
+   double atrBuffer[];
+   if(CopyBuffer(atrHandle, 0, 0, 2, atrBuffer) > 0) {
+      atrValue = atrBuffer[0];
+   } else {
+      Print("Error copying ATR buffer. Cannot determine grid step.");
+      return;
+   }
+   gridStepPips = NormalizeDouble(atrValue * GridStepATRMultiplier / _Point, 0); // Grid step in pips
+   if(gridStepPips < 10) gridStepPips = 10; // Minimum grid step of 10 pips
+
+   //--- Trend Filter Logic ---
+   bool allowBuy = true;
+   bool allowSell = true;
+   if(EnableTrendFilter) {
+      double fastMABuffer[], slowMABuffer[];
+      
+      if(CopyBuffer(fastMAHandle, 0, 0, 1, fastMABuffer) <= 0 ||
+         CopyBuffer(slowMAHandle, 0, 0, 1, slowMABuffer) <= 0) {
+         Print("Error copying MA data");
+         return;
+      }
+      
+      double fastMA = fastMABuffer[0];
+      double slowMA = slowMABuffer[0];
+      
+      if(fastMA > slowMA) { // Uptrend perceived
+         allowSell = false; // Do not open new sell grid levels in an uptrend
+      } else if (fastMA < slowMA) { // Downtrend perceived
+         allowBuy = false;  // Do not open new buy grid levels in a downtrend
+      }
+   }
+
+   //--- Global Stop Loss Logic
+   if(GlobalStopLossPercentage > 0) {
+      double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double accountEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      
+      if(globalStopLossLevel == 0) {
+         globalStopLossLevel = accountBalance * (1.0 - GlobalStopLossPercentage / 100.0);
+      }
+      
+      // Check if equity dropped below stop loss level
+      if(accountEquity < globalStopLossLevel && PositionsTotal() > 0) {
+         CloseAllPositions(); 
+         Print("Global Stop Loss triggered! Equity: ", accountEquity, " StopLevel: ", globalStopLossLevel);
+         return;
+      }
+   }
+
+   //--- Main Grid Logic
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   // Initialize grid if not already done
+   if(!gridInitialized) {
+      InitializeGrid(currentBid, allowBuy, allowSell);
+      return;
+   }
+
+   // Check if we need to place additional grid levels
+   ManageGridLevels(currentBid, currentAsk, gridStepPips, allowBuy, allowSell);
+
+   // Check for take profit on individual positions
+   ManageTakeProfit();
+
+   // Display current status
+   Comment(StringFormat("Adaptive Grid EA Running\nATR: %.5f\nGrid Step: %.0f pips\nAllow Buy: %s\nAllow Sell: %s\nBase Price: %.5f", 
+                        atrValue, gridStepPips, BoolToString(allowBuy), BoolToString(allowSell), gridBasePrice));
+}
+
+//+------------------------------------------------------------------+
+//| Check if grid was already in place from previous run             |
+//+------------------------------------------------------------------+
+void CheckExistingGrid() {
+   int countPositions = 0;
+   double highestPrice = 0;
+   double lowestPrice = DBL_MAX;
+   
+   for(int i = 0; i < PositionsTotal(); i++) {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket)) {
+         if(PositionGetInteger(POSITION_MAGIC) == eaMagicNumber && PositionGetString(POSITION_SYMBOL) == _Symbol) {
+            countPositions++;
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            
+            if(openPrice > highestPrice) highestPrice = openPrice;
+            if(openPrice < lowestPrice) lowestPrice = openPrice;
+         }
+      }
+   }
+   
+   if(countPositions > 0) {
+      gridInitialized = true;
+      gridBasePrice = (highestPrice + lowestPrice) / 2;
+      if(EnableDebugLogs) Print("Existing grid detected. Base price calculated: ", gridBasePrice);
+   } else {
+      gridInitialized = false;
+      gridBasePrice = 0;
+      if(EnableDebugLogs) Print("No existing grid detected. Will initialize a new one.");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Initialize grid with first trades                               |
+//+------------------------------------------------------------------+
+void InitializeGrid(double currentPrice, bool allowBuy, bool allowSell) {
+   if(gridInitialized) return;
+
+   double takeProfitBuy = TakeProfitPoints > 0 ? currentPrice + TakeProfitPoints * _Point : 0;
+   double takeProfitSell = TakeProfitPoints > 0 ? currentPrice - TakeProfitPoints * _Point : 0;
+   
+   bool buySuccess = false;
+   bool sellSuccess = false;
+   
+   // Place initial buy position if allowed
+   if(allowBuy) {
+      if(trade.Buy(LotSize, _Symbol, 0, 0, takeProfitBuy, "Grid-Level-0-Buy")) {
+         if(EnableDebugLogs) Print("Initial BUY order placed at market. Level 0");
+         buySuccess = true;
+      } else {
+         Print("Failed to place initial BUY order. Error: ", GetLastError());
+      }
+   }
+   
+   // Place initial sell position if allowed
+   if(allowSell) {
+      if(trade.Sell(LotSize, _Symbol, 0, 0, takeProfitSell, "Grid-Level-0-Sell")) {
+         if(EnableDebugLogs) Print("Initial SELL order placed at market. Level 0");
+         sellSuccess = true;
+      } else {
+         Print("Failed to place initial SELL order. Error: ", GetLastError());
+      }
+   }
+   
+   if(buySuccess || sellSuccess) {
+      gridInitialized = true;
+      gridBasePrice = currentPrice;
+      lastTradeTime = TimeCurrent();
+      if(EnableDebugLogs) Print("Grid initialized at base price: ", gridBasePrice);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage grid levels based on price movement                      |
+//+------------------------------------------------------------------+
+void ManageGridLevels(double currentBid, double currentAsk, double stepPips, bool allowBuy, bool allowSell) {
+   if(!gridInitialized || gridBasePrice == 0) return;
+   
+   // Count existing grid levels for Buy and Sell
+   int buyLevels = 0;
+   int sellLevels = 0;
+   
+   for(int i = 0; i < PositionsTotal(); i++) {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      
+      if(PositionGetInteger(POSITION_MAGIC) == eaMagicNumber && PositionGetString(POSITION_SYMBOL) == _Symbol) {
+         if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
+            buyLevels++;
+         } else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) {
+            sellLevels++;
+         }
+      }
+   }
+   
+   // Add rate limiting to avoid opening too many positions at once
+   if(TimeCurrent() - lastTradeTime < 2) {
+      return; // Add at least 2 seconds between new orders
+   }
+
+   // Check if we need to add a buy level
+   if(allowBuy && buyLevels < GridLevels) {
+      double priceForNewBuy = gridBasePrice - stepPips * _Point * buyLevels;
+      
+      if(currentAsk <= priceForNewBuy) {
+         double tp = TakeProfitPoints > 0 ? currentAsk + TakeProfitPoints * _Point : 0;
+         
+         if(trade.Buy(LotSize, _Symbol, 0, 0, tp, "Grid-Level-" + IntegerToString(buyLevels) + "-Buy")) {
+            if(EnableDebugLogs) Print("New BUY grid level ", buyLevels, " placed at ", currentAsk);
+            lastTradeTime = TimeCurrent();
+         } else {
+            Print("Failed to place BUY grid level. Error: ", GetLastError());
+         }
+      }
+   }
+   
+   // Check if we need to add a sell level
+   if(allowSell && sellLevels < GridLevels) {
+      double priceForNewSell = gridBasePrice + stepPips * _Point * sellLevels;
+      
+      if(currentBid >= priceForNewSell) {
+         double tp = TakeProfitPoints > 0 ? currentBid - TakeProfitPoints * _Point : 0;
+         
+         if(trade.Sell(LotSize, _Symbol, 0, 0, tp, "Grid-Level-" + IntegerToString(sellLevels) + "-Sell")) {
+            if(EnableDebugLogs) Print("New SELL grid level ", sellLevels, " placed at ", currentBid);
+            lastTradeTime = TimeCurrent();
+         } else {
+            Print("Failed to place SELL grid level. Error: ", GetLastError());
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check for positions that reached take profit                     |
+//+------------------------------------------------------------------+
+void ManageTakeProfit() {
+   // This is handled by the platform since we use TP values when placing orders
+   // This method could be expanded for dynamic TP management or partial closing
+}
+
+//--- Function to close all positions for this EA ---
+void CloseAllPositions() {
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket)) {
+         if(PositionGetInteger(POSITION_MAGIC) == eaMagicNumber && PositionGetString(POSITION_SYMBOL) == _Symbol) {
+            if(trade.PositionClose(ticket)) {
+               if(EnableDebugLogs) Print("Position closed: ", ticket);
+            } else {
+               Print("Error closing position ", ticket, ". Error: ", GetLastError());
+            }
+         }
+      }
+   }
+   // Reset grid status
+   gridInitialized = false;
+   gridBasePrice = 0;
+}
+
+//--- Bool to String for Printing ---
+string BoolToString(bool val) {
+   if(val) return "true";
+   return "false";
+}
+
+//+------------------------------------------------------------------+
