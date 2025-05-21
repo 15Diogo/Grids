@@ -1,478 +1,697 @@
-// Grid Trader EA - Versão Revisada, Otimizada e Corrigida
-#include <Trade\Trade.mqh>
-#include <Trade\PositionInfo.mqh>
-#include <Trade\OrderInfo.mqh>
+//+------------------------------------------------------------------+
+//|                                              Zone Recovery EA.mq5 |
+//|                          Copyright 2025, MetaQuotes Software Corp |
+//|                                                                   |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025"
+#property link      ""
+#property version   "1.03"
 
+// Input parameters
+input string GeneralSettings = "--- General Settings ---"; // General Settings
+input double InitialLot = 0.01;        // Initial Lot Size
+input int TakeProfit = 30;             // Take Profit in points
+input int ZoneSize = 1000;              // Zone Size in points (distance between trades)
+input double LotMultiplier = 0.01;      // Multiplier for lot size on each level
+input int MaxTrades = 1000;               // Maximum number of trades
+input ENUM_POSITION_TYPE DefaultDirection = POSITION_TYPE_BUY; // Default trade direction
+
+input string TradeSettings = "--- Trade Management ---"; // Trade Management
+input bool UseTrailingStop = true;    // Use Trailing Stop
+input int TrailingDistance = 20;       // Trailing Stop Distance in points
+input int BreakEvenProfit = 15;         // Points in profit to move to break even
+input int BreakEvenDistance = 4;       // Break even distance in points
+
+// Additional debug settings
+input string DebugSettings = "--- Debug Settings ---"; // Debug Settings
+input bool IsDebugMode = true;         // Enable detailed debug messages
+input bool ForceOpenBuy = true;       // Force open a BUY trade (for testing)
+input bool ForceOpenSell = true;      // Force open a SELL trade (for testing)
+input bool ContinuousTrading = true;   // Continue trading after closing all positions
+
+// Trading objects
+#include <Trade/Trade.mqh>
 CTrade trade;
-CPositionInfo positionInfo;
-COrderInfo orderInfo;
 
-// Parâmetros de entrada
-input double InitialPrice = 0; // Preço inicial (0 = preço atual)
-input int GridLevels = 20; // Número de níveis da grade
-input double GridSize = 10; // Tamanho da grade em pips
-input bool UseExponentialGrid = true; // Usar grade exponencial
-input double GridExponent = 1.5; // Expoente para grade exponencial (>1)
-input bool UseAsymmetricGrid = true; // Usar grade assimétrica
-input double BuyGridMultiplier = 0.02; // Multiplicador para níveis de compra
-input double SellGridMultiplier = 0.02; // Multiplicador para níveis de venda
-input double RiskPercent = 10.0; // Risco em porcentagem do saldo (0 = usar lote fixo)
-input double InitialLotSize = 0.01; // Tamanho do lote inicial (usado se RiskPercent=0)
-input double LotMultiplier = 0.1; // Multiplicador para níveis subsequentes
-input double MinimumLotSize = 0.01; // Tamanho mínimo de lote permitido
-input double MaximumLotSize = 10.0; // Tamanho máximo de lote permitido
-input double MinExposureAmount = 100.0; // Valor mínimo de exposição em moeda (para cálculo de lote)
-input bool AdjustLotsForMinExposure = true; // Ajustar lotes para garantir exposição mínima
-input double TakeProfit = 0; // Take Profit em pips (0 = desativado)
-input double StopLoss = 0; // Stop Loss em pips (0 = desativado)
-input double TrailingStopDistance = 20; // Distância do trailing stop em pips
-input bool UseTrailingStop = false; // Usar trailing stop
-input double MaxDrawdownPercent = 100; // Percentual máximo de drawdown
+// Global variables
+int zoneRecoveryMagic = 12345678910111213141516;        // Magic number for orders
+double point;                          // Point value
+int zoneDirection = 1;                 // Direction of current zone recovery (1=buy, -1=sell, 0=none)
+int totalTrades = 0;                   // Total number of trades in the current series
+datetime lastActionTime = 0;           // Time of last trading action
+bool forceNewTrade = true;            // Flag to force a new trade after closing all positions
 
-// Variáveis globais
-double g_initialBalance = 0;
-double g_point = 0;
-int g_digits = 0;
-double g_buyLevels[];
-double g_sellLevels[];
-ulong g_ticket_buy[];
-ulong g_ticket_sell[];
-int g_totalBuyOrders = 0;
-int g_totalSellOrders = 0;
-bool g_initialized = false;
-double g_symbolPointValue = 0; // Valor de 1 ponto para o símbolo atual
-double g_workingMinLotSize = 0; // Variável interna para o tamanho mínimo do lote
-
-// Inicialização
-int OnInit() {
-    LogMessage("Iniciando Grid Trader EA...");
-    
-    g_initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-    g_point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    g_digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-    
-    // Ajuste para Forex (converte para valor de pip correto)
-    if(g_digits == 3 || g_digits == 5)
-        g_point *= 10;
-        
-    // Teste de permissão de trading
-    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) {
-        LogMessage("Aviso: Trading automático não está permitido!");
-        return INIT_FAILED;
-    }
-    
-    // Calcular valor do ponto para cálculos de exposição
-    CalculatePointValue();
-    
-    // Inicializar variável de tamanho mínimo de lote com o valor do input
-    g_workingMinLotSize = MinimumLotSize;
-    
-    // Verificar tamanho mínimo de lote
-    double symbolMinLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-    if(g_workingMinLotSize < symbolMinLot) {
-        LogMessage("Aviso: Tamanho mínimo de lote definido (" + DoubleToString(g_workingMinLotSize, 2) + 
-                   ") é menor que o permitido pelo símbolo (" + DoubleToString(symbolMinLot, 2) + 
-                   "). Ajustando para " + DoubleToString(symbolMinLot, 2));
-        g_workingMinLotSize = symbolMinLot;
-    }
-
-    ArrayResize(g_buyLevels, GridLevels);
-    ArrayResize(g_sellLevels, GridLevels);
-    ArrayResize(g_ticket_buy, GridLevels);
-    ArrayResize(g_ticket_sell, GridLevels);
-    
-    // Inicializa arrays de tickets
-    for(int i = 0; i < GridLevels; i++) {
-        g_ticket_buy[i] = 0;
-        g_ticket_sell[i] = 0;
-    }
-    
-    CalculateGridLevels();
-    PlaceInitialOrders();
-    
-    g_initialized = true;
-    LogMessage("Grid Trader EA inicializado com sucesso");
-    
-    return INIT_SUCCEEDED;
+//+------------------------------------------------------------------+
+//| Expert initialization function                                    |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Initialize point value based on digits
+   point = _Point;
+   
+   // Set Magic number for all trades
+   trade.SetExpertMagicNumber(zoneRecoveryMagic);
+   
+   // Set timer for regular checks (every 5 seconds)
+   EventSetTimer(5);
+   
+   // Debug messages
+   Print("=================================================");
+   Print("Zone Recovery EA initialized (Continuous Trading Version)");
+   Print("Symbol: ", _Symbol);
+   Print("Point value: ", point);
+   Print("Initial lot: ", InitialLot);
+   Print("Magic number: ", zoneRecoveryMagic);
+   Print("Continuous Trading Mode: ", ContinuousTrading ? "ON" : "OFF");
+   
+   // Check if AutoTrading is enabled
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+   {
+      Print("WARNING: AutoTrading is not enabled! Enable AutoTrading in the terminal.");
+   }
+   
+   // Check account trade modes
+   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
+   {
+      Print("WARNING: Expert Advisors trading is disabled for this account!");
+   }
+   
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+   {
+      Print("WARNING: Trading is not allowed for this account!");
+   }
+   
+   Print("=================================================");
+   
+   return(INIT_SUCCEEDED);
 }
 
-// Desinicialização
-void OnDeinit(const int reason) {
-    LogMessage("Desativando Grid Trader EA...");
-    
-    // Fechar posições apenas se solicitado explicitamente (removendo todas as ordens pendentes)
-    for (int i = OrdersTotal() - 1; i >= 0; i--) {
-        ulong ticket = OrderGetTicket(i);
-        if (OrderSelect(ticket) && OrderGetString(ORDER_SYMBOL) == _Symbol) {
-            if (!trade.OrderDelete(ticket)) {
-                LogMessage("Erro ao excluir ordem #" + IntegerToString(ticket) + ": " + trade.ResultComment());
-            }
-        }
-    }
-    
-    ArrayFree(g_buyLevels);
-    ArrayFree(g_sellLevels);
-    ArrayFree(g_ticket_buy);
-    ArrayFree(g_ticket_sell);
-    
-    LogMessage("Grid Trader EA desativado");
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                  |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // Kill timer
+   EventKillTimer();
+      
+   Print("Zone Recovery EA deinitialized with reason code: ", reason);
 }
 
-// Loop principal
-void OnTick() {
-    if(!g_initialized) return;
-    
-    // Verificar drawdown
-    CheckDrawdown();
-    
-    // Verificar e substituir ordens
-    CheckAndReplaceOrders();
-    
-    // Aplicar trailing stop quando ativado
-    if(UseTrailingStop) {
-        ApplyTrailingStop();
-    }
-    
-    // Exibir informações no gráfico
-    DisplayInfo();
+//+------------------------------------------------------------------+
+//| Expert tick function                                              |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Main processing function that will handle trading logic
+   ProcessTrading();
 }
 
-// Verificar drawdown e parar o EA se necessário
-void CheckDrawdown() {
-    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-    double drawdown = (g_initialBalance - currentEquity) / g_initialBalance * 100;
-    
-    if(drawdown >= MaxDrawdownPercent) {
-        LogMessage("Drawdown máximo atingido (" + DoubleToString(drawdown, 2) + "%). Fechando todas as ordens.");
-        CloseAllOrders();
-        ExpertRemove();
-    }
+//+------------------------------------------------------------------+
+//| Timer event handler                                               |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   // Use timer to regularly check market conditions
+   ProcessTrading();
 }
 
-// Calcular o valor do ponto para o símbolo
-void CalculatePointValue() {
-    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-    double contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
-    
-    // Calcular valor de 1 ponto
-    g_symbolPointValue = (tickValue / tickSize) * g_point;
-    
-    string accountCurrency = AccountInfoString(ACCOUNT_CURRENCY);
-    string profitCurrency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
-    
-    LogMessage("Valor do ponto calculado: " + DoubleToString(g_symbolPointValue, 8) + 
-               " " + profitCurrency + " por lote");
-    
-    // Se moedas forem diferentes, mostrar aviso
-    if(accountCurrency != profitCurrency) {
-        LogMessage("Aviso: Moeda da conta (" + accountCurrency + 
-                   ") difere da moeda do símbolo (" + profitCurrency + 
-                   "). Conversão será necessária para calculos de exposição.");
-    }
+//+------------------------------------------------------------------+
+//| Main trading logic function                                       |
+//+------------------------------------------------------------------+
+void ProcessTrading()
+{
+   // Count trades and get the current zone direction
+   CountZoneTrades();
+   
+   // Check for force trade (debug mode)
+   if(totalTrades == 0 || forceNewTrade)
+   {
+      // Reset force new trade flag
+      forceNewTrade = false;
+      
+      // Force open a BUY trade if specified
+      if(ForceOpenBuy)
+      {
+         Print("DEBUG: Force BUY trade enabled - attempting to open a BUY trade...");
+         OpenTrade(POSITION_TYPE_BUY);
+         ResetForceOpenFlags();
+         return;
+      }
+      
+      // Force open a SELL trade if specified
+      if(ForceOpenSell)
+      {
+         Print("DEBUG: Force SELL trade enabled - attempting to open a SELL trade...");
+         OpenTrade(POSITION_TYPE_SELL);
+         ResetForceOpenFlags();
+         return;
+      }
+   }
+   
+   // If we have no trades, immediately open a trade using default direction
+   if(totalTrades == 0 || forceNewTrade)
+   {
+      // Reset force new trade flag
+      forceNewTrade = false;
+      
+      // No filters - just open a trade in the default direction
+      OpenTradeWithoutFilters();
+   }
+   else
+   {
+      // Print trade status regularly
+      if(IsDebugMode)
+      {
+         double totalProfit = CalculateTotalProfit();
+         Print("Active trades: ", totalTrades, ", Direction: ", 
+               zoneDirection == 1 ? "BUY" : "SELL", ", Total profit: ", 
+               DoubleToString(totalProfit, 2), " ", AccountInfoString(ACCOUNT_CURRENCY));
+      }
+   }
+   
+   // Manage existing trades (recovery, trailing, break even)
+   ManageOpenTrades();
 }
 
-// Calcular os níveis da grade
-void CalculateGridLevels() {
-    double centerPrice = InitialPrice > 0 ? InitialPrice : (SymbolInfoDouble(_Symbol, SYMBOL_ASK) + SymbolInfoDouble(_Symbol, SYMBOL_BID)) / 2;
-    
-    LogMessage("Preço central: " + DoubleToString(centerPrice, g_digits));
-    LogMessage("Tamanho do ponto: " + DoubleToString(g_point, 8));
-
-    for (int i = 0; i < GridLevels; i++) {
-        double buyOffset, sellOffset;
-        
-        if (UseExponentialGrid) {
-            buyOffset = GridSize * MathPow(i + 1, GridExponent) * g_point;
-            sellOffset = GridSize * MathPow(i + 1, GridExponent) * g_point;
-        } else {
-            buyOffset = GridSize * (i + 1) * g_point;
-            sellOffset = GridSize * (i + 1) * g_point;
-        }
-
-        if (UseAsymmetricGrid) {
-            buyOffset *= BuyGridMultiplier;
-            sellOffset *= SellGridMultiplier;
-        }
-        
-        g_buyLevels[i] = NormalizeDouble(centerPrice - buyOffset, g_digits);
-        g_sellLevels[i] = NormalizeDouble(centerPrice + sellOffset, g_digits);
-        
-        // Calcular lote para este nível
-        double lotSize = CalculateLotSize(i);
-        
-        LogMessage("Nível " + IntegerToString(i) + ": Compra em " + DoubleToString(g_buyLevels[i], g_digits) + 
-                   ", Venda em " + DoubleToString(g_sellLevels[i], g_digits) + 
-                   ", Lote: " + DoubleToString(lotSize, 2));
-    }
+//+------------------------------------------------------------------+
+//| Reset force open flags to prevent continuous order placement      |
+//+------------------------------------------------------------------+
+void ResetForceOpenFlags()
+{
+   // We can't directly modify input variables, so we need to work around this
+   // Just logging that it would be reset in a real scenario
+   Print("NOTE: Force trade flags would be reset in non-input variables");
 }
 
-// Colocar ordens iniciais
-void PlaceInitialOrders() {
-    LogMessage("Colocando ordens iniciais...");
-    
-    for (int i = 0; i < GridLevels; i++) {
-        double lotSize = CalculateLotSize(i);
-        
-        // Colocar ordem de compra
-        if(PlaceBuyOrder(g_buyLevels[i], lotSize, i)) {
-            LogMessage("Ordem de compra colocada no nível " + IntegerToString(i) + " em " + 
-                       DoubleToString(g_buyLevels[i], g_digits) + " com lote " + DoubleToString(lotSize, 2));
-        }
-        
-        // Colocar ordem de venda
-        if(PlaceSellOrder(g_sellLevels[i], lotSize, i)) {
-            LogMessage("Ordem de venda colocada no nível " + IntegerToString(i) + " em " + 
-                       DoubleToString(g_sellLevels[i], g_digits) + " com lote " + DoubleToString(lotSize, 2));
-        }
-    }
-}
-
-// Colocar ordem de compra
-bool PlaceBuyOrder(double price, double lotSize, int level) {
-    double sl = StopLoss > 0 ? NormalizeDouble(price - StopLoss * g_point, g_digits) : 0;
-    double tp = TakeProfit > 0 ? NormalizeDouble(price + TakeProfit * g_point, g_digits) : 0;
-
-    if (trade.BuyLimit(lotSize, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "Grid EA Buy " + IntegerToString(level))) {
-        g_ticket_buy[level] = trade.ResultOrder();
-        return true;
-    } else {
-        LogMessage("Erro ao colocar ordem de compra: " + IntegerToString(trade.ResultRetcode()) + " - " + trade.ResultComment());
-        return false;
-    }
-}
-
-// Colocar ordem de venda
-bool PlaceSellOrder(double price, double lotSize, int level) {
-    double sl = StopLoss > 0 ? NormalizeDouble(price + StopLoss * g_point, g_digits) : 0;
-    double tp = TakeProfit > 0 ? NormalizeDouble(price - TakeProfit * g_point, g_digits) : 0;
-
-    if (trade.SellLimit(lotSize, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "Grid EA Sell " + IntegerToString(level))) {
-        g_ticket_sell[level] = trade.ResultOrder();
-        return true;
-    } else {
-        LogMessage("Erro ao colocar ordem de venda: " + IntegerToString(trade.ResultRetcode()) + " - " + trade.ResultComment());
-        return false;
-    }
-}
-
-// Verificar se ordem existe pelo ticket
-bool OrderExists(ulong ticket) {
-    if(ticket == 0) return false;
-    
-    for(int i = 0; i < OrdersTotal(); i++) {
-        ulong currentTicket = OrderGetTicket(i);
-        if(currentTicket == ticket && OrderSelect(currentTicket)) {
-            if(OrderGetString(ORDER_SYMBOL) == _Symbol) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// Verificar e substituir ordens perdidas
-void CheckAndReplaceOrders() {
-    for (int i = 0; i < GridLevels; i++) {
-        // Verificar ordem de compra
-        if(!OrderExists(g_ticket_buy[i])) {
-            double lotSize = CalculateLotSize(i);
-            if(PlaceBuyOrder(g_buyLevels[i], lotSize, i)) {
-                LogMessage("Nova ordem de compra colocada no nível " + IntegerToString(i));
-            }
-        }
-        
-        // Verificar ordem de venda
-        if(!OrderExists(g_ticket_sell[i])) {
-            double lotSize = CalculateLotSize(i);
-            if(PlaceSellOrder(g_sellLevels[i], lotSize, i)) {
-                LogMessage("Nova ordem de venda colocada no nível " + IntegerToString(i));
-            }
-        }
-    }
-}
-
-// Aplicar trailing stop
-void ApplyTrailingStop() {
-    datetime currentTime = TimeCurrent();
-    static datetime lastCheck = 0;
-
-    // Limitar a frequência das verificações
-    if (currentTime - lastCheck < 10) return;
-    lastCheck = currentTime;
-
-    for (int i = 0; i < PositionsTotal(); i++) {
-        if (positionInfo.SelectByIndex(i) && positionInfo.Symbol() == _Symbol) {
-            double currentSL = positionInfo.StopLoss();
-            double currentPrice = positionInfo.PriceCurrent();
-            double newSL;
+//+------------------------------------------------------------------+
+//| Count trades in the current zone recovery series                  |
+//+------------------------------------------------------------------+
+void CountZoneTrades()
+{
+   totalTrades = 0;
+   zoneDirection = 0;
+   
+   // Loop through all positions
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         long magic = PositionGetInteger(POSITION_MAGIC);
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         
+         if(magic == zoneRecoveryMagic && symbol == _Symbol)
+         {
+            totalTrades++;
             
-            if (positionInfo.Type() == POSITION_TYPE_BUY) {
-                newSL = NormalizeDouble(currentPrice - TrailingStopDistance * g_point, g_digits);
-                // Só move o SL se o novo for maior que o atual (e o atual não for zero)
-                if ((currentSL == 0 || newSL > currentSL) && currentPrice - newSL >= TrailingStopDistance * g_point) {
-                    trade.PositionModify(positionInfo.Ticket(), newSL, positionInfo.TakeProfit());
-                }
-            } else {
-                newSL = NormalizeDouble(currentPrice + TrailingStopDistance * g_point, g_digits);
-                // Só move o SL se o novo for menor que o atual (e o atual não for zero)
-                if ((currentSL == 0 || newSL < currentSL) && newSL - currentPrice >= TrailingStopDistance * g_point) {
-                    trade.PositionModify(positionInfo.Ticket(), newSL, positionInfo.TakeProfit());
-                }
+            // Determine zone direction from the first trade found
+            if(zoneDirection == 0)
+            {
+               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                  zoneDirection = 1;
+               else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+                  zoneDirection = -1;
             }
-        }
-    }
+         }
+      }
+   }
 }
 
-// Fechar todas as ordens e posições
-void CloseAllOrders() {
-    LogMessage("Fechando todas as ordens e posições...");
-    
-    // Fechar todas as posições abertas
-    for (int i = PositionsTotal() - 1; i >= 0; i--) {
-        if (positionInfo.SelectByIndex(i) && positionInfo.Symbol() == _Symbol) {
-            if (!trade.PositionClose(positionInfo.Ticket())) {
-                LogMessage("Erro ao fechar posição #" + IntegerToString(positionInfo.Ticket()) + ": " + trade.ResultComment());
+//+------------------------------------------------------------------+
+//| Open new trade without any filtering (REMOVED FILTERS)            |
+//+------------------------------------------------------------------+
+void OpenTradeWithoutFilters()
+{
+   // Simply open a trade in the default direction without any filters
+   Print("Opening trade with default direction without filters");
+   OpenTrade(DefaultDirection);
+}
+
+//+------------------------------------------------------------------+
+//| Open a new trade                                                  |
+//+------------------------------------------------------------------+
+void OpenTrade(ENUM_POSITION_TYPE type)
+{
+   // Set up trading parameters
+   double volume = InitialLot;
+   double sl = 0.0; // No stop loss for zone recovery
+   double tp = 0.0;
+   
+   // Check minimum lot size restrictions
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   if(volume < minLot)
+   {
+      Print("WARNING: Initial lot ", volume, " is below minimum lot size ", minLot, ". Adjusting to minimum.");
+      volume = minLot;
+   }
+   
+   if(volume > maxLot)
+   {
+      Print("WARNING: Initial lot ", volume, " is above maximum lot size ", maxLot, ". Adjusting to maximum.");
+      volume = maxLot;
+   }
+   
+   // Normalize volume according to lot step
+   volume = NormalizeDouble(MathFloor(volume / lotStep) * lotStep, 2);
+   
+   if(type == POSITION_TYPE_BUY)
+   {
+      tp = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + TakeProfit * point;
+      Print("Trying to BUY at market price, TP: ", tp, ", Lot: ", volume);
+   }
+   else
+   {
+      tp = SymbolInfoDouble(_Symbol, SYMBOL_BID) - TakeProfit * point;
+      Print("Trying to SELL at market price, TP: ", tp, ", Lot: ", volume);
+   }
+   
+   // Execute trade using CTrade without any filters or checks
+   bool result = false;
+   if(type == POSITION_TYPE_BUY)
+      result = trade.Buy(volume, _Symbol, 0, sl, tp, "Zone Recovery EA");
+   else
+      result = trade.Sell(volume, _Symbol, 0, sl, tp, "Zone Recovery EA");
+   
+   // Check result
+   if(result)
+   {
+      Print("Trade executed: ", EnumToString(type), " result: ", trade.ResultRetcode(), ", Ticket: ", trade.ResultOrder());
+      totalTrades = 1;
+      zoneDirection = (type == POSITION_TYPE_BUY) ? 1 : -1;
+      lastActionTime = TimeCurrent();
+      forceNewTrade = false;  // Reset the force new trade flag
+   }
+   else
+   {
+      Print("ERROR: Failed to open trade - result code: ", trade.ResultRetcode(), 
+            ", Comment: ", trade.ResultComment(), ", Error: ", GetLastError());
+            
+      // Print trade context and error details
+      PrintTradeContextError();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Print detailed trade context errors                               |
+//+------------------------------------------------------------------+
+void PrintTradeContextError()
+{
+   int lastError = GetLastError();
+   
+   Print("Last error code: ", lastError, " - check details below");
+   
+   // Check common trading errors
+   if(lastError == 4109) // TRADE_RETCODE_DONE
+      Print("Trade operation completed successfully");
+   else if(lastError == 4051) // TRADE_RETCODE_REJECT 
+      Print("Request rejected by trade server");
+   else if(lastError == 4063) // TRADE_RETCODE_VOLUME_LIMIT
+      Print("Volume limit exceeded");
+   else if(lastError == 4064) // TRADE_RETCODE_LIMIT_VOLUME
+      Print("Position limit reached");
+   else if(lastError == 4065) // TRADE_RETCODE_LIMIT_ORDERS
+      Print("Orders limit reached");
+   else if(lastError == 4108) // TRADE_RETCODE_NO_CHANGES
+      Print("No changes in request");
+   
+   // Print trade context info
+   Print("Check if context is busy: ", !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ? "YES" : "NO");
+   Print("Check if trade is allowed: ", !MQLInfoInteger(MQL_TRADE_ALLOWED) ? "NO" : "YES");
+   Print("Check if EA trading is allowed: ", !AccountInfoInteger(ACCOUNT_TRADE_EXPERT) ? "NO" : "YES");
+}
+
+//+------------------------------------------------------------------+
+//| Manage existing trades for zone recovery                          |
+//+------------------------------------------------------------------+
+void ManageOpenTrades()
+{
+   // If no trades, nothing to manage
+   if(totalTrades == 0)
+      return;
+      
+   // Calculate total profit of all trades
+   double totalProfit = CalculateTotalProfit();
+   
+   // Check if we should close all trades with profit
+   if(totalProfit > 0)
+   {
+      if(CloseAllTrades())
+      {
+         Print("Closed all trades with profit: ", totalProfit);
+         
+         // In continuous trading mode, set flag to immediately open a new trade
+         if(ContinuousTrading)
+         {
+            Print("Continuous trading mode enabled. Will open new trade immediately.");
+            forceNewTrade = true;
+         }
+         
+         // Reset trade counters
+         totalTrades = 0;
+         zoneDirection = 0;
+         return;
+      }
+   }
+   
+   // Always allow opening recovery trades regardless of MaxTrades limit
+   // by removing the if(totalTrades < MaxTrades) condition
+   
+   // Check if we need to open a recovery trade
+   double entryPrice = GetAverageEntryPrice();
+   double currentPrice = (zoneDirection == 1) ? 
+                        SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                        SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                        
+   double distance = MathAbs(entryPrice - currentPrice) / point;
+   
+   if(IsDebugMode)
+   {
+      Print("Zone recovery check - Entry price: ", entryPrice, ", Current price: ", currentPrice, 
+            ", Distance in points: ", distance, ", Required zone size: ", ZoneSize);
+   }
+   
+   // Removed MaxTrades check - If price moved against us by ZoneSize points, immediately open a recovery trade
+   if((zoneDirection == 1 && currentPrice < entryPrice - ZoneSize * point) ||
+      (zoneDirection == -1 && currentPrice > entryPrice + ZoneSize * point))
+   {
+      // No delay between trades - immediately open a recovery trade
+      OpenRecoveryTrade();
+      lastActionTime = TimeCurrent();
+   }
+   
+   // Apply trailing stop if enabled
+   if(UseTrailingStop && totalProfit > 0)
+   {
+      ApplyTrailingStop();
+   }
+   
+   // Apply break even if enabled
+   if(totalProfit > BreakEvenProfit * point)
+   {
+      ApplyBreakEven();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open a recovery trade for zone recovery                           |
+//+------------------------------------------------------------------+
+void OpenRecoveryTrade()
+{
+   // Calculate recovery lot size based on previous trades
+   double recoveryLot = InitialLot * MathPow(LotMultiplier, totalTrades);
+   
+   // Normalize lot size according to broker restrictions
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   recoveryLot = MathMin(maxLot, MathMax(minLot, NormalizeDouble(recoveryLot, 2)));
+   
+   // Set up trading parameters
+   double sl = 0.0; // No stop loss for zone recovery
+   double tp = 0.0;
+   ENUM_POSITION_TYPE type;
+   
+   // Open trade in the same direction as the current series
+   // This is important for zone recovery/grid strategy
+   if(zoneDirection == 1) // Current series is BUY, open another BUY
+   {
+      type = POSITION_TYPE_BUY;
+      tp = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + TakeProfit * point;
+   }
+   else // Current series is SELL, open another SELL
+   {
+      type = POSITION_TYPE_SELL;
+      tp = SymbolInfoDouble(_Symbol, SYMBOL_BID) - TakeProfit * point;
+   }
+   
+   Print("Opening recovery trade: Type: ", EnumToString(type), ", Lot: ", recoveryLot, 
+         ", TP: ", tp);
+   
+   // Execute trade using CTrade
+   bool result = false;
+   if(type == POSITION_TYPE_BUY)
+      result = trade.Buy(recoveryLot, _Symbol, 0, sl, tp, "Zone Recovery");
+   else
+      result = trade.Sell(recoveryLot, _Symbol, 0, sl, tp, "Zone Recovery");
+   
+   // Check result
+   if(result)
+   {
+      Print("Recovery trade executed: ", EnumToString(type), ", Lot: ", recoveryLot, 
+            ", Result: ", trade.ResultRetcode(), ", Ticket: ", trade.ResultOrder());
+      totalTrades++;
+   }
+   else
+   {
+      Print("Error opening recovery trade: ", GetLastError(), 
+            ", Code: ", trade.ResultRetcode(), ", Comment: ", trade.ResultComment());
+      
+      // Print trade context and error details
+      PrintTradeContextError();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate the total profit of all trades in the series            |
+//+------------------------------------------------------------------+
+double CalculateTotalProfit()
+{
+   double profit = 0;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         long magic = PositionGetInteger(POSITION_MAGIC);
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         
+         if(magic == zoneRecoveryMagic && symbol == _Symbol)
+         {
+            profit += PositionGetDouble(POSITION_PROFIT);
+         }
+      }
+   }
+   
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| Get the average entry price of all trades                         |
+//+------------------------------------------------------------------+
+double GetAverageEntryPrice()
+{
+   double totalVolume = 0;
+   double volumeWeightedPrice = 0;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         long magic = PositionGetInteger(POSITION_MAGIC);
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         
+         if(magic == zoneRecoveryMagic && symbol == _Symbol)
+         {
+            double volume = PositionGetDouble(POSITION_VOLUME);
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            
+            totalVolume += volume;
+            volumeWeightedPrice += volume * openPrice;
+         }
+      }
+   }
+   
+   if(totalVolume > 0)
+      return volumeWeightedPrice / totalVolume;
+      
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Close all trades in the current zone recovery series              |
+//+------------------------------------------------------------------+
+bool CloseAllTrades()
+{
+   bool success = true;
+   
+   // Create an array to store positions to close
+   ulong tickets[];
+   int count = 0;
+   
+   // First, collect all position tickets
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         long magic = PositionGetInteger(POSITION_MAGIC);
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         
+         if(magic == zoneRecoveryMagic && symbol == _Symbol)
+         {
+            // Resize array and add ticket
+            ArrayResize(tickets, count + 1);
+            tickets[count] = ticket;
+            count++;
+         }
+      }
+   }
+   
+   Print("Attempting to close ", count, " trades");
+   
+   // Now close all positions
+   for(int i = 0; i < count; i++)
+   {
+      if(PositionSelectByTicket(tickets[i]))
+      {
+         // Use CTrade to close position
+         if(!trade.PositionClose(tickets[i]))
+         {
+            Print("Error closing position ", tickets[i], ": ", GetLastError(), 
+                  ", Code: ", trade.ResultRetcode(), ", Comment: ", trade.ResultComment());
+            success = false;
+         }
+         else
+         {
+            Print("Position closed: ", tickets[i]);
+         }
+      }
+   }
+   
+   return success;
+}
+
+//+------------------------------------------------------------------+
+//| Apply trailing stop to all trades                                 |
+//+------------------------------------------------------------------+
+void ApplyTrailingStop()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         long magic = PositionGetInteger(POSITION_MAGIC);
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         
+         if(magic == zoneRecoveryMagic && symbol == _Symbol)
+         {
+            double currentSL = PositionGetDouble(POSITION_SL);
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            
+            double newSL = 0;
+            bool modifyFlag = false;
+            
+            // Calculate new stop loss based on position type
+            if(posType == POSITION_TYPE_BUY)
+            {
+               double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+               
+               // Only apply trailing stop if price moved in favorable direction
+               if(bid > openPrice + TrailingDistance * point)
+               {
+                  newSL = NormalizeDouble(bid - TrailingDistance * point, _Digits);
+                  
+                  // Only modify if the new SL is higher than the current one
+                  if(currentSL < newSL || currentSL == 0)
+                     modifyFlag = true;
+               }
             }
-        }
-    }
-
-    // Excluir todas as ordens pendentes
-    for (int i = OrdersTotal() - 1; i >= 0; i--) {
-        ulong ticket = OrderGetTicket(i);
-        if (OrderSelect(ticket) && OrderGetString(ORDER_SYMBOL) == _Symbol) {
-            if (!trade.OrderDelete(ticket)) {
-                LogMessage("Erro ao excluir ordem #" + IntegerToString(ticket) + ": " + trade.ResultComment());
-            }
-        }
-    }
-    
-    // Resetar tickets
-    for(int i = 0; i < GridLevels; i++) {
-        g_ticket_buy[i] = 0;
-        g_ticket_sell[i] = 0;
-    }
-}
-
-// Exibir informações no gráfico
-void DisplayInfo() {
-    double totalProfit = 0;
-    int totalPositions = 0, buyPositions = 0, sellPositions = 0;
-    int pendingOrders = 0;
-    double totalExposure = 0;
-
-    // Verificar posições abertas
-    for (int i = 0; i < PositionsTotal(); i++) {
-        if (positionInfo.SelectByIndex(i) && positionInfo.Symbol() == _Symbol) {
-            totalProfit += positionInfo.Profit();
-            totalPositions++;
-            
-            // Calcular exposição total (volume * preço)
-            totalExposure += positionInfo.Volume() * positionInfo.PriceCurrent();
-            
-            if (positionInfo.Type() == POSITION_TYPE_BUY) buyPositions++;
-            if (positionInfo.Type() == POSITION_TYPE_SELL) sellPositions++;
-        }
-    }
-    
-    // Contar ordens pendentes
-    for (int i = 0; i < OrdersTotal(); i++) {
-        ulong ticket = OrderGetTicket(i);
-        if (OrderSelect(ticket) && OrderGetString(ORDER_SYMBOL) == _Symbol) {
-            pendingOrders++;
-        }
-    }
-
-    // Calcular drawdown
-    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-    double drawdown = (g_initialBalance - currentEquity) / g_initialBalance * 100;
-    if(drawdown < 0) drawdown = 0; // Não mostrar valores negativos
-
-    // Formatar informações para exibir
-    string info = "";
-    info += "=== Informações do Grid EA ===\n";
-    info += "Lucro Atual: " + DoubleToString(totalProfit, 2) + " " + AccountInfoString(ACCOUNT_CURRENCY) + "\n";
-    info += "Saldo Inicial: " + DoubleToString(g_initialBalance, 2) + " " + AccountInfoString(ACCOUNT_CURRENCY) + "\n";
-    info += "Equity Atual: " + DoubleToString(currentEquity, 2) + " " + AccountInfoString(ACCOUNT_CURRENCY) + "\n";
-    info += "Exposição Total: " + DoubleToString(totalExposure, 2) + "\n";
-    info += "Exposição Mínima: " + DoubleToString(MinExposureAmount, 2) + " (Ajuste: " + (AdjustLotsForMinExposure ? "Sim" : "Não") + ")\n";
-    info += "Drawdown: " + DoubleToString(drawdown, 2) + "% (Máx: " + DoubleToString(MaxDrawdownPercent, 2) + "%)\n";
-    info += "Posições: " + IntegerToString(totalPositions) + " (C: " + IntegerToString(buyPositions) + ", V: " + IntegerToString(sellPositions) + ")\n";
-    info += "Ordens Pendentes: " + IntegerToString(pendingOrders) + "\n";
-    info += "Lote Mínimo: " + DoubleToString(MinimumLotSize, 2) + ", Máximo: " + DoubleToString(MaximumLotSize, 2) + "\n";
-
-    Comment(info);
-}
-
-// Calcular tamanho do lote
-double CalculateLotSize(int level) {
-    double lotSize;
-    
-    if(RiskPercent > 0) {
-        // Baseado no risco
-        lotSize = NormalizeDouble(AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100 / 1000, 2);
-    } else {
-        // Tamanho fixo com multiplicador por nível
-        lotSize = InitialLotSize;
-        if(level > 0 && LotMultiplier > 0) {
-            lotSize *= (1 + level * LotMultiplier);
-        }
-    }
-    
-    // Ajuste para garantir exposição mínima se ativado
-    if(AdjustLotsForMinExposure && MinExposureAmount > 0) {
-        // Obter valor de 1 lote em moeda da conta
-        double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-        double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-        double contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
-        
-        // Fator de conversão para obter o valor real em moeda da conta
-        double conversionFactor = 1.0;
-        string accountCurrency = AccountInfoString(ACCOUNT_CURRENCY);
-        string profitCurrency = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
-        
-        // Se moeda da conta e do símbolo forem diferentes, tentar converter
-        if(accountCurrency != profitCurrency) {
-            string conversionPair = profitCurrency + accountCurrency;
-            double conversionRate = 1.0;
-            
-            // Tentar obter taxa de conversão (simplificação)
-            // Na prática, você pode precisar de lógica adicional baseada em seu broker
-            if(SymbolInfoDouble(conversionPair, SYMBOL_BID) > 0) {
-                conversionRate = SymbolInfoDouble(conversionPair, SYMBOL_BID);
-            } else if(SymbolInfoDouble(accountCurrency + profitCurrency, SYMBOL_BID) > 0) {
-                conversionRate = 1.0 / SymbolInfoDouble(accountCurrency + profitCurrency, SYMBOL_BID);
+            else // POSITION_TYPE_SELL
+            {
+               double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+               
+               // Only apply trailing stop if price moved in favorable direction
+               if(ask < openPrice - TrailingDistance * point)
+               {
+                  newSL = NormalizeDouble(ask + TrailingDistance * point, _Digits);
+                  
+                  // Only modify if the new SL is lower than the current one or not set
+                  if(currentSL > newSL || currentSL == 0)
+                     modifyFlag = true;
+               }
             }
             
-            conversionFactor = conversionRate;
-        }
-        
-        // Calcular valor de 1 pip para 1 lote padrão
-        double pipValue = tickValue * (0.0001 / tickSize) * contractSize * conversionFactor;
-        
-        // Calcular lote necessário para exposição mínima
-        double lotForMinExposure = MinExposureAmount / (100 * pipValue);
-        
-        // Ajustar o tamanho do lote para garantir exposição mínima
-        if(lotSize < lotForMinExposure) {
-            lotSize = lotForMinExposure;
-            LogMessage("Lote ajustado para exposição mínima: " + DoubleToString(lotSize, 2));
-        }
-    }
-    
-    // Validar o tamanho mínimo e máximo do lote
-    double minLot = MathMax(g_workingMinLotSize, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
-    if(lotSize < minLot) lotSize = minLot;
-    
-    // Arredondar para o incremento de lote do símbolo
-    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-    lotSize = MathFloor(lotSize / lotStep) * lotStep;
-    
-    // Não exceder o tamanho máximo do lote
-    return MathMin(lotSize, MaximumLotSize);
+            // Modify position if needed
+            if(modifyFlag)
+            {
+               if(!trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP)))
+               {
+                  Print("Error modifying SL: ", GetLastError(), 
+                        ", Code: ", trade.ResultRetcode(), ", Comment: ", trade.ResultComment());
+               }
+               else
+               {
+                  Print("Modified trailing stop for position ", ticket, " to ", newSL);
+               }
+            }
+         }
+      }
+   }
 }
 
-// Registrar mensagens no log
-void LogMessage(string message) {
-    Print(TimeCurrent(), " - Grid EA: ", message);
+//+------------------------------------------------------------------+
+//| Apply break even to all trades                                    |
+//+------------------------------------------------------------------+
+void ApplyBreakEven()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         long magic = PositionGetInteger(POSITION_MAGIC);
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         
+         if(magic == zoneRecoveryMagic && symbol == _Symbol)
+         {
+            double currentSL = PositionGetDouble(POSITION_SL);
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            
+            double newSL = 0;
+            bool modifyFlag = false;
+            
+            // Set break even SL
+            if(posType == POSITION_TYPE_BUY)
+            {
+               newSL = openPrice + BreakEvenDistance * point;
+               
+               // Only modify if the new SL is higher than the current one or not set
+               if(currentSL < newSL || currentSL == 0)
+                  modifyFlag = true;
+            }
+            else // POSITION_TYPE_SELL
+            {
+               newSL = openPrice - BreakEvenDistance * point;
+               
+               // Only modify if the new SL is lower than the current one or not set
+               if(currentSL > newSL || currentSL == 0)
+                  modifyFlag = true;
+            }
+            
+            // Modify position if needed
+            if(modifyFlag)
+            {
+               if(!trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP)))
+               {
+                  Print("Error setting break even: ", GetLastError(), 
+                        ", Code: ", trade.ResultRetcode(), ", Comment: ", trade.ResultComment());
+               }
+               else
+               {
+                  Print("Modified position ", ticket, " to break even at ", newSL);
+               }
+            }
+         }
+      }
+   }
 }
+//+------------------------------------------------------------------+
