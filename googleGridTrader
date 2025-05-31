@@ -1,0 +1,528 @@
+//+------------------------------------------------------------------+
+//|                                  GradienteLinearGrid_EA_v2.mq5 |
+//|                                                     Seu Nome Aqui |
+//|                                             https://www.example.com |
+//+------------------------------------------------------------------+
+#property copyright "Seu Nome Aqui"
+#property link      "https://www.example.com"
+#property version   "2.00"
+#property description "Expert Advisor conceitual para Gradiente Linear com Grid (v2 - Melhorado)"
+
+//--- Incluir bibliotecas necessárias
+#include <Trade\Trade.mqh>         // Biblioteca para operações de negociação
+#include <Trade\PositionInfo.mqh>  // Biblioteca para informações de posição
+#include <MovingAverages.mqh>      // Para a Média Móvel
+
+//--- Parâmetros de entrada do EA
+input group "Parâmetros do Gradiente (EMA)"
+input int                EMA_Period           = 50;        // Período da Média Móvel Exponencial
+input ENUM_MA_METHOD     EMA_Method           = MODE_EMA;  // Método da Média Móvel
+input ENUM_APPLIED_PRICE EMA_AppliedPrice     = PRICE_CLOSE; // Preço aplicado para a EMA
+
+input group "Parâmetros do Grid"
+input double             LotSize                  = 0.01;   // Tamanho do lote inicial
+input int                GridStepPoints           = 100;    // Distância entre as ordens do grid (em pontos)
+input int                MaxGridOrders            = 5;      // Número máximo de ordens no grid em uma direção
+input double             TakeProfitPoints         = 200;    // Take Profit para cada ordem (em pontos)
+input double             StopLossPoints           = 100;    // Stop Loss para cada ordem (em pontos) - CUIDADO!
+input int                MaxGridSpreadFromMarketPoints = 1000; // Distância máxima (pontos) do preço atual para novas ordens do grid
+
+input group "Gerenciamento do EA"
+input ulong              MagicNumber              = 12345;  // Número mágico para identificar as ordens do EA
+input int                Slippage                 = 5;      // Slippage permitido em pontos
+
+//--- Variáveis globais
+CTrade                   trade;                   // Objeto para negociação
+CPositionInfo            posInfo;                 // Objeto para informações de posição
+double                   emaValueCurrent;
+double                   emaValuePrevious;
+string                   symbol;
+double                   pointValue;              // Valor de um ponto para o símbolo atual
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Inicializar objetos e variáveis
+   symbol = Symbol();
+   pointValue = SymbolInfoDouble(symbol, SYMBOL_POINT);
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(Slippage);
+   trade.SetTypeFillingBySymbol(symbol); // Define o tipo de preenchimento de ordem
+
+   //--- Verificar parâmetros
+   if(GridStepPoints <= 0 || MaxGridOrders <= 0 || LotSize <= 0 || MaxGridSpreadFromMarketPoints <=0)
+   {
+      Print("Erro: Parâmetros do grid inválidos.");
+      return(INIT_FAILED);
+   }
+   if(TakeProfitPoints <=0 && StopLossPoints <=0)
+   {
+       Print("Aviso: TakeProfit e StopLoss não definidos para as ordens do grid.");
+   }
+
+   PrintFormat("EA GradienteLinearGrid_EA (v2) inicializado: %s", symbol);
+   PrintFormat("EMA Período: %d, Passo Grid: %d pts, Max Ordens: %d, Max Dist. Grid: %d pts",
+               EMA_Period, GridStepPoints, MaxGridOrders, MaxGridSpreadFromMarketPoints);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   PrintFormat("EA GradienteLinearGrid_EA (v2) desinicializado. Razão: %d", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Obter preços atuais
+   MqlTick latest_tick;
+   if(!SymbolInfoTick(symbol, latest_tick))
+   {
+      Print("Erro ao obter o tick atual para ", symbol);
+      return;
+   }
+
+   //--- Calcular EMA
+   double ema_buffer[];
+   if(CopyBuffer(iMA(symbol, Period(), EMA_Period, 0, EMA_Method, EMA_AppliedPrice), 0, 0, 2, ema_buffer) < 2)
+   {
+      Print("Erro ao copiar buffer da EMA.");
+      return;
+   }
+   emaValuePrevious = ema_buffer[0]; // EMA da penúltima vela fechada (mais antiga das duas)
+   emaValueCurrent  = ema_buffer[1]; // EMA da vela fechada mais recente (mais nova das duas)
+
+
+   //--- Lógica da Estratégia
+   ManageGrid();
+}
+
+//+------------------------------------------------------------------+
+//| Gerencia o Grid de Ordens                                        |
+//+------------------------------------------------------------------+
+void ManageGrid()
+{
+   //--- Obter preços atuais para colocar ordens
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+
+   if(ask == 0 || bid == 0 || pointValue == 0)
+   {
+      Print("Erro ao obter ask/bid/pointValue para ", symbol);
+      return;
+   }
+
+   //--- Contar ordens pendentes e posições abertas pelo EA
+   int open_buy_positions = 0;
+   int open_sell_positions = 0;
+   int pending_buy_stops = 0;
+   int pending_sell_stops = 0;
+
+   CountEAOrdersAndPositions(open_buy_positions, open_sell_positions, pending_buy_stops, pending_sell_stops);
+
+   //--- Lógica de abertura do Grid baseada na EMA (Gradiente Linear)
+
+   // Tendência de ALTA (EMA atual > EMA anterior)
+   if(emaValueCurrent > emaValuePrevious)
+   {
+      // Limpar ordens Sell Stop pendentes, pois a tendência é de alta
+      ClosePendingOrders(ORDER_TYPE_SELL_STOP);
+      // Opcional: Gerenciar/fechar posições de Venda (requer lógica cuidadosa)
+      // ClosePositionsByType(POSITION_TYPE_SELL);
+
+      // Abrir novas ordens Buy Stop se não houver muitas posições/ordens de compra
+      if(open_buy_positions + pending_buy_stops < MaxGridOrders)
+      {
+         double last_buy_order_or_position_price = GetLastOrderOrPositionPrice(ORDER_TYPE_BUY_STOP, POSITION_TYPE_BUY, ask);
+         double price_to_open;
+
+         if(last_buy_order_or_position_price == ask) // Nenhuma ordem/posição de compra anterior encontrada
+         {
+            price_to_open = NormalizeDouble(ask + GridStepPoints * pointValue, _Digits);
+         }
+         else // Baseado na última ordem/posição de compra
+         {
+            price_to_open = NormalizeDouble(last_buy_order_or_position_price + GridStepPoints * pointValue, _Digits);
+         }
+
+         // Verificar se a nova ordem não está muito longe do preço atual
+         if (price_to_open > ask + MinStopLevelPoints() * pointValue && // Acima do stop level
+             price_to_open <= ask + MaxGridSpreadFromMarketPoints * pointValue) // Dentro da distância máxima
+         {
+            PlacePendingOrder(ORDER_TYPE_BUY_STOP, price_to_open, LotSize,
+                              (TakeProfitPoints > 0 ? price_to_open + TakeProfitPoints * pointValue : 0),
+                              (StopLossPoints > 0 ? price_to_open - StopLossPoints * pointValue : 0),
+                              "Grid Buy Stop EMA Up");
+         }
+         else if (price_to_open > ask + MaxGridSpreadFromMarketPoints * pointValue)
+         {
+             //PrintFormat("Nova Buy Stop %.5f muito distante do Ask %.5f (Max Dist: %d pts)", price_to_open, ask, MaxGridSpreadFromMarketPoints);
+         }
+      }
+   }
+   // Tendência de BAIXA (EMA atual < EMA anterior)
+   else if(emaValueCurrent < emaValuePrevious)
+   {
+      // Limpar ordens Buy Stop pendentes, pois a tendência é de baixa
+      ClosePendingOrders(ORDER_TYPE_BUY_STOP);
+      // Opcional: Gerenciar/fechar posições de Compra
+      // ClosePositionsByType(POSITION_TYPE_BUY);
+
+      // Abrir novas ordens Sell Stop se não houver muitas posições/ordens de venda
+      if(open_sell_positions + pending_sell_stops < MaxGridOrders)
+      {
+         double last_sell_order_or_position_price = GetLastOrderOrPositionPrice(ORDER_TYPE_SELL_STOP, POSITION_TYPE_SELL, bid);
+         double price_to_open;
+
+         if(last_sell_order_or_position_price == bid) // Nenhuma ordem/posição de venda anterior
+         {
+            price_to_open = NormalizeDouble(bid - GridStepPoints * pointValue, _Digits);
+         }
+         else // Baseado na última ordem/posição de venda
+         {
+            price_to_open = NormalizeDouble(last_sell_order_or_position_price - GridStepPoints * pointValue, _Digits);
+         }
+
+         // Verificar se a nova ordem não está muito longe do preço atual
+         if (price_to_open < bid - MinStopLevelPoints() * pointValue && price_to_open > 0 && // Abaixo do stop level e > 0
+             price_to_open >= bid - MaxGridSpreadFromMarketPoints * pointValue) // Dentro da distância máxima
+         {
+            PlacePendingOrder(ORDER_TYPE_SELL_STOP, price_to_open, LotSize,
+                              (TakeProfitPoints > 0 ? price_to_open - TakeProfitPoints * pointValue : 0),
+                              (StopLossPoints > 0 ? price_to_open + StopLossPoints * pointValue : 0),
+                              "Grid Sell Stop EMA Down");
+         }
+         else if (price_to_open < bid - MaxGridSpreadFromMarketPoints * pointValue && price_to_open > 0)
+         {
+            //PrintFormat("Nova Sell Stop %.5f muito distante do Bid %.5f (Max Dist: %d pts)", price_to_open, bid, MaxGridSpreadFromMarketPoints);
+         }
+      }
+   }
+   // Sem tendência clara (EMA estável ou cruzando muito próximo) - Nenhuma ação de abertura de novas séries de grid
+   else
+   {
+       // Print("EMA estável ou sem tendência clara. Nenhuma nova série de grid iniciada.");
+   }
+
+   // Gerenciamento de Stop Loss e Take Profit para posições abertas (se não definido na ordem)
+   // Esta parte pode ser complexa e depende se você quer TP/SL individual ou para o grid como um todo.
+   // ManageOpenPositionsTP_SL(); // Função de placeholder comentada no final
+}
+
+//+------------------------------------------------------------------+
+//| Conta ordens e posições do EA                                    |
+//+------------------------------------------------------------------+
+void CountEAOrdersAndPositions(int &open_buy_pos, int &open_sell_pos, int &pending_buy_stp, int &pending_sell_stp)
+{
+   open_buy_pos = 0;
+   open_sell_pos = 0;
+   pending_buy_stp = 0;
+   pending_sell_stp = 0;
+
+   // Contar posições abertas
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == symbol && posInfo.Magic() == MagicNumber)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+            open_buy_pos++;
+         else if(posInfo.PositionType() == POSITION_TYPE_SELL)
+            open_sell_pos++;
+      }
+   }
+
+   // Contar ordens pendentes
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong order_ticket = OrderGetTicket(i);
+      if(order_ticket > 0 && OrderGetString(ORDER_SYMBOL) == symbol && OrderGetInteger(ORDER_MAGIC) == MagicNumber)
+      {
+         ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         if(order_type == ORDER_TYPE_BUY_STOP)
+            pending_buy_stp++;
+         else if(order_type == ORDER_TYPE_SELL_STOP)
+            pending_sell_stp++;
+      }
+   }
+}
+
+
+//+------------------------------------------------------------------+
+//| Coloca uma Ordem Pendente                                        |
+//+------------------------------------------------------------------+
+bool PlacePendingOrder(ENUM_ORDER_TYPE type, double price, double volume, double tp_price, double sl_price, string comment)
+{
+   MqlTradeRequest request;
+   MqlTradeResult  result;
+   
+   // Inicializar estrutura manualmente
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   // Define a ação da requisição - ESSENCIAL antes de OrderSend()
+   request.action       = TRADE_ACTION_PENDING;
+   
+   request.symbol       = symbol;
+   request.volume       = volume;
+   request.type         = type;
+   request.price        = NormalizeDouble(price, _Digits);
+   request.tp           = (tp_price > 0) ? NormalizeDouble(tp_price, _Digits) : 0;
+   request.sl           = (sl_price > 0) ? NormalizeDouble(sl_price, _Digits) : 0;
+   request.magic        = MagicNumber;
+   request.comment      = comment;
+   request.type_filling = SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+   request.deviation    = (ulong)Slippage;
+
+   // Verificações básicas de validade dos preços de SL/TP em relação ao preço da ordem
+   double stopLevelDistance = MinStopLevelPoints() * pointValue;
+
+   if(request.sl != 0)
+   {
+      if(type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_LIMIT) // Para ordens de compra
+      {
+         if(request.price - request.sl < stopLevelDistance)
+         {
+            PrintFormat("SL para ordem %s (%.5f) muito próximo do preço da ordem %.5f. SL ajustado ou removido.", EnumToString(type), request.sl, request.price);
+            request.sl = NormalizeDouble(request.price - stopLevelDistance - pointValue, _Digits); 
+            if(request.sl <=0) request.sl = 0; 
+         }
+      }
+      else // Para ordens de venda (SELL_STOP, SELL_LIMIT)
+      {
+         if(request.sl - request.price < stopLevelDistance)
+         {
+            PrintFormat("SL para ordem %s (%.5f) muito próximo do preço da ordem %.5f. SL ajustado ou removido.", EnumToString(type), request.sl, request.price);
+            request.sl = NormalizeDouble(request.price + stopLevelDistance + pointValue, _Digits);
+         }
+      }
+   }
+   if(request.tp != 0)
+   {
+      if(type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_LIMIT) // Para ordens de compra
+      {
+         if(request.tp - request.price < stopLevelDistance)
+         {
+            PrintFormat("TP para ordem %s (%.5f) muito próximo do preço da ordem %.5f. TP ajustado ou removido.", EnumToString(type), request.tp, request.price);
+            request.tp = NormalizeDouble(request.price + stopLevelDistance + pointValue, _Digits);
+         }
+      }
+      else // Para ordens de venda
+      {
+         if(request.price - request.tp < stopLevelDistance)
+         {
+            PrintFormat("TP para ordem %s (%.5f) muito próximo do preço da ordem %.5f. TP ajustado ou removido.", EnumToString(type), request.tp, request.price);
+            request.tp = NormalizeDouble(request.price - stopLevelDistance - pointValue, _Digits);
+            if(request.tp <=0) request.tp = 0;
+         }
+      }
+   }
+
+   if(!trade.OrderSend(request, result))
+   {
+      PrintFormat("Erro ao enviar ordem pendente %s: %s. Código: %d, Preço req:%.5f",
+                  EnumToString(type), result.comment, result.retcode, request.price);
+      return(false);
+   }
+
+   PrintFormat("Ordem pendente %s enviada: #%d, Preço: %.5f, TP: %.5f, SL: %.5f",
+               EnumToString(type), result.order, request.price, request.tp, request.sl);
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Obtém o preço da última ordem/posição para basear o próximo nível |
+//+------------------------------------------------------------------+
+double GetLastOrderOrPositionPrice(ENUM_ORDER_TYPE pending_order_type_to_check, ENUM_POSITION_TYPE position_type_to_check, double current_market_price_for_direction)
+{
+   double   last_relevant_price = current_market_price_for_direction;
+   datetime last_relevant_time = 0;
+   bool     found_relevant_order_or_position = false;
+
+   // Verificar posições abertas primeiro, pois são "mais ativas" que pendentes
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == symbol && posInfo.Magic() == MagicNumber && posInfo.PositionType() == position_type_to_check)
+      {
+         if(posInfo.Time() > last_relevant_time)
+         {
+            last_relevant_price = posInfo.PriceOpen();
+            last_relevant_time = posInfo.Time();
+            found_relevant_order_or_position = true;
+         }
+      }
+   }
+
+   // Verificar ordens pendentes
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong order_ticket = OrderGetTicket(i);
+      if(OrderSelect(order_ticket) && OrderGetInteger(ORDER_MAGIC) == MagicNumber && OrderGetString(ORDER_SYMBOL) == symbol)
+      {
+         if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) == pending_order_type_to_check)
+         {
+            if(OrderGetInteger(ORDER_TIME_SETUP) > last_relevant_time)
+            {
+               last_relevant_price = OrderGetDouble(ORDER_PRICE_OPEN);
+               last_relevant_time = OrderGetInteger(ORDER_TIME_SETUP);
+               found_relevant_order_or_position = true;
+            }
+         }
+      }
+   }
+
+   if(found_relevant_order_or_position)
+      return NormalizeDouble(last_relevant_price, _Digits);
+   else
+      return NormalizeDouble(current_market_price_for_direction, _Digits); // Retorna o preço de mercado se nada foi encontrado
+}
+
+
+//+------------------------------------------------------------------+
+//| Fecha todas as ordens pendentes de um tipo específico            |
+//+------------------------------------------------------------------+
+void ClosePendingOrders(ENUM_ORDER_TYPE type_to_close)
+{
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+    {
+        ulong order_ticket = OrderGetTicket(i);
+        if(OrderSelect(order_ticket)) // Seleciona a ordem para obter suas propriedades
+        {
+            if(OrderGetInteger(ORDER_MAGIC) == MagicNumber &&
+               OrderGetString(ORDER_SYMBOL) == symbol &&
+               (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) == type_to_close)
+            {
+                MqlTradeRequest request;
+                MqlTradeResult  result;
+                
+                // Inicializar estrutura manualmente
+                ZeroMemory(request);
+                ZeroMemory(result);
+                
+                // Define a ação da requisição - ESSENCIAL antes de OrderSend()
+                request.action = TRADE_ACTION_REMOVE; 
+                
+                request.order  = order_ticket;
+                request.symbol = symbol; 
+
+                if(!trade.OrderSend(request,result))
+                {
+                    PrintFormat("Erro ao deletar ordem pendente #%d (%s): %s. Código: %d",
+                                order_ticket, EnumToString(type_to_close), result.comment, result.retcode);
+                }
+                else
+                {
+                    PrintFormat("Ordem pendente #%d (%s) deletada com sucesso.",
+                                order_ticket, EnumToString(type_to_close));
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Fecha todas as posições de um tipo específico (COMPRA ou VENDA)  |
+//| CUIDADO: Usar esta função pode fechar posições lucrativas/perdedoras prematuramente. |
+//+------------------------------------------------------------------+
+/*
+void ClosePositionsByType(ENUM_POSITION_TYPE position_type_to_close)
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(posInfo.SelectByIndex(i))
+        {
+            if(posInfo.Symbol() == symbol && posInfo.Magic() == MagicNumber && posInfo.PositionType() == position_type_to_close)
+            {
+                PrintFormat("Tentando fechar posição #%d (%s) do tipo %s", posInfo.Ticket(), symbol, EnumToString(position_type_to_close));
+                if(!trade.PositionClose(posInfo.Ticket(), (ulong)Slippage))
+                {
+                    PrintFormat("Erro ao fechar posição #%d: %s. Código: %d", posInfo.Ticket(), trade.ResultComment(), trade.ResultRetcode());
+                }
+                else
+                {
+                    PrintFormat("Posição #%d (%s) fechada com sucesso.", posInfo.Ticket(), EnumToString(position_type_to_close));
+                }
+            }
+        }
+    }
+}
+*/
+
+//+------------------------------------------------------------------+
+//| Retorna o valor mínimo de StopLevel em pontos                    |
+//+------------------------------------------------------------------+
+int MinStopLevelPoints()
+{
+    return (int)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+}
+
+//+------------------------------------------------------------------+
+//| Função para gerenciar TP/SL de posições abertas (Exemplo básico) |
+//+------------------------------------------------------------------+
+/*
+void ManageOpenPositionsTP_SL()
+{
+    // Esta função é um placeholder.
+    // Você precisaria iterar por todas as posições abertas por este EA
+    // e verificar se o TP/SL global do grid foi atingido, ou ajustar TPs/SLs individuais.
+    // Por exemplo, um TP global para todo o grid quando o lucro total atingir X,
+    // ou um SL global quando a perda total atingir Y.
+
+    double total_profit_buy = 0;
+    double total_profit_sell = 0;
+    int    count_buy = 0;
+    int    count_sell = 0;
+    // double current_balance = AccountInfoDouble(ACCOUNT_BALANCE); // Para drawdown
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(posInfo.SelectByIndex(i) && posInfo.Symbol() == symbol && posInfo.Magic() == MagicNumber)
+        {
+            if(posInfo.PositionType() == POSITION_TYPE_BUY)
+            {
+                total_profit_buy += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+                count_buy++;
+            }
+            else if(posInfo.PositionType() == POSITION_TYPE_SELL)
+            {
+                total_profit_sell += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+                count_sell++;
+            }
+        }
+    }
+
+    // Exemplo: Se tiver X ordens de compra e o lucro total for Y, fechar todas as compras
+    // double targetProfitAmount = 50.0; // Exemplo: $50 de lucro
+    // if(count_buy > 0 && total_profit_buy >= targetProfitAmount) {
+    //    PrintFormat("Lucro total de Compra atingido (%.2f). Fechando %d posições de compra.", total_profit_buy, count_buy);
+    //    ClosePositionsByType(POSITION_TYPE_BUY);
+    // }
+    // if(count_sell > 0 && total_profit_sell >= targetProfitAmount) {
+    //    PrintFormat("Lucro total de Venda atingido (%.2f). Fechando %d posições de venda.", total_profit_sell, count_sell);
+    //    ClosePositionsByType(POSITION_TYPE_SELL);
+    // }
+
+    // Exemplo de Stop Loss Global para o Grid (baseado em % da equidade ou valor fixo)
+    // double maxGridLossAmount = -100.0; // Exemplo: -$100 de prejuízo
+    // if(count_buy > 0 && total_profit_buy <= maxGridLossAmount) {
+    //    PrintFormat("Prejuízo total de Compra atingido (%.2f). Fechando %d posições de compra.", total_profit_buy, count_buy);
+    //    ClosePositionsByType(POSITION_TYPE_BUY);
+    //    // Poderia também fechar ordens pendentes de compra aqui
+    //    ClosePendingOrders(ORDER_TYPE_BUY_STOP);
+    // }
+    // if(count_sell > 0 && total_profit_sell <= maxGridLossAmount) {
+    //    PrintFormat("Prejuízo total de Venda atingido (%.2f). Fechando %d posições de venda.", total_profit_sell, count_sell);
+    //    ClosePositionsByType(POSITION_TYPE_SELL);
+    //    ClosePendingOrders(ORDER_TYPE_SELL_STOP);
+    // }
+}
+*/
+//+------------------------------------------------------------------+
