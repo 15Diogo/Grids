@@ -1,0 +1,672 @@
+//+------------------------------------------------------------------+
+//|                                   GridTraderEA_v6_LimitGrid.mq5 |
+//|                        Copyright 2025, Manus AI for User Request |
+//|          MQL5 Version for Multi-Symbol Trading with LIMIT Orders |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, Manus AI for User Request"
+#property link      ""
+#property version   "1.06_LimitGrid"
+#property strict
+
+#include <Trade\Trade.mqh> // Include standard trading library
+
+//--- Input parameters
+input string InpSymbol1           = "EURUSD"; // Symbol 1 to trade
+input string InpSymbol2           = "USDCHF"; // Symbol 2 to trade (leave empty to disable)
+input double InpGridPips          = 30.0;    // Grid distance in Pips (applied to both symbols)
+input double InpTakeProfitPips    = 15.0;    // Take Profit in Pips (applied to both symbols)
+input double InpLotSize           = 0.01;    // Order Volume (applied to both symbols)
+input int    InpMaxOrdersPerSide  = 15;      // Max orders per side (per symbol)
+input double InpGlobalStopLoss    = 100.0;   // Global Stop Loss in Account Currency (applied PER SYMBOL)
+input bool   InpUseATRFilter      = false;   // Use ATR Filter to start (per symbol)? (Default OFF for Limit Grid)
+input ENUM_TIMEFRAMES InpATRTimeframe = PERIOD_H1; // ATR Timeframe (per symbol)
+input int    InpATRPeriod         = 14;      // ATR Period (per symbol)
+input double InpATRThreshold      = 1.0;     // ATR Threshold in Pips (per symbol)
+input ulong  InpMagicNumber       = 20250533; // Magic Number (ulong for MQL5) - Changed slightly
+input uint   InpSlippage          = 3;       // Slippage in points (uint for MQL5)
+input bool   InpReplaceOrderOnTP  = true;    // Replace order at same price on TP?
+
+//--- Constants for symbol indices
+#define SYMBOL_1 0
+#define SYMBOL_2 1
+#define MAX_SYMBOLS 2
+
+//--- Global variables
+string symbolNames[MAX_SYMBOLS];
+double gridStepPoints[MAX_SYMBOLS];
+double takeProfitPoints[MAX_SYMBOLS];
+double atrThresholdPoints[MAX_SYMBOLS];
+int    atrHandle[MAX_SYMBOLS];
+double pipValue[MAX_SYMBOLS];
+string eaComment = "GridTraderEA_Manus_v6LG";
+CTrade trade; // Trading object - SINGLE instance is fine
+ulong  lastHistoryCheckTime = 0; // To avoid checking history too often
+ulong  lastDealTicketProcessed = 0; // To avoid processing the same deal multiple times
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Populate symbol names array
+   symbolNames[SYMBOL_1] = InpSymbol1;
+   symbolNames[SYMBOL_2] = InpSymbol2;
+
+   //--- Check parameters
+   if(InpMaxOrdersPerSide <= 0)
+   {
+      Print("Error: MaxOrdersPerSide must be greater than 0.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+   if(InpGridPips <= 0 || InpTakeProfitPips <= 0 || InpLotSize <= 0)
+   {
+      Print("Error: GridPips, TakeProfitPips, and LotSize must be positive.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+   if(symbolNames[SYMBOL_1] == "")
+   {
+      Print("Error: Symbol 1 cannot be empty.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
+   //--- Initialize data for each symbol
+   for(int i = 0; i < MAX_SYMBOLS; i++)
+   {
+      atrHandle[i] = INVALID_HANDLE; // Initialize handle
+      if(symbolNames[i] == "") continue; // Skip if symbol 2 is empty
+
+      // Add symbol to Market Watch if not already visible
+      if(!SymbolSelect(symbolNames[i], true))
+      {
+         PrintFormat("Warning: Could not select symbol %s in Market Watch. Error %d. EA might not get ticks.", symbolNames[i], GetLastError());
+      }
+      Sleep(100); // Allow terminal time to process symbol selection
+
+      //--- Convert pips to points for the specific symbol
+      int digits = (int)SymbolInfoInteger(symbolNames[i], SYMBOL_DIGITS);
+      double point = SymbolInfoDouble(symbolNames[i], SYMBOL_POINT);
+      pipValue[i] = point * (digits == 3 || digits == 5 ? 10 : 1);
+      if(pipValue[i] == 0) // Fallback if pip calculation fails
+      {
+         pipValue[i] = point;
+         PrintFormat("Warning [%s]: Could not determine Pip value accurately, using Point value: %f", symbolNames[i], pipValue[i]);
+         if(pipValue[i] == 0) // Still zero? Problem with symbol info
+         {
+            PrintFormat("Error [%s]: Cannot determine Point value for the symbol.", symbolNames[i]);
+            return(INIT_FAILED);
+         }
+      }
+      gridStepPoints[i] = InpGridPips * pipValue[i];
+      takeProfitPoints[i] = InpTakeProfitPips * pipValue[i];
+      atrThresholdPoints[i] = InpATRThreshold * pipValue[i];
+
+      //--- Initialize ATR indicator handle for the specific symbol
+      if(InpUseATRFilter)
+      {
+         atrHandle[i] = iATR(symbolNames[i], InpATRTimeframe, InpATRPeriod);
+         if(atrHandle[i] == INVALID_HANDLE)
+         {
+            PrintFormat("Error [%s]: Creating ATR indicator handle failed: %d", symbolNames[i], GetLastError());
+         }
+      }
+      PrintFormat("Symbol [%s] Initialized (LIMIT GRID): Grid Step: %.5f points, TP: %.5f points, ATR Threshold: %.5f points",
+                  symbolNames[i], gridStepPoints[i], takeProfitPoints[i], atrThresholdPoints[i]);
+   }
+
+   //--- Initialize CTrade object (once)
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpSlippage);
+   trade.SetAsyncMode(false); // Use synchronous mode for simplicity here
+
+   Print("GridTraderEA (v6 LimitGrid) initialized successfully.");
+   PrintFormat("Replace Order on TP: %s", InpReplaceOrderOnTP ? "Yes" : "No");
+   lastHistoryCheckTime = (ulong)TimeCurrent(); // Initialize history check time
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   //--- Release indicator handles
+   for(int i = 0; i < MAX_SYMBOLS; i++)
+   {
+      if(atrHandle[i] != INVALID_HANDLE)
+         IndicatorRelease(atrHandle[i]);
+   }
+
+   Print("GridTraderEA (v6 LimitGrid) deinitialized. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Check if trading is allowed
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+   {
+      return;
+   }
+
+   //--- Process each symbol
+   for(int i = 0; i < MAX_SYMBOLS; i++)
+   {
+      if(symbolNames[i] == "") continue; // Skip empty symbol slots
+
+      string currentSymbol = symbolNames[i];
+      int symbolIndex = i;
+
+      //--- Check if initial grid needs placement for this symbol
+      if(CountEaPendingOrders(currentSymbol, WRONG_VALUE) == 0 && CountEaMarketPositions(currentSymbol, WRONG_VALUE) == 0)
+      {
+          CheckAndPlaceInitialGrid(currentSymbol, symbolIndex); // Attempt to place grid if conditions met
+      }
+
+      //--- Check global stop loss for this symbol
+      CheckGlobalStopLoss(currentSymbol, symbolIndex);
+   }
+
+   //--- Check for closed orders and replace them (throttled check) - Done once for all symbols
+   ulong currentTime = (ulong)TimeCurrent();
+   if(currentTime > lastHistoryCheckTime) // Check history at most once per second
+   {
+       CheckAndReplaceClosedOrdersByTP(); // This function now handles multiple symbols internally
+       lastHistoryCheckTime = currentTime;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check ATR and Place Initial Grid for a specific symbol (LIMIT ORDERS) |
+//+------------------------------------------------------------------+
+bool CheckAndPlaceInitialGrid(const string symbol, const int symbolIdx)
+{
+    //--- Check if orders/positions already exist for this EA and symbol
+    if(CountEaPendingOrders(symbol, WRONG_VALUE) > 0 || CountEaMarketPositions(symbol, WRONG_VALUE) > 0)
+    {
+        return true; // Orders/positions exist for this symbol, no need to place initial grid again
+    }
+
+    //--- Check ATR filter for this symbol
+    if(InpUseATRFilter)
+    {
+        if(!CheckATRCondition(symbol, symbolIdx))
+        {
+            return false; // ATR condition not met
+        }
+    }
+
+    //--- Place initial grid for this symbol using LIMIT orders
+    PrintFormat("[%s] ATR condition met (or filter disabled) and no orders/positions exist. Placing initial LIMIT grid...", symbol);
+    MqlTick currentTick;
+    if(!SymbolInfoTick(symbol, currentTick))
+    {
+        PrintFormat("[%s] Error getting tick info: %d", symbol, GetLastError());
+        return false;
+    }
+    double ask = currentTick.ask;
+    double bid = currentTick.bid;
+    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+
+    if(ask == 0 || bid == 0 || ask <= bid) // Basic price check
+    {
+        PrintFormat("[%s] Invalid prices: Ask=%.*f, Bid=%.*f", symbol, digits, ask, digits, bid);
+        return false;
+    }
+
+    bool buyGridPlaced = false;
+    bool sellGridPlaced = false;
+
+    //--- Place Buy LIMIT orders BELOW current Bid
+    for(int i = 0; i < InpMaxOrdersPerSide; i++)
+    {
+        double entryPrice = NormalizeDouble(bid - (i + 1) * gridStepPoints[symbolIdx], digits);
+        double tpPrice = NormalizeDouble(entryPrice + takeProfitPoints[symbolIdx], digits);
+        if(!PlacePendingOrder(symbol, symbolIdx, ORDER_TYPE_BUY_LIMIT, entryPrice, tpPrice))
+        {
+           PrintFormat("[%s] Failed to place initial Buy Limit #%d at %.*f", symbol, i + 1, digits, entryPrice);
+        }
+        else
+        {
+           buyGridPlaced = true;
+        }
+    }
+
+    //--- Place Sell LIMIT orders ABOVE current Ask
+    for(int i = 0; i < InpMaxOrdersPerSide; i++)
+    {
+        double entryPrice = NormalizeDouble(ask + (i + 1) * gridStepPoints[symbolIdx], digits);
+        double tpPrice = NormalizeDouble(entryPrice - takeProfitPoints[symbolIdx], digits);
+        if(!PlacePendingOrder(symbol, symbolIdx, ORDER_TYPE_SELL_LIMIT, entryPrice, tpPrice))
+        {
+           PrintFormat("[%s] Failed to place initial Sell Limit #%d at %.*f", symbol, i + 1, digits, entryPrice);
+        }
+        else
+        {
+           sellGridPlaced = true;
+        }
+    }
+
+    if(buyGridPlaced || sellGridPlaced)
+      PrintFormat("[%s] Initial LIMIT grid placement attempted.", symbol);
+
+    return (buyGridPlaced || sellGridPlaced);
+}
+
+//+------------------------------------------------------------------+
+//| Check ATR Condition for a specific symbol                        |
+//+------------------------------------------------------------------+
+bool CheckATRCondition(const string symbol, const int symbolIdx)
+{
+   if(!InpUseATRFilter || atrHandle[symbolIdx] == INVALID_HANDLE)
+      return true; // Filter disabled or handle invalid for this symbol
+
+   double atrValueBuffer[1];
+   if(CopyBuffer(atrHandle[symbolIdx], 0, 1, 1, atrValueBuffer) <= 0) // Get ATR for the last completed bar [index 1]
+   {
+      PrintFormat("[%s] Error copying ATR buffer: %d", symbol, GetLastError());
+      return false; // Cannot determine ATR, assume condition not met for safety
+   }
+   return (atrValueBuffer[0] > atrThresholdPoints[symbolIdx]);
+}
+
+//+------------------------------------------------------------------+
+//| Check History for TP Hits and Replace Orders (Handles All Symbols & LIMIT Orders) |
+//+------------------------------------------------------------------+
+void CheckAndReplaceClosedOrdersByTP()
+{
+   // Request history deals for the last N seconds (e.g., 1 hour) to be safe
+   if(!HistorySelect(TimeCurrent() - 3600, TimeCurrent()))
+   {
+      PrintFormat("Error selecting history: %d", GetLastError());
+      return;
+   }
+
+   int totalDeals = HistoryDealsTotal();
+   ulong latestDealTicket = 0;
+
+   for(int i = 0; i < totalDeals; i++)
+   {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket <= lastDealTicketProcessed) continue; // Skip already processed deals
+      if(dealTicket > latestDealTicket) latestDealTicket = dealTicket; // Track the latest deal ticket checked
+
+      // Check if the deal belongs to this EA
+      if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC) == InpMagicNumber)
+      {
+         string dealSymbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+         int symbolIdx = GetSymbolIndex(dealSymbol); // Find which symbol this deal belongs to
+
+         if(symbolIdx == -1) continue; // Deal is for a symbol not managed by this EA instance
+
+         // Check if it was an exit deal caused by Take Profit
+         long dealEntry = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+         long dealReason = HistoryDealGetInteger(dealTicket, DEAL_REASON);
+
+         // DEAL_ENTRY_OUT signifies closing a position
+         // DEAL_REASON_TP signifies closure by Take Profit
+         if(dealEntry == DEAL_ENTRY_OUT && dealReason == DEAL_REASON_TP)
+         {
+            // *** Replace order at the SAME price logic ***
+            if(InpReplaceOrderOnTP) // Check if replacement is enabled
+            {
+               long positionID = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+               double originalEntryPrice = 0;
+               ENUM_ORDER_TYPE originalPositionType = WRONG_VALUE;
+
+               // Find the entry deal for this closed position to get the original price and type
+               if(HistorySelectByPosition(positionID))
+               {
+                  int dealsInPosition = HistoryDealsTotal();
+                  for(int j = 0; j < dealsInPosition; j++)
+                  {
+                     ulong posDealTicket = HistoryDealGetTicket(j);
+                     if(HistoryDealGetInteger(posDealTicket, DEAL_POSITION_ID) == positionID &&
+                        HistoryDealGetInteger(posDealTicket, DEAL_ENTRY) == DEAL_ENTRY_IN)
+                     {
+                        originalEntryPrice = HistoryDealGetDouble(posDealTicket, DEAL_PRICE);
+                        // The DEAL_TYPE for the entry deal IS the original position type (BUY or SELL)
+                        originalPositionType = (ENUM_ORDER_TYPE)HistoryDealGetInteger(posDealTicket, DEAL_TYPE);
+                        break; // Found the entry deal
+                     }
+                  }
+               }
+
+               if(originalEntryPrice > 0 && originalPositionType != WRONG_VALUE)
+               {
+                  int digits = (int)SymbolInfoInteger(dealSymbol, SYMBOL_DIGITS);
+                  if(originalPositionType == ORDER_TYPE_BUY) // Original position was BUY (from a Buy Limit)
+                  {
+                     // Replace with a Buy LIMIT at the original entry price
+                     if(CountEaPendingOrders(dealSymbol, ORDER_TYPE_BUY_LIMIT) < InpMaxOrdersPerSide)
+                     {
+                        double newTpPrice = NormalizeDouble(originalEntryPrice + takeProfitPoints[symbolIdx], digits);
+                        PrintFormat("[%s] Buy TP hit (PosID %d). Replacing with Buy LIMIT at original price %.*f", dealSymbol, positionID, digits, originalEntryPrice);
+                        PlacePendingOrder(dealSymbol, symbolIdx, ORDER_TYPE_BUY_LIMIT, originalEntryPrice, newTpPrice);
+                     }
+                     else
+                     {
+                        PrintFormat("[%s] Buy TP hit (PosID %d). Max Buy Limit orders reached, not replacing.", dealSymbol, positionID);
+                     }
+                  }
+                  else if(originalPositionType == ORDER_TYPE_SELL) // Original position was SELL (from a Sell Limit)
+                  {
+                     // Replace with a Sell LIMIT at the original entry price
+                     if(CountEaPendingOrders(dealSymbol, ORDER_TYPE_SELL_LIMIT) < InpMaxOrdersPerSide)
+                     {
+                        double newTpPrice = NormalizeDouble(originalEntryPrice - takeProfitPoints[symbolIdx], digits);
+                        PrintFormat("[%s] Sell TP hit (PosID %d). Replacing with Sell LIMIT at original price %.*f", dealSymbol, positionID, digits, originalEntryPrice);
+                        PlacePendingOrder(dealSymbol, symbolIdx, ORDER_TYPE_SELL_LIMIT, originalEntryPrice, newTpPrice);
+                     }
+                     else
+                     {
+                        PrintFormat("[%s] Sell TP hit (PosID %d). Max Sell Limit orders reached, not replacing.", dealSymbol, positionID);
+                     }
+                  }
+               }
+               else
+               {
+                  PrintFormat("[%s] Could not find original entry price/type for closed position ID %d.", dealSymbol, positionID);
+               }
+            }
+            else
+            {
+               PrintFormat("[%s] TP hit, but InpReplaceOrderOnTP is false. No replacement performed.", dealSymbol);
+            }
+         }
+      }
+   }
+   // Update the last processed deal ticket
+   if(latestDealTicket > lastDealTicketProcessed)
+      lastDealTicketProcessed = latestDealTicket;
+}
+
+//+------------------------------------------------------------------+
+//| Place Pending Order using CTrade for a specific symbol (Handles LIMIT) |
+//+------------------------------------------------------------------+
+bool PlacePendingOrder(const string symbol, const int symbolIdx, ENUM_ORDER_TYPE type, double price, double tp)
+{
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+
+   //--- Check price validity relative to current market price and stops level for the specific symbol
+   MqlTick currentTick;
+   if(!SymbolInfoTick(symbol, currentTick))
+   {
+      PrintFormat("[%s] Error getting tick info for price check: %d", symbol, GetLastError());
+      return false;
+   }
+   double minDistancePoints = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+
+   // Adjust price slightly if it's too close to market or inside spread/stops level
+   // For LIMIT orders, the price needs to be sufficiently FAR from the market
+   if(type == ORDER_TYPE_BUY_LIMIT && price >= NormalizeDouble(currentTick.bid - minDistancePoints, digits))
+   {
+      price = NormalizeDouble(currentTick.bid - minDistancePoints - point, digits); // Adjust slightly further below min distance
+      PrintFormat("[%s] Adjusting Buy Limit price due to Stops Level/Market: %.*f", symbol, digits, price);
+      tp = NormalizeDouble(price + takeProfitPoints[symbolIdx], digits); // Adjust TP accordingly
+   }
+   if(type == ORDER_TYPE_SELL_LIMIT && price <= NormalizeDouble(currentTick.ask + minDistancePoints, digits))
+   {
+      price = NormalizeDouble(currentTick.ask + minDistancePoints + point, digits); // Adjust slightly further above min distance
+      PrintFormat("[%s] Adjusting Sell Limit price due to Stops Level/Market: %.*f", symbol, digits, price);
+      tp = NormalizeDouble(price - takeProfitPoints[symbolIdx], digits); // Adjust TP accordingly
+   }
+   // --- Stop order adjustments (kept for reference, but not used for Limit grid) ---
+   /*
+   if(type == ORDER_TYPE_BUY_STOP && price <= NormalizeDouble(currentTick.ask + minDistancePoints, digits))
+   {
+      price = NormalizeDouble(currentTick.ask + minDistancePoints + point, digits);
+      PrintFormat("[%s] Adjusting Buy Stop price due to Stops Level/Market: %.*f", symbol, digits, price);
+      tp = NormalizeDouble(price + takeProfitPoints[symbolIdx], digits);
+   }
+   if(type == ORDER_TYPE_SELL_STOP && price >= NormalizeDouble(currentTick.bid - minDistancePoints, digits))
+   {
+      price = NormalizeDouble(currentTick.bid - minDistancePoints - point, digits);
+      PrintFormat("[%s] Adjusting Sell Stop price due to Stops Level/Market: %.*f", symbol, digits, price);
+      tp = NormalizeDouble(price - takeProfitPoints[symbolIdx], digits);
+   }
+   */
+   // --- End Stop order adjustments ---
+
+   //--- Check TP validity relative to adjusted price and stops level
+   // For LIMIT orders, TP check is the same logic as STOP orders
+   if((type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY_STOP) && tp <= NormalizeDouble(price + minDistancePoints, digits))
+   {
+       PrintFormat("[%s] Buy %s TP %.*f too close to adjusted price %.*f (Min Distance: %.5f). Order not placed.", symbol, EnumToString(type), digits, tp, digits, price, minDistancePoints);
+       return false;
+   }
+   if((type == ORDER_TYPE_SELL_LIMIT || type == ORDER_TYPE_SELL_STOP) && tp >= NormalizeDouble(price - minDistancePoints, digits))
+   {
+       PrintFormat("[%s] Sell %s TP %.*f too close to adjusted price %.*f (Min Distance: %.5f). Order not placed.", symbol, EnumToString(type), digits, tp, digits, price, minDistancePoints);
+       return false;
+   }
+
+   //--- Set filling policy for the specific symbol before trading
+   trade.SetTypeFillingBySymbol(symbol);
+
+   //--- Use CTrade for placing pending orders
+   bool result = false;
+   switch(type)
+   {
+      case ORDER_TYPE_BUY_LIMIT:
+         result = trade.BuyLimit(InpLotSize, price, symbol, 0, tp, ORDER_TIME_GTC, 0, eaComment);
+         break;
+      case ORDER_TYPE_SELL_LIMIT:
+         result = trade.SellLimit(InpLotSize, price, symbol, 0, tp, ORDER_TIME_GTC, 0, eaComment);
+         break;
+      // Keep STOP cases for potential future use or if mixing strategies
+      case ORDER_TYPE_BUY_STOP:
+         result = trade.BuyStop(InpLotSize, price, symbol, 0, tp, ORDER_TIME_GTC, 0, eaComment);
+         break;
+      case ORDER_TYPE_SELL_STOP:
+         result = trade.SellStop(InpLotSize, price, symbol, 0, tp, ORDER_TIME_GTC, 0, eaComment);
+         break;
+      default:
+         PrintFormat("[%s] Unsupported pending order type: %s", symbol, EnumToString(type));
+         return false;
+   }
+
+   if(!result)
+   {
+      PrintFormat("[%s] OrderSend failed for %s at %.*f. CTrade Error: %d - %s",
+                  symbol, EnumToString(type), digits, price, trade.ResultRetcode(), trade.ResultComment());
+      if(trade.ResultRetcode() == 10016) // Invalid Stops
+      {
+         PrintFormat("[%s] Error 10016 (Invalid Stops) likely due to TP %.*f being too close to price %.*f or market.", symbol, digits, tp, digits, price);
+      }
+      else if(trade.ResultRetcode() == 10015) // Invalid Price
+      {
+          PrintFormat("[%s] Error 10015 (Invalid Price) likely due to Limit price %.*f being on the wrong side of market or too close.", symbol, digits, price);
+      }
+      return false;
+   }
+   else
+   {
+      PrintFormat("[%s] %s placed successfully at %.*f, TP %.*f, Ticket #%d",
+                  symbol, EnumToString(type), digits, price, digits, tp, trade.ResultOrder());
+      return true;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Count Pending Orders for this EA for a specific symbol           |
+//+------------------------------------------------------------------+
+int CountEaPendingOrders(const string symbol, ENUM_ORDER_TYPE type = WRONG_VALUE)
+{
+   int count = 0;
+   int total_orders = OrdersTotal();
+
+   for(int i = 0; i < total_orders; i++)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket > 0)
+      {
+         if(OrderSelect(ticket))
+         {
+            if(OrderGetString(ORDER_SYMBOL) == symbol &&
+               OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+            {
+               ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+               // Count only relevant pending order types for this EA version
+               if(orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT ||
+                  orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP) // Keep stop check just in case
+               {
+                  if(type == WRONG_VALUE || orderType == type)
+                  {
+                     count++;
+                  }
+               }
+            }
+         }
+      }
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Count Market Positions for this EA for a specific symbol         |
+//+------------------------------------------------------------------+
+int CountEaMarketPositions(const string symbol, ENUM_POSITION_TYPE type = WRONG_VALUE)
+{
+    int count = 0;
+    int total_positions = PositionsTotal();
+
+    for(int i = 0; i < total_positions; i++)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0)
+        {
+            if(PositionSelectByTicket(ticket))
+            {
+                if(PositionGetString(POSITION_SYMBOL) == symbol &&
+                   PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+                {
+                    if(type == WRONG_VALUE || PositionGetInteger(POSITION_TYPE) == type)
+                    {
+                        count++;
+                    }
+                }
+            }
+        }
+    }
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| Check Global Stop Loss for a specific symbol                     |
+//+------------------------------------------------------------------+
+void CheckGlobalStopLoss(const string symbol, const int symbolIdx)
+{
+   if(InpGlobalStopLoss <= 0) return; // Disabled
+
+   double currentProfit = 0;
+   int total_positions = PositionsTotal();
+
+   for(int i = 0; i < total_positions; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+      {
+         if(PositionSelectByTicket(ticket))
+         {
+            if(PositionGetString(POSITION_SYMBOL) == symbol &&
+               PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+            {
+               currentProfit += PositionGetDouble(POSITION_PROFIT);
+               currentProfit += PositionGetDouble(POSITION_SWAP); // Include swap
+            }
+         }
+      }
+   }
+
+   if(currentProfit < -MathAbs(InpGlobalStopLoss))
+   {
+      PrintFormat("[%s] Global Stop Loss triggered! Current Profit: %.2f, Limit: -%.2f. Closing all positions and pending orders for this symbol...",
+                  symbol, currentProfit, InpGlobalStopLoss);
+      CloseAllEaOrdersAndPositions(symbol); // Close only for the affected symbol
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close All Orders and Positions for this EA for a specific symbol |
+//+------------------------------------------------------------------+
+void CloseAllEaOrdersAndPositions(const string symbol)
+{
+   bool closedPositions = false;
+   bool deletedOrders = false;
+
+   trade.SetTypeFillingBySymbol(symbol);
+
+   //--- Close market positions first
+   int total_positions = PositionsTotal();
+   for(int i = total_positions - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+      {
+         if(PositionSelectByTicket(ticket))
+         {
+            if(PositionGetString(POSITION_SYMBOL) == symbol &&
+               PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+            {
+               if(trade.PositionClose(ticket, InpSlippage))
+               {
+                  PrintFormat("[%s] Position #%d closed due to Global SL. Result: %d", symbol, ticket, trade.ResultRetcode());
+                  closedPositions = true;
+               }
+               else
+               {
+                  PrintFormat("[%s] Error closing position #%d: %d - %s", symbol, ticket, trade.ResultRetcode(), trade.ResultComment());
+               }
+               Sleep(100);
+            }
+         }
+      }
+   }
+
+   //--- Delete pending orders
+   int total_orders = OrdersTotal();
+   for(int i = total_orders - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket > 0)
+      {
+         if(OrderSelect(ticket))
+         {
+            if(OrderGetString(ORDER_SYMBOL) == symbol &&
+               OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+            {
+               if(trade.OrderDelete(ticket))
+               {
+                  PrintFormat("[%s] Pending order #%d deleted due to Global SL. Result: %d", symbol, ticket, trade.ResultRetcode());
+                  deletedOrders = true;
+               }
+               else
+               {
+                  PrintFormat("[%s] Error deleting pending order #%d: %d - %s", symbol, ticket, trade.ResultRetcode(), trade.ResultComment());
+               }
+               Sleep(100);
+            }
+         }
+      }
+   }
+   if(closedPositions || deletedOrders)
+      PrintFormat("[%s] Finished closing/deleting all EA orders/positions due to Global SL.", symbol);
+}
+
+//+------------------------------------------------------------------+
+//| Helper function to get the index for a symbol name               |
+//+------------------------------------------------------------------+
+int GetSymbolIndex(const string symbol)
+{
+   for(int i = 0; i < MAX_SYMBOLS; i++)
+   {
+      if(symbolNames[i] == symbol)
+         return i;
+   }
+   return -1; // Symbol not found in our list
+}
+//+------------------------------------------------------------------+
+
