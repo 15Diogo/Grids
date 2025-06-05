@@ -1,0 +1,273 @@
+//+------------------------------------------------------------------+
+//|                                                       BuyBuy.mq5 |
+//|                        Copyright 2025, Manus AI Agent        |
+//|                                                                  |
+//+------------------------------------------------------------------+
+#property copyright "Manus AI Agent"
+#property link      ""
+#property version   "1.00"
+#property strict
+#property description "Expert Advisor que opera um grid de compra em EURUSD e USDCHF simultaneamente."
+
+#include <Trade/Trade.mqh>
+#include <Trade/PositionInfo.mqh>
+
+//--- Input parameters
+input double LotSize         = 0.01;    // Fixed Lot Size for each order
+input int    GridStepPips    = 15;      // Grid Step in Pips
+input int    TakeProfitPips  = 15;      // Take Profit in Pips for each order
+input ulong  MagicNumber     = 67890;   // EA Magic Number
+input string Symbol1         = "EURUSD"; // First Symbol
+input string Symbol2         = "USDCHF"; // Second Symbol
+
+//--- Global variables
+CTrade          trade;
+CPositionInfo   posInfo;
+
+// Structure to hold symbol-specific data
+struct SymbolData
+{
+   string          name;
+   double          gridStepPoints;
+   double          takeProfitPoints;
+   double          pointValue;
+   int             digits;
+   double          minLot;
+   double          maxLot;
+   double          lotStep;
+   bool            isTradingAllowed;
+};
+
+SymbolData symbols[2]; // Array to hold data for the two symbols
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   Print("Initializing BuyBuy EA...");
+
+   //--- Initialize trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(5); // Allow 5 points deviation
+   trade.SetTypeFilling(ORDER_FILLING_FOK); // Use FOK for simplicity, adjust if needed
+
+   //--- Initialize data for Symbol 1
+   if(!InitializeSymbolData(Symbol1, symbols[0]))
+      return(INIT_FAILED);
+
+   //--- Initialize data for Symbol 2
+   if(!InitializeSymbolData(Symbol2, symbols[1]))
+      return(INIT_FAILED);
+
+   Print("BuyBuy EA Initialized Successfully.");
+   PrintFormat("Operating on: %s and %s", symbols[0].name, symbols[1].name);
+   PrintFormat("Lot Size: %.2f, Grid Step: %d pips, TP: %d pips", LotSize, GridStepPips, TakeProfitPips);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize data for a specific symbol                            |
+//+------------------------------------------------------------------+
+bool InitializeSymbolData(const string symbolName, SymbolData &symbolData)
+{
+   symbolData.name = symbolName;
+
+   //--- Ensure symbol is available in Market Watch
+   if(!SymbolSelect(symbolName, true))
+   {
+      PrintFormat("Error: Symbol %s not found or not enabled in Market Watch. Please add it.", symbolName);
+      return(false);
+   }
+
+   //--- Wait for symbol info to be available
+   int retries = 10;
+   while(SymbolInfoDouble(symbolName, SYMBOL_POINT) == 0 && retries > 0)
+   {
+      Sleep(500);
+      // RefreshRates() is not available in MQL5, symbol info is refreshed automatically
+      retries--;
+   }
+
+   symbolData.pointValue = SymbolInfoDouble(symbolName, SYMBOL_POINT);
+   if(symbolData.pointValue == 0)
+   {
+      PrintFormat("Error: Could not get point value for %s.", symbolName);
+      return(false);
+   }
+
+   symbolData.digits = (int)SymbolInfoInteger(symbolName, SYMBOL_DIGITS);
+   symbolData.gridStepPoints = GridStepPips * symbolData.pointValue;
+   symbolData.takeProfitPoints = TakeProfitPips * symbolData.pointValue;
+   symbolData.minLot = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_MIN);
+   symbolData.maxLot = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_MAX);
+   symbolData.lotStep = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_STEP);
+   symbolData.isTradingAllowed = SymbolInfoInteger(symbolName, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_DISABLED;
+
+   //--- Validate LotSize
+   if(LotSize < symbolData.minLot || LotSize > symbolData.maxLot || fmod(LotSize, symbolData.lotStep) > 0.0000001)
+   {
+      PrintFormat("Error: Lot size %.2f is invalid for %s (Min: %.2f, Max: %.2f, Step: %.2f).",
+                  LotSize, symbolName, symbolData.minLot, symbolData.maxLot, symbolData.lotStep);
+      return(false);
+   }
+
+   if(!symbolData.isTradingAllowed)
+   {
+       PrintFormat("Warning: Trading is disabled for symbol %s.", symbolName);
+       // Continue initialization but don't trade this symbol
+   }
+
+   PrintFormat("Initialized data for %s: Point=%.*f, Digits=%d, GridPoints=%.*f, TPPoints=%.*f, Trading Allowed: %s",
+               symbolName,
+               symbolData.digits, symbolData.pointValue,
+               symbolData.digits,
+               symbolData.digits, symbolData.gridStepPoints,
+               symbolData.digits, symbolData.takeProfitPoints,
+               symbolData.isTradingAllowed ? "Yes" : "No");
+
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("BuyBuy EA Deinitialized. Reason: ", reason);
+   //--- Optional: Close positions on deinit
+   // CloseAllPositionsBySymbol(symbols[0].name);
+   // CloseAllPositionsBySymbol(symbols[1].name);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Check if trading is allowed globally
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return;
+
+   //--- Manage grid for each symbol
+   for(int i = 0; i < ArraySize(symbols); i++)
+   {
+      if(symbols[i].isTradingAllowed)
+      {
+         ManageGridForSymbol(symbols[i]);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage the buy grid for a specific symbol                        |
+//+------------------------------------------------------------------+
+void ManageGridForSymbol(const SymbolData &symbolData)
+{
+   //--- Get current price
+   double currentAsk = SymbolInfoDouble(symbolData.name, SYMBOL_ASK);
+   if(currentAsk == 0) // Check for valid price
+   {
+      // PrintFormat("Invalid Ask price for %s, skipping grid management.", symbolData.name);
+      return;
+   }
+
+   //--- Find the lowest buy position for this symbol and magic number
+   double lowestBuyPrice = DBL_MAX;
+   int positionsCount = 0;
+   int totalPositions = PositionsTotal();
+
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+         {
+            positionsCount++;
+            if(posInfo.PriceOpen() < lowestBuyPrice)
+            {
+               lowestBuyPrice = posInfo.PriceOpen();
+            }
+         }
+      }
+   }
+
+   //--- If no buy positions exist, open the first one
+   if(positionsCount == 0)
+   {
+      double tpPrice = NormalizeDouble(currentAsk + symbolData.takeProfitPoints, symbolData.digits);
+      PrintFormat("[%s] No open buy positions. Placing initial buy order at market (Ask: %.5f), TP: %.5f, Lot: %.2f",
+                  symbolData.name, currentAsk, tpPrice, LotSize);
+      if(!trade.Buy(LotSize, symbolData.name, currentAsk, 0, tpPrice, "Initial Buy Grid"))
+      {
+         PrintFormat("[%s] Error placing initial buy order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+      }
+      return; // Exit after placing initial order
+   }
+
+   //--- If positions exist, check if a new grid level is reached
+   double nextBuyLevel = NormalizeDouble(lowestBuyPrice - symbolData.gridStepPoints, symbolData.digits);
+
+   // Check if price has dropped below the next grid level
+   // Add a small buffer (e.g., 1 point) to avoid placing orders exactly on the level due to floating point inaccuracies
+   if(currentAsk <= nextBuyLevel + symbolData.pointValue)
+   {
+      // Check if an order already exists very close to this level to prevent duplicates
+      bool orderExistsNearLevel = false;
+      for(int i = totalPositions - 1; i >= 0; i--)
+      {
+         if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name && posInfo.PositionType() == POSITION_TYPE_BUY)
+         {
+            // Check if open price is within a small range (e.g., half the grid step) of the target level
+            if(MathAbs(posInfo.PriceOpen() - nextBuyLevel) < (symbolData.gridStepPoints / 2.0))
+            {
+               orderExistsNearLevel = true;
+               break;
+            }
+         }
+      }
+
+      if(!orderExistsNearLevel)
+      {
+         double tpPrice = NormalizeDouble(currentAsk + symbolData.takeProfitPoints, symbolData.digits);
+         PrintFormat("[%s] Price (%.5f) reached next grid level (%.5f). Placing new buy order. TP: %.5f, Lot: %.2f",
+                     symbolData.name, currentAsk, nextBuyLevel, tpPrice, LotSize);
+         if(!trade.Buy(LotSize, symbolData.name, currentAsk, 0, tpPrice, "Grid Buy"))
+         {
+            PrintFormat("[%s] Error placing grid buy order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+         }
+      }
+      // else { PrintFormat("[%s] Order already exists near level %.5f. Skipping.", symbolData.name, nextBuyLevel); }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions for a specific symbol                        |
+//+------------------------------------------------------------------+
+void CloseAllPositionsBySymbol(const string symbolName)
+{
+   int totalPositions = PositionsTotal();
+   PrintFormat("Attempting to close all positions for %s (Magic: %d)...", symbolName, MagicNumber);
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolName)
+      {
+         PrintFormat("Closing position #%d (%s %.2f @ %.5f) for %s",
+                     posInfo.Ticket(),
+                     (posInfo.PositionType() == POSITION_TYPE_BUY ? "Buy" : "Sell"),
+                     posInfo.Volume(),
+                     posInfo.PriceOpen(),
+                     symbolName);
+         if(!trade.PositionClose(posInfo.Ticket()))
+         {
+            PrintFormat("Error closing position #%d: %d - %s", posInfo.Ticket(), trade.ResultRetcode(), trade.ResultComment());
+         }
+         else
+         {
+             PrintFormat("Position #%d closed successfully.", posInfo.Ticket());
+         }
+      }
+   }
+}
+//+------------------------------------------------------------------+
