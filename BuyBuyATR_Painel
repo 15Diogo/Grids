@@ -1,0 +1,556 @@
+//+------------------------------------------------------------------+
+//|                                           BuyBuy_ATR_Panel_V2.mq5 |
+//|                                   Copyright 2025, Manus AI Agent |
+//|                                                                  |
+//+------------------------------------------------------------------+
+#property copyright "Manus AI Agent"
+#property link      ""
+#property version   "1.15_MODIFIED" // Version with initial trade option
+#property strict
+#property description "EA com grid ATR em dois pares, painel de controle com P&L detalhado, gráfico e pausa. Agora com opção de negociação inicial (Compra/Venda 0.1 lote)."
+
+#include <Trade/Trade.mqh>
+#include <Trade/PositionInfo.mqh>
+#include <Indicators/Indicators.mqh>
+
+#include <Controls/Dialog.mqh>
+#include <Controls/Label.mqh>
+#include <Controls/Button.mqh>
+#include <ChartObjects/ChartObjectsTxtControls.mqh>
+
+//--- Enum para tipo de negociação inicial
+enum ENUM_INITIAL_TRADE_TYPE
+{
+    INITIAL_BUY = 0,    // Compra inicial
+    INITIAL_SELL = 1    // Venda inicial
+};
+
+//--- Input parameters
+input group "Parâmetros de Negociação"
+input double LotSize         = 0.01;
+input int    TakeProfitPips  = 15;
+input int    AtrPeriod       = 14;
+input double AtrMultiplier   = 1.0;
+input ENUM_TIMEFRAMES AtrTimeframe = PERIOD_CURRENT;
+input ulong  MagicNumber     = 67891;
+input string Symbol1         = "EURUSD";
+//---input string Symbol2         = "USDCHF";
+
+input group "Parâmetros da Negociação Inicial"
+input ENUM_INITIAL_TRADE_TYPE InitialTradeType = INITIAL_BUY; // Tipo da negociação inicial (Compra/Venda)
+input double InitialLotSize  = 0.1;    // Tamanho do lote da negociação inicial
+
+//--- Global variables
+CTrade        trade;
+CPositionInfo posInfo;
+
+struct SymbolData
+{
+    string        name;
+    double        takeProfitPoints;
+    double        pointValue;
+    int           digits;
+    double        minLot;
+    double        maxLot;
+    double        lotStep;
+    bool          isTradingAllowed;
+    int           atrHandle;
+    double        currentProfit;
+    int           openPositionsCount;
+};
+SymbolData symbols[2];
+
+//--- Panel Dialog class
+class CPanelDialog : public CAppDialog
+{
+private:
+    CLabel        m_label_title;
+    CLabel        m_label_status;
+    CLabel        m_label_profit_total;
+    CLabel        m_label_symbol1_stats;
+    CLabel        m_label_symbol2_stats;
+    CButton       m_button_close_all;
+    CButton       m_button_pause_resume;
+    
+public:
+    bool          Create(const long chart, const string name, const int subwin, const int x1, const int y1, const int x2, const int y2);
+    bool          CreateLabels(void);
+    bool          CreateButtons(void);
+    void          UpdateData(void);
+    virtual bool  OnEvent(const int id, const long &lparam, const double &dparam, const string &sparam);
+};
+
+//--- Global panel instance
+CPanelDialog  ExtPanel;
+
+//--- Constantes e variáveis para o Canvas e Botões
+#define CANVAS_HISTORY_POINTS 50
+#define BUTTON_CLOSE_ALL_ID (101)
+#define BUTTON_PAUSE_RESUME_ID (102)
+bool   g_trading_paused = false;
+
+//+------------------------------------------------------------------+
+//| Panel Dialog Implementation                                      |
+//+------------------------------------------------------------------+
+bool CPanelDialog::Create(const long chart, const string name, const int subwin, const int x1, const int y1, const int x2, const int y2)
+{
+    if(!CAppDialog::Create(chart, name, subwin, x1, y1, x2, y2))
+        return false;
+    
+    if(!CreateLabels())
+        return false;
+    if(!CreateButtons())
+        return false;
+        
+    return true;
+}
+
+bool CPanelDialog::CreateLabels(void)
+{
+    int y_pos = 10;
+    int lbl_h = 20;
+    int spacing = 5;
+
+    // Title label
+    if(!m_label_title.Create(m_chart_id, m_name + "LblTitle", m_subwin, 10, y_pos, 360, y_pos + lbl_h))
+        return false;
+   // m_label_title.Text("Painel BuyBuy ATR (" + Symbol1 + " & " + Symbol2 + ")");
+    m_label_title.FontSize(11);
+    m_label_title.Color(clrSilver);
+    if(!Add(m_label_title))
+        return false;
+    y_pos += lbl_h + spacing;
+
+    // Status label
+    if(!m_label_status.Create(m_chart_id, m_name + "LblStatus", m_subwin, 10, y_pos, 360, y_pos + lbl_h))
+        return false;
+    m_label_status.FontSize(10);
+    m_label_status.Color(clrWhite);
+    if(!Add(m_label_status))
+        return false;
+    y_pos += lbl_h + spacing + 5;
+
+    // Profit total label
+    if(!m_label_profit_total.Create(m_chart_id, m_name + "LblPnlTotal", m_subwin, 10, y_pos, 360, y_pos + lbl_h + 5))
+        return false;
+    m_label_profit_total.FontSize(14);
+    if(!Add(m_label_profit_total))
+        return false;
+    y_pos += lbl_h + 5 + spacing + 5;
+
+    // Symbol 1 stats
+    if(!m_label_symbol1_stats.Create(m_chart_id, m_name + "LblSym1Stats", m_subwin, 15, y_pos, 350, y_pos + lbl_h))
+        return false;
+    m_label_symbol1_stats.FontSize(9);
+    m_label_symbol1_stats.Color(clrLightGray);
+    if(!Add(m_label_symbol1_stats))
+        return false;
+    y_pos += lbl_h + spacing;
+
+    // Symbol 2 stats
+    if(!m_label_symbol2_stats.Create(m_chart_id, m_name + "LblSym2Stats", m_subwin, 15, y_pos, 350, y_pos + lbl_h))
+        return false;
+    m_label_symbol2_stats.FontSize(9);
+    m_label_symbol2_stats.Color(clrLightGray);
+    if(!Add(m_label_symbol2_stats))
+        return false;
+
+    return true;
+}
+
+bool CPanelDialog::CreateButtons(void)
+{
+    int y_pos = 160;
+    int btn_h = 30;
+    int spacing = 5;
+
+    // Close all button
+    if(!m_button_close_all.Create(m_chart_id, m_name + "BtnCloseAll", m_subwin, 10, y_pos, 360, y_pos + btn_h))
+        return false;
+    m_button_close_all.Text("FECHAR TODAS NEGOCIAÇÕES DO EA");
+    m_button_close_all.FontSize(9);
+    m_button_close_all.Color(clrWhite);
+    m_button_close_all.ColorBackground(C'139,0,0'); // Dark Red
+    m_button_close_all.ColorBorder(clrGray);
+    if(!Add(m_button_close_all))
+        return false;
+    y_pos += btn_h + spacing;
+
+    // Pause/Resume button
+    if(!m_button_pause_resume.Create(m_chart_id, m_name + "BtnPauseResume", m_subwin, 10, y_pos, 360, y_pos + btn_h))
+        return false;
+    m_button_pause_resume.FontSize(9);
+    m_button_pause_resume.Color(clrBlack);
+    m_button_pause_resume.ColorBorder(clrGray);
+    if(!Add(m_button_pause_resume))
+        return false;
+
+    return true;
+}
+
+void CPanelDialog::UpdateData(void)
+{
+    if(!IsVisible())
+        return;
+        
+    double total_profit = CalculateTotalProfitAndUpdateSymbolStats();
+    string currency = AccountInfoString(ACCOUNT_CURRENCY);
+
+    // Update profit label
+    m_label_profit_total.Text("P&L Total EA: " + DoubleToString(total_profit, 2) + " " + currency);
+    m_label_profit_total.Color(total_profit >= 0 ? clrLimeGreen : clrRed);
+
+    // Update symbol stats
+    string s1_stats = symbols[0].name + ": P&L " + DoubleToString(symbols[0].currentProfit,2) + " " + currency +
+                      " (" + (string)symbols[0].openPositionsCount + " pos)";
+    m_label_symbol1_stats.Text(s1_stats);
+    m_label_symbol1_stats.Color(symbols[0].currentProfit >= 0 ? clrPaleGreen : clrPink);
+
+    string s2_stats = symbols[1].name + ": P&L " + DoubleToString(symbols[1].currentProfit,2) + " " + currency +
+                      " (" + (string)symbols[1].openPositionsCount + " pos)";
+    m_label_symbol2_stats.Text(s2_stats);
+    m_label_symbol2_stats.Color(symbols[1].currentProfit >= 0 ? clrPaleGreen : clrPink);
+
+    // Update status and pause button
+    if(g_trading_paused) {
+        m_label_status.Text("Status EA: PAUSADO");
+        m_label_status.Color(clrOrange);
+        m_button_pause_resume.Text("RETOMAR NEGOCIAÇÕES");
+        m_button_pause_resume.ColorBackground(C'0,100,0'); // Dark Green
+    } else {
+        m_label_status.Text("Status EA: NEGOCIANDO");
+        m_label_status.Color(clrLimeGreen);
+        m_button_pause_resume.Text("PAUSAR NEGOCIAÇÕES");
+        m_button_pause_resume.ColorBackground(C'218,165,32'); // Goldenrod
+    }
+}
+
+bool CPanelDialog::OnEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+    if(id == CHARTEVENT_OBJECT_CLICK) {
+        if(sparam == m_button_close_all.Name()) {
+            Print("Panel Button 'FECHAR TODAS' clicked!");
+            CloseAllEAPositions();
+            UpdateData();
+            return true;
+        }
+        else if(sparam == m_button_pause_resume.Name()) {
+            g_trading_paused = !g_trading_paused;
+            Print("Trading " + (g_trading_paused ? "PAUSADO" : "RETOMADO") + " pelo painel.");
+            UpdateData();
+            return true;
+        }
+    }
+    return CAppDialog::OnEvent(id, lparam, dparam, sparam);
+}
+
+//+------------------------------------------------------------------+
+//| OnInit                                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    Print("Initializing BuyBuy_ATR_Panel_V2 (MODIFIED) EA...");
+    g_trading_paused = false;
+
+    if(AtrPeriod <= 0 || AtrMultiplier <= 0) {
+        Print("Error: Invalid ATR Parameters."); 
+        return(INIT_PARAMETERS_INCORRECT);
+    }
+    
+    if(InitialLotSize <= 0) {
+        Print("Error: Invalid Initial Lot Size."); 
+        return(INIT_PARAMETERS_INCORRECT);
+    }
+    
+    trade.SetExpertMagicNumber(MagicNumber);
+    trade.SetDeviationInPoints(5);
+    trade.SetTypeFilling(ORDER_FILLING_FOK);
+
+    if(!InitializeSymbolData(Symbol1, symbols[0])) 
+        return(INIT_FAILED);
+    //if(!InitializeSymbolData(Symbol2, symbols[1])) 
+        //return(INIT_FAILED);
+
+    if(!ExtPanel.Create(ChartID(), "BuyBuy_ATR_Panel_V2_" + (string)MagicNumber, 0, 20, 20, 400, 300)) {
+        Print("Error creating panel!"); 
+        return(INIT_FAILED);
+    }
+    
+    EventSetTimer(1);
+
+    string tradeTypeStr = (InitialTradeType == INITIAL_BUY) ? "COMPRA" : "VENDA";
+    PrintFormat("BuyBuy_ATR_Panel_V2 (MODIFIED) EA Initialized. Negociação inicial: %s %.2f lote", tradeTypeStr, InitialLotSize);
+    ExtPanel.UpdateData();
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| InitializeSymbolData                                             |
+//+------------------------------------------------------------------+
+bool InitializeSymbolData(const string symbolName, SymbolData &symbolData)
+{
+    symbolData.name = symbolName;
+    if(!SymbolSelect(symbolName, true)) { 
+        PrintFormat("Error: Symbol %s not found.", symbolName); 
+        return(false); 
+    }
+    
+    int retries = 10;
+    while(SymbolInfoDouble(symbolName, SYMBOL_POINT) == 0 && retries > 0) { 
+        Sleep(500); 
+        retries--; 
+    }
+    
+    symbolData.pointValue = SymbolInfoDouble(symbolName, SYMBOL_POINT);
+    if(symbolData.pointValue == 0) { 
+        PrintFormat("Error: Point value for %s.", symbolName); 
+        return(false); 
+    }
+    
+    symbolData.digits = (int)SymbolInfoInteger(symbolName, SYMBOL_DIGITS);
+    symbolData.takeProfitPoints = TakeProfitPips * symbolData.pointValue;
+    symbolData.minLot = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_MIN);
+    symbolData.maxLot = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_MAX);
+    symbolData.lotStep = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_STEP);
+    symbolData.isTradingAllowed = SymbolInfoInteger(symbolName, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_DISABLED;
+
+    // Validar LotSize do grid
+    if(LotSize < symbolData.minLot || LotSize > symbolData.maxLot || fmod(LotSize, symbolData.lotStep) > 0.0000001) {
+        PrintFormat("Error: Grid Lot size %.2f invalid for %s.", LotSize, symbolName); 
+        return(false);
+    }
+    
+    // Validar InitialLotSize
+    if(InitialLotSize < symbolData.minLot || InitialLotSize > symbolData.maxLot || fmod(InitialLotSize, symbolData.lotStep) > 0.0000001) {
+        PrintFormat("Warning: Initial Lot size %.2f invalid for %s (Min: %.2f, Max: %.2f, Step: %.2f). Initial trade will be skipped for this symbol.",
+                    InitialLotSize, symbolName, symbolData.minLot, symbolData.maxLot, symbolData.lotStep);
+        // Não retorna false, apenas aviso. O EA pode ainda executar o grid.
+    }
+    
+    if(!symbolData.isTradingAllowed) 
+        PrintFormat("Warning: Trading disabled for %s.", symbolName);
+        
+    symbolData.atrHandle = iATR(symbolName, AtrTimeframe, AtrPeriod);
+    if(symbolData.atrHandle == INVALID_HANDLE) { 
+        PrintFormat("Error: Failed ATR for %s.", symbolName); 
+        return(false); 
+    }
+    
+    symbolData.currentProfit = 0;
+    symbolData.openPositionsCount = 0;
+
+    PrintFormat("Initialized %s: Point=%.*f, TPPoints=%.*f, ATR Handle: %d", symbolName,
+                symbolData.digits, symbolData.pointValue, symbolData.digits, symbolData.takeProfitPoints, symbolData.atrHandle);
+    return(true);
+}
+
+//+------------------------------------------------------------------+
+//| OnDeinit                                                         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    Print("BuyBuy_ATR_Panel_V2 (MODIFIED) EA Deinitializing. Reason: ", reason);
+    EventKillTimer();
+    ExtPanel.Destroy();
+    
+    for(int i = 0; i < ArraySize(symbols); i++) {
+        if(symbols[i].atrHandle != INVALID_HANDLE) 
+            IndicatorRelease(symbols[i].atrHandle);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| OnTick                                                           |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) 
+        return;
+
+    if(!g_trading_paused) {
+        for(int i = 0; i < ArraySize(symbols); i++) {
+            if(symbols[i].isTradingAllowed && symbols[i].atrHandle != INVALID_HANDLE) {
+                ManageGridForSymbol(symbols[i]);
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| ManageGridForSymbol                                              |
+//+------------------------------------------------------------------+
+void ManageGridForSymbol(const SymbolData &symbolData)
+{
+    if(g_trading_paused) 
+        return;
+
+    double currentAsk = SymbolInfoDouble(symbolData.name, SYMBOL_ASK);
+    double currentBid = SymbolInfoDouble(symbolData.name, SYMBOL_BID);
+    if(currentAsk == 0 || currentBid == 0) 
+        return;
+        
+    double atrValueRaw[1];
+    if(CopyBuffer(symbolData.atrHandle, 0, 1, 1, atrValueRaw) <= 0) {
+        PrintFormat("[%s] Error ATR value: %d", symbolData.name, GetLastError()); 
+        return;
+    }
+    
+    double atrValue = atrValueRaw[0];
+    double dynamicGridStepPoints = atrValue * AtrMultiplier;
+    double minStepPoints = symbolData.pointValue * 1;
+    if (dynamicGridStepPoints < minStepPoints) 
+        dynamicGridStepPoints = minStepPoints;
+
+    // Contar TODAS as posições para este símbolo/magic
+    int totalSymbolPositions = 0;
+    // Contar apenas posições de COMPRA e encontrar o menor preço
+    int buyPositionsCount = 0;
+    double lowestBuyPrice = DBL_MAX;
+    int totalPositions = PositionsTotal();
+
+    for(int i = totalPositions - 1; i >= 0; i--) {
+        if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name) {
+            totalSymbolPositions++; // Conta todas as posições (Buy & Sell)
+            if(posInfo.PositionType() == POSITION_TYPE_BUY) {
+                buyPositionsCount++;
+                if(posInfo.PriceOpen() < lowestBuyPrice) 
+                    lowestBuyPrice = posInfo.PriceOpen();
+            }
+        }
+    }
+
+    // --- Colocar negociação inicial de 0.1 lote se NÃO houver posições ---
+    if(totalSymbolPositions == 0) {
+        // Validar o lote inicial antes de negociar
+        if(InitialLotSize >= symbolData.minLot && InitialLotSize <= symbolData.maxLot && 
+           fmod(InitialLotSize, symbolData.lotStep) < 0.0000001) {
+            
+            if(InitialTradeType == INITIAL_BUY) {
+                // Negociação inicial de COMPRA
+                double tpPrice = NormalizeDouble(currentAsk + symbolData.takeProfitPoints, symbolData.digits);
+                PrintFormat("[%s] Sem posições. Colocando negociação inicial de COMPRA (Ask: %.5f), TP: %.5f, Lote: %.2f",
+                           symbolData.name, currentAsk, tpPrice, InitialLotSize);
+                if(!trade.Buy(InitialLotSize, symbolData.name, currentAsk, 0, tpPrice, "Initial Buy " + DoubleToString(InitialLotSize, 2))) {
+                   PrintFormat("[%s] Erro ao colocar negociação inicial de compra: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+                }
+            }
+            else { // INITIAL_SELL
+                // Negociação inicial de VENDA
+                double tpPrice = NormalizeDouble(currentBid - symbolData.takeProfitPoints, symbolData.digits);
+                PrintFormat("[%s] Sem posições. Colocando negociação inicial de VENDA (Bid: %.5f), TP: %.5f, Lote: %.2f",
+                           symbolData.name, currentBid, tpPrice, InitialLotSize);
+                if(!trade.Sell(InitialLotSize, symbolData.name, currentBid, 0, tpPrice, "Initial Sell " + DoubleToString(InitialLotSize, 2))) {
+                   PrintFormat("[%s] Erro ao colocar negociação inicial de venda: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+                }
+            }
+            // Não retornar aqui - permitir que a lógica de compra do grid continue abaixo
+        }
+        else {
+            PrintFormat("[%s] Pulando negociação inicial: Lote %.2f inválido (Min: %.2f, Max: %.2f, Step: %.2f).",
+                       symbolData.name, InitialLotSize, symbolData.minLot, symbolData.maxLot, symbolData.lotStep);
+        }
+    } // Fim if(totalSymbolPositions == 0)
+
+    // --- Gerenciar o grid de COMPRAS ---
+    
+    // Se não há posições de compra (pode estar sem posições ou só com a venda inicial), abrir a primeira compra do grid
+    if(buyPositionsCount == 0) {
+        if(g_trading_paused) 
+            return;
+        double tpPrice = NormalizeDouble(currentAsk + symbolData.takeProfitPoints, symbolData.digits);
+        PrintFormat("[%s] Sem posições de COMPRA. Colocando primeira compra do grid (Ask: %.5f), TP: %.5f, Lote: %.2f",
+                   symbolData.name, currentAsk, tpPrice, LotSize);
+        if(!trade.Buy(LotSize, symbolData.name, currentAsk, 0, tpPrice, "Grid Buy Start V2")) {
+             PrintFormat("[%s] Erro na primeira compra do grid V2: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+        }
+        return;
+    }
+    else { // buyPositionsCount > 0
+        // Verificar se um novo nível do grid foi atingido
+        double nextBuyLevel = NormalizeDouble(lowestBuyPrice - dynamicGridStepPoints, symbolData.digits);
+        if(currentAsk <= nextBuyLevel + symbolData.pointValue) {
+            if(g_trading_paused) 
+                return;
+            bool orderExistsNearLevel = false;
+            for(int i = totalPositions - 1; i >= 0; i--) {
+                if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name && posInfo.PositionType() == POSITION_TYPE_BUY) {
+                    if(MathAbs(posInfo.PriceOpen() - nextBuyLevel) < (dynamicGridStepPoints / 2.0)) {
+                        orderExistsNearLevel = true; 
+                        break;
+                    }
+                }
+            }
+            if(!orderExistsNearLevel) {
+                double tpPrice = NormalizeDouble(currentAsk + symbolData.takeProfitPoints, symbolData.digits);
+                PrintFormat("[%s] Preço (%.5f) atingiu novo nível do grid (%.5f). Colocando nova compra do grid. TP: %.5f, Lote: %.2f",
+                           symbolData.name, currentAsk, nextBuyLevel, tpPrice, LotSize);
+                if(!trade.Buy(LotSize, symbolData.name, currentAsk, 0, tpPrice, "Grid Buy ATR V2")) {
+                    PrintFormat("[%s] Erro na compra do grid V2: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+                }
+            }
+        }
+    } // Fim else (buyPositionsCount > 0)
+}
+
+//+------------------------------------------------------------------+
+//| CloseAllEAPositions                                              |
+//+------------------------------------------------------------------+
+void CloseAllEAPositions()
+{
+    PrintFormat("Attempting to close ALL positions for Magic: %d...", MagicNumber);
+    int totalPositions = PositionsTotal();
+    for(int i = totalPositions - 1; i >= 0; i--) {
+        if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber) {
+            if(!trade.PositionClose(posInfo.Ticket())) {
+                PrintFormat("Error closing #%d: %d - %s", posInfo.Ticket(), trade.ResultRetcode(), trade.ResultComment());
+            } else {
+                PrintFormat("Position #%d closed.", posInfo.Ticket());
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Panel Functions                                                  |
+//+------------------------------------------------------------------+
+double CalculateTotalProfitAndUpdateSymbolStats()
+{
+    double totalProfit = 0;
+    for(int i=0; i<ArraySize(symbols); i++) {
+        symbols[i].currentProfit = 0;
+        symbols[i].openPositionsCount = 0;
+    }
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--) {
+        if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber) {
+            double position_profit = posInfo.Profit() + posInfo.Swap();
+            totalProfit += position_profit;
+            
+            for(int j=0; j<ArraySize(symbols); j++) {
+                if(posInfo.Symbol() == symbols[j].name) {
+                    symbols[j].currentProfit += position_profit;
+                    symbols[j].openPositionsCount++;
+                    break; 
+                }
+            }
+        }
+    }
+    return totalProfit;
+}
+
+//+------------------------------------------------------------------+
+//| OnTimer                                                          |
+//+------------------------------------------------------------------+
+void OnTimer() 
+{ 
+    ExtPanel.UpdateData(); 
+}
+
+//+------------------------------------------------------------------+
+//| OnChartEvent                                                     |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+    ExtPanel.OnEvent(id, lparam, dparam, sparam);
+}
+//+------------------------------------------------------------------+
