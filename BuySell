@@ -1,0 +1,221 @@
+//+------------------------------------------------------------------+
+//|                                                Grid_Strategy.mq5 |
+//|                                  Copyright 2025, Seu Nome Aqui |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025"
+#property link      "https://www.mql5.com"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+CTrade trade;
+CPositionInfo position;
+
+//--- Parâmetros de entrada
+input double Volume = 0.01;        // Volume das ordens (0 = micro lote)
+input int PipDistance = 15;        // Distância em pips entre ordens
+input int TakeProfit = 20;         // Take Profit em pips
+input string EA_Comment = "Grid_EA"; // Comentário das ordens
+input int MagicNumber = 12345;     // Número mágico
+
+//--- Variáveis globais
+double lastOrderPrice = 0;         // Preço da última ordem
+double pipValue;                   // Valor do pip
+bool initialOrdersPlaced = false;  // Flag para ordens iniciais
+
+//+------------------------------------------------------------------+
+//| Função de inicialização do Expert                                |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    // Configurar o objeto de negociação
+    trade.SetExpertMagicNumber(MagicNumber);
+    
+    // Calcular valor do pip
+    pipValue = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    if(SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) == 5 || 
+       SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) == 3)
+        pipValue *= 10;
+    
+    // Verificar se já existem posições abertas
+    CheckExistingPositions();
+    
+    Print("Grid EA iniciado - Distância: ", PipDistance, " pips, Volume: ", Volume, ", Take Profit: ", TakeProfit, " pips");
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Função principal do Expert                                        |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // Se não há ordens iniciais, abrir o primeiro par
+    if(!initialOrdersPlaced)
+    {
+        PlaceInitialOrders();
+        return;
+    }
+    
+    // Verificar se precisa abrir novas ordens baseado no movimento
+    CheckForNewOrders();
+}
+
+//+------------------------------------------------------------------+
+//| Colocar ordens iniciais (1 compra e 1 venda)                    |
+//+------------------------------------------------------------------+
+void PlaceInitialOrders()
+{
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    // Usar volume 0 se especificado, senão usar o volume mínimo
+    double orderVolume = (Volume == 0) ? SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN) : Volume;
+    
+    // Calcular Take Profit
+    double takeProfitPoints = TakeProfit * pipValue;
+    double buyTP = ask + takeProfitPoints;
+    double sellTP = bid - takeProfitPoints;
+    
+    // Abrir ordem de compra com Take Profit
+    if(trade.Buy(orderVolume, _Symbol, ask, 0, buyTP, EA_Comment + "_BUY"))
+    {
+        Print("Ordem de compra inicial aberta em: ", ask, " | TP: ", buyTP);
+    }
+    else
+    {
+        Print("Erro ao abrir ordem de compra: ", trade.ResultRetcode());
+    }
+    
+    // Abrir ordem de venda com Take Profit
+    if(trade.Sell(orderVolume, _Symbol, bid, 0, sellTP, EA_Comment + "_SELL"))
+    {
+        Print("Ordem de venda inicial aberta em: ", bid, " | TP: ", sellTP);
+    }
+    else
+    {
+        Print("Erro ao abrir ordem de venda: ", trade.ResultRetcode());
+    }
+    
+    lastOrderPrice = (ask + bid) / 2; // Preço médio como referência
+    initialOrdersPlaced = true;
+}
+
+//+------------------------------------------------------------------+
+//| Verificar se precisa abrir novas ordens                          |
+//+------------------------------------------------------------------+
+void CheckForNewOrders()
+{
+    double currentPrice = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) + 
+                          SymbolInfoDouble(_Symbol, SYMBOL_BID)) / 2;
+    
+    // Calcular distância em pips desde a última ordem
+    double distanceInPips = MathAbs(currentPrice - lastOrderPrice) / pipValue;
+    
+    // Se o mercado se moveu 15 pips ou mais, abrir novas ordens
+    if(distanceInPips >= PipDistance)
+    {
+        PlaceNewOrderPair(currentPrice);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Abrir novo par de ordens (compra e venda)                        |
+//+------------------------------------------------------------------+
+void PlaceNewOrderPair(double referencePrice)
+{
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    // Usar volume 0 se especificado, senão usar o volume mínimo
+    double orderVolume = (Volume == 0) ? SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN) : Volume;
+    
+    // Calcular Take Profit
+    double takeProfitPoints = TakeProfit * pipValue;
+    double buyTP = ask + takeProfitPoints;
+    double sellTP = bid - takeProfitPoints;
+    
+    // Abrir ordem de compra com Take Profit
+    if(trade.Buy(orderVolume, _Symbol, ask, 0, buyTP, EA_Comment + "_BUY"))
+    {
+        Print("Nova ordem de compra aberta em: ", ask, " | TP: ", buyTP, " | Distância: ", 
+              MathAbs(referencePrice - lastOrderPrice) / pipValue, " pips");
+    }
+    
+    // Abrir ordem de venda com Take Profit
+    if(trade.Sell(orderVolume, _Symbol, bid, 0, sellTP, EA_Comment + "_SELL"))
+    {
+        Print("Nova ordem de venda aberta em: ", bid, " | TP: ", sellTP, " | Distância: ", 
+              MathAbs(referencePrice - lastOrderPrice) / pipValue, " pips");
+    }
+    
+    // Atualizar preço de referência para a última ordem
+    lastOrderPrice = referencePrice;
+}
+
+//+------------------------------------------------------------------+
+//| Verificar posições existentes na inicialização                   |
+//+------------------------------------------------------------------+
+void CheckExistingPositions()
+{
+    if(PositionsTotal() > 0)
+    {
+        // Se já existem posições, encontrar a mais recente como referência
+        double latestPrice = 0;
+        datetime latestTime = 0;
+        
+        for(int i = 0; i < PositionsTotal(); i++)
+        {
+            if(position.SelectByIndex(i))
+            {
+                if(position.Symbol() == _Symbol && position.Magic() == MagicNumber)
+                {
+                    if(position.Time() > latestTime)
+                    {
+                        latestTime = position.Time();
+                        latestPrice = position.PriceOpen();
+                    }
+                }
+            }
+        }
+        
+        if(latestPrice > 0)
+        {
+            lastOrderPrice = latestPrice;
+            initialOrdersPlaced = true;
+            Print("Posições existentes encontradas. Última ordem em: ", latestPrice);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Função de desinicialização                                       |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    Print("Grid EA finalizado. Motivo: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Função para calcular o tamanho do lote baseado no risco         |
+//+------------------------------------------------------------------+
+double CalculateLotSize()
+{
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    
+    if(Volume == 0)
+        return minLot;
+    
+    double lotSize = Volume;
+    
+    // Normalizar o tamanho do lote
+    lotSize = MathMax(minLot, lotSize);
+    lotSize = MathMin(maxLot, lotSize);
+    lotSize = MathRound(lotSize / stepLot) * stepLot;
+    
+    return lotSize;
+}
