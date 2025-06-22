@@ -1,0 +1,627 @@
+//+------------------------------------------------------------------+
+//|                                                Grid_Strategy.mq5 |
+//|                                  Copyright 2025, Seu Nome Aqui |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025"
+#property link      "https://www.mql5.com"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+CTrade trade;
+CPositionInfo position;
+
+//--- Parâmetros de entrada
+input double Volume = 0.01;        // Volume das ordens (0 = micro lote)
+input int PipDistance = 15;        // Distância em pips entre ordens
+input int TakeProfit = 15;         // Take Profit em pips
+input string EA_Comment = "Grid_EA"; // Comentário das ordens
+input int MagicNumber = 12345;     // Número mágico
+
+//--- Parâmetros do Painel - VISUAL MELHORADO
+input bool ShowPanel = true;       // Mostrar painel de informações
+input int PanelX = 15;            // Posição X do painel
+input int PanelY = 25;            // Posição Y do painel
+
+//--- Variáveis globais
+double lastOrderPrice = 0;         // Preço da última ordem
+double pipValue;                   // Valor do pip
+bool initialOrdersPlaced = true;  // Flag para ordens iniciais
+
+//--- Variáveis do painel
+string panelObjects[] = {
+    "GridPanel_Background",
+    "GridPanel_Header",
+    "GridPanel_Title",
+    "GridPanel_Subtitle",
+    "GridPanel_Balance",
+    "GridPanel_Equity",
+    "GridPanel_Margin",
+    "GridPanel_FreeMargin",
+    "GridPanel_OpenOrders",
+    "GridPanel_BuyOrders",
+    "GridPanel_SellOrders",
+    "GridPanel_TotalProfit",
+    "GridPanel_DrawDown",
+    "GridPanel_Spread",
+    "GridPanel_LastUpdate",
+    "GridPanel_Status",
+    "GridPanel_CloseAllBtn",
+    "GridPanel_AccountSection",
+    "GridPanel_OrdersSection",
+    "GridPanel_StatusSection",
+    "GridPanel_ControlSection"
+};
+
+//+------------------------------------------------------------------+
+//| Função de inicialização do Expert                                |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    // Configurar o objeto de negociação
+    trade.SetExpertMagicNumber(MagicNumber);
+    
+    // Calcular valor do pip
+    pipValue = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    if(SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) == 5 || 
+       SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) == 3)
+        pipValue *= 10;
+    
+    // Verificar se já existem posições abertas
+    CheckExistingPositions();
+    
+    // Criar painel se habilitado
+    if(ShowPanel)
+        CreatePanel();
+    
+    Print("Grid EA iniciado - Distância: ", PipDistance, " pips, Volume: ", Volume, ", Take Profit: ", TakeProfit, " pips");
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Função principal do Expert                                        |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // Se não há ordens iniciais, abrir o primeiro par
+    if(!initialOrdersPlaced)
+    {
+        PlaceInitialOrders();
+        return;
+    }
+    
+    // Verificar se precisa abrir novas ordens baseado no movimento
+    CheckForNewOrders();
+    
+    // Atualizar painel se habilitado
+    if(ShowPanel)
+        UpdatePanel();
+}
+
+//+------------------------------------------------------------------+
+//| Criar painel de informações - DESIGN MODERNO                    |
+//+------------------------------------------------------------------+
+void CreatePanel()
+{
+    int panelWidth = 320;
+    int panelHeight = 520;
+    
+    // === FUNDO PRINCIPAL - PRETO ===
+    ObjectCreate(0, "GridPanel_Background", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_XDISTANCE, PanelX);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_YDISTANCE, PanelY);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_XSIZE, panelWidth);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_YSIZE, panelHeight);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_BGCOLOR, clrBlack);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_COLOR, clrDimGray);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_STYLE, STYLE_SOLID);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_WIDTH, 3);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_BACK, false);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_SELECTED, false);
+    ObjectSetInteger(0, "GridPanel_Background", OBJPROP_HIDDEN, true);
+    
+    // === CABEÇALHO - CINZA ESCURO ===
+    ObjectCreate(0, "GridPanel_Header", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_XDISTANCE, PanelX + 2);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_YDISTANCE, PanelY + 2);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_XSIZE, panelWidth - 4);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_YSIZE, 65);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_BGCOLOR, clrDimGray);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_COLOR, clrGray);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_STYLE, STYLE_SOLID);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_WIDTH, 1);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_BACK, false);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_SELECTED, false);
+    ObjectSetInteger(0, "GridPanel_Header", OBJPROP_HIDDEN, true);
+    
+    // === TÍTULO PRINCIPAL ===
+    CreateLabel("GridPanel_Title", "⚡ GRID TRADER PRO ⚡", PanelX + 15, PanelY + 12, 14, clrGold, "Arial Black");
+    CreateLabel("GridPanel_Subtitle", "Sistema de Negociação Automatizada", PanelX + 15, PanelY + 35, 9, clrLightGray, "Arial");
+    CreateLabel("GridPanel_Symbol", "Par: " + _Symbol, PanelX + 15, PanelY + 52, 8, clrSilver, "Arial");
+    
+    // === SEÇÃO CONTA - FUNDO CINZA ===
+    CreateSectionBackground("GridPanel_AccountSection", PanelX + 8, PanelY + 75, panelWidth - 16, 100, clrDarkSlateGray);
+    CreateSectionTitle("Informações da Conta", PanelX + 15, PanelY + 82, clrWhite);
+    
+    CreateLabel("GridPanel_Balance", "💰 Saldo: R$ 0,00", PanelX + 15, PanelY + 100, 10, clrLightBlue, "Arial Bold");
+    CreateLabel("GridPanel_Equity", "📊 Capital: R$ 0,00", PanelX + 15, PanelY + 118, 10, clrLightBlue, "Arial Bold");
+    CreateLabel("GridPanel_Margin", "📈 Margem: R$ 0,00", PanelX + 15, PanelY + 136, 9, clrLightGray, "Arial");
+    CreateLabel("GridPanel_FreeMargin", "🆓 Margem Livre: R$ 0,00", PanelX + 15, PanelY + 154, 9, clrLightGray, "Arial");
+    
+    // === SEÇÃO ORDENS - FUNDO CINZA ===
+    CreateSectionBackground("GridPanel_OrdersSection", PanelX + 8, PanelY + 185, panelWidth - 16, 120, clrDarkSlateGray);
+    CreateSectionTitle("Posições Ativas", PanelX + 15, PanelY + 192, clrWhite);
+    
+    CreateLabel("GridPanel_OpenOrders", "📋 Total de Ordens: 0", PanelX + 15, PanelY + 210, 11, clrYellow, "Arial Bold");
+    CreateLabel("GridPanel_BuyOrders", "🟢 Ordens de Compra: 0", PanelX + 15, PanelY + 230, 10, clrLimeGreen, "Arial Bold");
+    CreateLabel("GridPanel_SellOrders", "🔴 Ordens de Venda: 0", PanelX + 15, PanelY + 250, 10, clrOrangeRed, "Arial Bold");
+    CreateLabel("GridPanel_TotalProfit", "💵 Lucro Total: R$ 0,00", PanelX + 15, PanelY + 275, 12, clrYellow, "Arial Black");
+    
+    // === SEÇÃO STATUS - FUNDO CINZA ===
+    CreateSectionBackground("GridPanel_StatusSection", PanelX + 8, PanelY + 315, panelWidth - 16, 90, clrDarkSlateGray);
+    CreateSectionTitle("Status do Sistema", PanelX + 15, PanelY + 322, clrWhite);
+    
+    CreateLabel("GridPanel_DrawDown", "📉 DrawDown: 0,00%", PanelX + 15, PanelY + 340, 9, clrLightGray, "Arial");
+    CreateLabel("GridPanel_Spread", "📊 Spread: 0,0 pips", PanelX + 15, PanelY + 358, 9, clrLightGray, "Arial");
+    CreateLabel("GridPanel_Status", "🟢 ROBÔ ATIVO", PanelX + 15, PanelY + 376, 11, clrLimeGreen, "Arial Bold");
+    CreateLabel("GridPanel_LastUpdate", "🕒 Atualizado: " + TimeToString(TimeCurrent(), TIME_SECONDS), PanelX + 15, PanelY + 394, 8, clrDarkGray, "Arial");
+    
+    // === SEÇÃO CONTROLES ===
+    CreateSectionBackground("GridPanel_ControlSection", PanelX + 8, PanelY + 415, panelWidth - 16, 95, clrDarkSlateGray);
+    CreateSectionTitle("Controles & Configurações", PanelX + 15, PanelY + 422, clrWhite);
+    
+    // Botão Fechar Todas as Ordens - DESIGN MODERNO
+    CreateModernButton("GridPanel_CloseAllBtn", "❌ FECHAR TODAS AS POSIÇÕES", PanelX + 15, PanelY + 445, panelWidth - 30, 35, clrDarkRed, clrWhite);
+    
+    // Informações da estratégia
+    CreateLabel("GridPanel_Strategy", "⚙️ Distância Grid: " + IntegerToString(PipDistance) + " pips", PanelX + 15, PanelY + 488, 8, clrLightGray, "Arial");
+    CreateLabel("GridPanel_TP", "🎯 Take Profit: " + IntegerToString(TakeProfit) + " pips | 💾 Volume: " + DoubleToString(Volume, 2), PanelX + 15, PanelY + 500, 8, clrLightGray, "Arial");
+}
+
+//+------------------------------------------------------------------+
+//| Criar fundo de seção                                            |
+//+------------------------------------------------------------------+
+void CreateSectionBackground(string name, int x, int y, int width, int height, color bgColor)
+{
+    ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+    ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+    ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bgColor);
+    ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+    ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, name, OBJPROP_COLOR, clrGray);
+    ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_SOLID);
+    ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+    ObjectSetInteger(0, name, OBJPROP_BACK, false);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+    ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Criar título de seção                                           |
+//+------------------------------------------------------------------+
+void CreateSectionTitle(string text, int x, int y, color textColor)
+{
+    string name = "Section_" + IntegerToString(MathRand());
+    CreateLabel(name, "▼ " + text, x, y, 9, textColor, "Arial Bold");
+}
+
+//+------------------------------------------------------------------+
+//| Criar botão moderno                                             |
+//+------------------------------------------------------------------+
+void CreateModernButton(string name, string text, int x, int y, int width, int height, color bgColor, color textColor)
+{
+    ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+    ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+    ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bgColor);
+    ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+    ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_SOLID);
+    ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
+    ObjectSetInteger(0, name, OBJPROP_BACK, false);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, true);
+    ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+    ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+    
+    // Texto do botão centralizado
+    string buttonTextName = name + "_Text";
+    ObjectCreate(0, buttonTextName, OBJ_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, buttonTextName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, buttonTextName, OBJPROP_XDISTANCE, x + width/2 - 80);
+    ObjectSetInteger(0, buttonTextName, OBJPROP_YDISTANCE, y + height/2 - 8);
+    ObjectSetInteger(0, buttonTextName, OBJPROP_COLOR, textColor);
+    ObjectSetInteger(0, buttonTextName, OBJPROP_FONTSIZE, 10);
+    ObjectSetString(0, buttonTextName, OBJPROP_FONT, "Arial Bold");
+    ObjectSetString(0, buttonTextName, OBJPROP_TEXT, text);
+    ObjectSetInteger(0, buttonTextName, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, buttonTextName, OBJPROP_SELECTED, false);
+    ObjectSetInteger(0, buttonTextName, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Função para tratar eventos de clique                            |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+    if(id == CHARTEVENT_OBJECT_CLICK)
+    {
+        if(sparam == "GridPanel_CloseAllBtn")
+        {
+            CloseAllOrders();
+            ObjectSetInteger(0, "GridPanel_CloseAllBtn", OBJPROP_STATE, false);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Fechar todas as ordens do EA                                    |
+//+------------------------------------------------------------------+
+void CloseAllOrders()
+{
+    int totalClosed = 0;
+    
+    // Fechar todas as posições do EA
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(position.SelectByIndex(i))
+        {
+            if(position.Symbol() == _Symbol && position.Magic() == MagicNumber)
+            {
+                ulong ticket = position.Ticket();
+                if(trade.PositionClose(ticket))
+                {
+                    totalClosed++;
+                    Print("Posição fechada: ", ticket, " | Tipo: ", 
+                          (position.PositionType() == POSITION_TYPE_BUY ? "COMPRA" : "VENDA"));
+                }
+                else
+                {
+                    Print("Erro ao fechar posição ", ticket, ": ", trade.ResultRetcode());
+                }
+            }
+        }
+    }
+    
+    if(totalClosed > 0)
+    {
+        Print("Total de ", totalClosed, " posições fechadas pelo usuário");
+        // Resetar flag para permitir novas ordens iniciais
+        initialOrdersPlaced = false;
+    }
+    else
+    {
+        Print("Nenhuma posição encontrada para fechar");
+    }
+}
+
+void CreateLabel(string name, string text, int x, int y, int fontSize, color textColor, string fontName)
+{
+    ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, name, OBJPROP_COLOR, textColor);
+    ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+    ObjectSetString(0, name, OBJPROP_FONT, fontName);
+    ObjectSetString(0, name, OBJPROP_TEXT, text);
+    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+    ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+    ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Atualizar informações do painel - CORES MELHORADAS             |
+//+------------------------------------------------------------------+
+void UpdatePanel()
+{
+    // Informações da conta
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    double margin = AccountInfoDouble(ACCOUNT_MARGIN);
+    double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+    
+    // Contar ordens
+    int totalOrders = 0;
+    int buyOrders = 0;
+    int sellOrders = 0;
+    double totalProfit = 0.0;
+    
+    for(int i = 0; i < PositionsTotal(); i++)
+    {
+        if(position.SelectByIndex(i))
+        {
+            if(position.Symbol() == _Symbol && position.Magic() == MagicNumber)
+            {
+                totalOrders++;
+                totalProfit += position.Profit() + position.Swap() + position.Commission();
+                
+                if(position.PositionType() == POSITION_TYPE_BUY)
+                    buyOrders++;
+                else
+                    sellOrders++;
+            }
+        }
+    }
+    
+    // Calcular drawdown
+    double drawDown = 0;
+    if(balance > 0)
+        drawDown = ((balance - equity) / balance) * 100;
+    
+    // Calcular spread
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double spread = (ask - bid) / pipValue;
+    
+    // === ATUALIZAR INFORMAÇÕES COM CORES APRIMORADAS ===
+    ObjectSetString(0, "GridPanel_Balance", OBJPROP_TEXT, "💰 Saldo: R$ " + DoubleToString(balance, 2));
+    ObjectSetString(0, "GridPanel_Equity", OBJPROP_TEXT, "📊 Capital: R$ " + DoubleToString(equity, 2));
+    ObjectSetString(0, "GridPanel_Margin", OBJPROP_TEXT, "📈 Margem: R$ " + DoubleToString(margin, 2));
+    ObjectSetString(0, "GridPanel_FreeMargin", OBJPROP_TEXT, "🆓 Margem Livre: R$ " + DoubleToString(freeMargin, 2));
+    
+    // Cores dinâmicas para equity
+    color equityColor = (equity >= balance) ? clrLimeGreen : clrOrange;
+    ObjectSetInteger(0, "GridPanel_Equity", OBJPROP_COLOR, equityColor);
+    
+    ObjectSetString(0, "GridPanel_OpenOrders", OBJPROP_TEXT, "📋 Total de Ordens: " + IntegerToString(totalOrders));
+    ObjectSetString(0, "GridPanel_BuyOrders", OBJPROP_TEXT, "🟢 Ordens de Compra: " + IntegerToString(buyOrders));
+    ObjectSetString(0, "GridPanel_SellOrders", OBJPROP_TEXT, "🔴 Ordens de Venda: " + IntegerToString(sellOrders));
+    
+    // P&L com cores dinâmicas e símbolos
+    color profitColor;
+    string profitSymbol;
+    string profitEmoji;
+    
+    if(totalProfit > 0)
+    {
+        profitColor = clrLimeGreen;
+        profitSymbol = "+";
+        profitEmoji = "💚";
+    }
+    else if(totalProfit < 0)
+    {
+        profitColor = clrOrangeRed;
+        profitSymbol = "";
+        profitEmoji = "💔";
+    }
+    else
+    {
+        profitColor = clrYellow;
+        profitSymbol = "";
+        profitEmoji = "💵";
+    }
+    
+    ObjectSetString(0, "GridPanel_TotalProfit", OBJPROP_TEXT, profitEmoji + " Lucro Total: " + profitSymbol + "R$ " + DoubleToString(totalProfit, 2));
+    ObjectSetInteger(0, "GridPanel_TotalProfit", OBJPROP_COLOR, profitColor);
+    
+    // DrawDown com cores
+    color drawDownColor = (drawDown > 5) ? clrOrangeRed : ((drawDown > 2) ? clrOrange : clrLimeGreen);
+    ObjectSetString(0, "GridPanel_DrawDown", OBJPROP_TEXT, "📉 DrawDown: " + DoubleToString(drawDown, 2) + "%");
+    ObjectSetInteger(0, "GridPanel_DrawDown", OBJPROP_COLOR, drawDownColor);
+    
+    ObjectSetString(0, "GridPanel_Spread", OBJPROP_TEXT, "📊 Spread: " + DoubleToString(spread, 1) + " pips");
+    ObjectSetString(0, "GridPanel_LastUpdate", OBJPROP_TEXT, "🕒 Atualizado: " + TimeToString(TimeCurrent(), TIME_SECONDS));
+    
+    // Status baseado na atividade
+    string status;
+    color statusColor;
+    
+    if(totalOrders > 0)
+    {
+        status = "🟢 ROBÔ ATIVO (" + IntegerToString(totalOrders) + " posições)";
+        statusColor = clrLimeGreen;
+    }
+    else
+    {
+        status = "🟡 AGUARDANDO SINAIS";
+        statusColor = clrGold;
+    }
+    
+    ObjectSetString(0, "GridPanel_Status", OBJPROP_TEXT, status);
+    ObjectSetInteger(0, "GridPanel_Status", OBJPROP_COLOR, statusColor);
+}
+
+//+------------------------------------------------------------------+
+//| Colocar ordens iniciais (1 compra e 1 venda)                    |
+//+------------------------------------------------------------------+
+void PlaceInitialOrders()
+{
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    // Usar volume 0 se especificado, senão usar o volume mínimo
+    double orderVolume = (Volume == 0) ? SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN) : Volume;
+    
+    // Calcular Take Profit
+    double takeProfitPoints = TakeProfit * pipValue;
+    double buyTP = ask + takeProfitPoints;
+    double sellTP = bid - takeProfitPoints;
+    
+    // Abrir ordem de compra com Take Profit
+    if(trade.Buy(orderVolume, _Symbol, ask, 0, buyTP, EA_Comment + "_COMPRA"))
+    {
+        Print("Ordem de compra inicial aberta em: ", ask, " | TP: ", buyTP);
+    }
+    else
+    {
+        Print("Erro ao abrir ordem de compra: ", trade.ResultRetcode());
+    }
+    
+    // Abrir ordem de venda com Take Profit
+    if(trade.Sell(orderVolume, _Symbol, bid, 0, sellTP, EA_Comment + "_VENDA"))
+    {
+        Print("Ordem de venda inicial aberta em: ", bid, " | TP: ", sellTP);
+    }
+    else
+    {
+        Print("Erro ao abrir ordem de venda: ", trade.ResultRetcode());
+    }
+    
+    lastOrderPrice = (ask + bid) / 2; // Preço médio como referência
+    initialOrdersPlaced = true;
+}
+
+//+------------------------------------------------------------------+
+//| Verificar se precisa abrir novas ordens                          |
+//+------------------------------------------------------------------+
+void CheckForNewOrders()
+{
+    double currentPrice = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) + 
+                          SymbolInfoDouble(_Symbol, SYMBOL_BID)) / 2;
+    
+    // Calcular distância em pips desde a última ordem
+    double distanceInPips = MathAbs(currentPrice - lastOrderPrice) / pipValue;
+    
+    // Se o mercado se moveu 15 pips ou mais, abrir novas ordens
+    if(distanceInPips >= PipDistance)
+    {
+        PlaceNewOrderPair(currentPrice);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Abrir novo par de ordens (compra e venda)                        |
+//+------------------------------------------------------------------+
+void PlaceNewOrderPair(double referencePrice)
+{
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    // Usar volume 0 se especificado, senão usar o volume mínimo
+    double orderVolume = (Volume == 0) ? SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN) : Volume;
+    
+    // Calcular Take Profit
+    double takeProfitPoints = TakeProfit * pipValue;
+    double buyTP = ask + takeProfitPoints;
+    double sellTP = bid - takeProfitPoints;
+    
+    // Abrir ordem de compra com Take Profit
+    if(trade.Buy(orderVolume, _Symbol, ask, 0, buyTP, EA_Comment + "_COMPRA"))
+    {
+        Print("Nova ordem de compra aberta em: ", ask, " | TP: ", buyTP, " | Distância: ", 
+              MathAbs(referencePrice - lastOrderPrice) / pipValue, " pips");
+    }
+    
+    // Abrir ordem de venda com Take Profit
+    if(trade.Sell(orderVolume, _Symbol, bid, 0, sellTP, EA_Comment + "_VENDA"))
+    {
+        Print("Nova ordem de venda aberta em: ", bid, " | TP: ", sellTP, " | Distância: ", 
+              MathAbs(referencePrice - lastOrderPrice) / pipValue, " pips");
+    }
+    
+    // Atualizar preço de referência para a última ordem
+    lastOrderPrice = referencePrice;
+}
+
+//+------------------------------------------------------------------+
+//| Verificar posições existentes na inicialização                   |
+//+------------------------------------------------------------------+
+void CheckExistingPositions()
+{
+    if(PositionsTotal() > 0)
+    {
+        // Se já existem posições, encontrar a mais recente como referência
+        double latestPrice = 0;
+        datetime latestTime = 0;
+        
+        for(int i = 0; i < PositionsTotal(); i++)
+        {
+            if(position.SelectByIndex(i))
+            {
+                if(position.Symbol() == _Symbol && position.Magic() == MagicNumber)
+                {
+                    if(position.Time() > latestTime)
+                    {
+                        latestTime = position.Time();
+                        latestPrice = position.PriceOpen();
+                    }
+                }
+            }
+        }
+        
+        if(latestPrice > 0)
+        {
+            lastOrderPrice = latestPrice;
+            initialOrdersPlaced = true;
+            Print("Posições existentes encontradas. Última ordem em: ", latestPrice);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Remover objetos do painel                                        |
+//+------------------------------------------------------------------+
+void RemovePanel()
+{
+    // Remover todos os objetos do painel
+    for(int i = 0; i < ArraySize(panelObjects); i++)
+    {
+        ObjectDelete(0, panelObjects[i]);
+    }
+    
+    // Remover objetos adicionais criados dinamicamente
+    ObjectDelete(0, "GridPanel_Symbol");
+    ObjectDelete(0, "GridPanel_Strategy");
+    ObjectDelete(0, "GridPanel_TP");
+    ObjectDelete(0, "GridPanel_CloseAllBtn_Text");
+    
+    // Remover títulos de seção criados dinamicamente
+    for(int i = 0; i < 1000; i++)
+    {
+        string sectionName = "Section_" + IntegerToString(i);
+        if(ObjectFind(0, sectionName) >= 0)
+            ObjectDelete(0, sectionName);
+    }
+    
+    Print("Painel visual removido com sucesso");
+}
+
+//+------------------------------------------------------------------+
+//| Função de desinicialização                                       |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    // Remover painel
+    if(ShowPanel)
+        RemovePanel();
+    
+    Print("Grid EA finalizado. Motivo: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Função para calcular o tamanho do lote baseado no risco         |
+//+------------------------------------------------------------------+
+double CalculateLotSize()
+{
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    
+    if(Volume == 0)
+        return minLot;
+    
+    double lotSize = Volume;
+    
+    // Normalizar o tamanho do lote
+    lotSize = MathMax(minLot, lotSize);
+    lotSize = MathMin(maxLot, lotSize);
+    lotSize = MathRound(lotSize / stepLot) * stepLot;
+    
+    return lotSize;
+}
