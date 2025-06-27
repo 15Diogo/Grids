@@ -1,0 +1,477 @@
+//+------------------------------------------------------------------+
+//|                                                   BuyBot.mq5     |
+//|                        Copyright 2025, Manus AI Agent           |
+//|                                                                  |
+//+------------------------------------------------------------------+
+#property copyright "Manus AI Agent"
+#property link      ""
+#property version   "2.10"
+#property strict
+#property description "Expert Advisor que opera um grid de compra no ativo corrente usando ATR para balizar entradas com TP individual e SL global."
+
+#include <Trade/Trade.mqh>
+#include <Trade/PositionInfo.mqh>
+
+//--- Input parameters
+input double BaseLotSize       = 0.01;    // Base Lot Size
+input double RiskPercent       = 1.0;     // Risk Percentage per trade
+input double ATRMultiplier     = 1.5;     // ATR Multiplier for Grid Step
+input double IndividualTP      = 200.0;   // Take Profit individual para cada ordem (em pontos)
+input double GlobalSLPercent   = 30.0;    // Stop Loss Global (% do capital inicial)
+input int    ATRPeriod         = 14;      // ATR Period
+input ENUM_TIMEFRAMES ATRTimeframe = PERIOD_H1; // ATR Timeframe
+input ulong  MagicNumber       = 67890;   // EA Magic Number
+input int    MaxPositions      = 10;      // Maximum number of positions allowed
+input bool   UseATRLotSizing   = true;    // Use ATR for lot sizing
+input bool   UseFixedGrid      = false;   // Use fixed grid instead of ATR
+input int    FixedGridPips     = 15;      // Fixed Grid Step in Pips (if UseFixedGrid = true)
+
+//--- Global variables
+CTrade          trade;
+CPositionInfo   posInfo;
+int             atrHandle;
+double          initialCapital;            // Capital inicial para cálculo do SL global
+double          globalSLAmount;            // Valor do stop loss global
+bool            gridActive;                // Flag para controlar se o grid está ativo
+
+// Structure to hold symbol-specific data
+struct SymbolData
+{
+   string          name;
+   double          pointValue;
+   int             digits;
+   double          minLot;
+   double          maxLot;
+   double          lotStep;
+   bool            isTradingAllowed;
+   double          tickValue;
+   double          contractSize;
+};
+
+SymbolData currentSymbol; // Data for current symbol
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   Print("Initializing BuyBot EA with Individual TP and Global SL...");
+
+   //--- Initialize trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(5);
+   trade.SetTypeFilling(ORDER_FILLING_FOK);
+
+   //--- Get current symbol from chart
+   string chartSymbol = Symbol();
+   
+   //--- Initialize ATR indicator
+   atrHandle = iATR(chartSymbol, ATRTimeframe, ATRPeriod);
+   if(atrHandle == INVALID_HANDLE)
+   {
+      PrintFormat("Error: Could not create ATR indicator for %s", chartSymbol);
+      return(INIT_FAILED);
+   }
+
+   //--- Initialize data for current symbol
+   if(!InitializeSymbolData(chartSymbol, currentSymbol))
+      return(INIT_FAILED);
+
+   //--- Initialize capital management
+   initialCapital = AccountInfoDouble(ACCOUNT_BALANCE);
+   globalSLAmount = initialCapital * (GlobalSLPercent / 100.0);
+   gridActive = true;
+
+   Print("BuyBot EA with Individual TP and Global SL Initialized Successfully.");
+   PrintFormat("Operating on current symbol: %s", currentSymbol.name);
+   PrintFormat("Base Lot: %.2f, Risk: %.1f%%, ATR Period: %d, ATR Timeframe: %s", 
+               BaseLotSize, RiskPercent, ATRPeriod, EnumToString(ATRTimeframe));
+   PrintFormat("Individual TP: %.0f points, Global SL: %.1f%% (%.2f)", 
+               IndividualTP, GlobalSLPercent, globalSLAmount);
+   PrintFormat("Initial Capital: %.2f, Max Positions: %d", initialCapital, MaxPositions);
+   PrintFormat("ATR Lot Sizing: %s, Fixed Grid: %s", 
+               UseATRLotSizing ? "Yes" : "No", UseFixedGrid ? "Yes" : "No");
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize data for a specific symbol                            |
+//+------------------------------------------------------------------+
+bool InitializeSymbolData(const string symbolName, SymbolData &symbolData)
+{
+   symbolData.name = symbolName;
+
+   //--- Ensure symbol is available in Market Watch
+   if(!SymbolSelect(symbolName, true))
+   {
+      PrintFormat("Error: Symbol %s not found or not enabled in Market Watch.", symbolName);
+      return(false);
+   }
+
+   //--- Wait for symbol info to be available
+   int retries = 10;
+   while(SymbolInfoDouble(symbolName, SYMBOL_POINT) == 0 && retries > 0)
+   {
+      Sleep(500);
+      retries--;
+   }
+
+   symbolData.pointValue = SymbolInfoDouble(symbolName, SYMBOL_POINT);
+   if(symbolData.pointValue == 0)
+   {
+      PrintFormat("Error: Could not get point value for %s.", symbolName);
+      return(false);
+   }
+
+   symbolData.digits = (int)SymbolInfoInteger(symbolName, SYMBOL_DIGITS);
+   symbolData.minLot = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_MIN);
+   symbolData.maxLot = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_MAX);
+   symbolData.lotStep = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_STEP);
+   symbolData.tickValue = SymbolInfoDouble(symbolName, SYMBOL_TRADE_TICK_VALUE);
+   symbolData.contractSize = SymbolInfoDouble(symbolName, SYMBOL_TRADE_CONTRACT_SIZE);
+   symbolData.isTradingAllowed = SymbolInfoInteger(symbolName, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_DISABLED;
+
+   //--- Validate BaseLotSize
+   if(BaseLotSize < symbolData.minLot || BaseLotSize > symbolData.maxLot || 
+      fmod(BaseLotSize, symbolData.lotStep) > 0.0000001)
+   {
+      PrintFormat("Error: Base lot size %.2f is invalid for %s (Min: %.2f, Max: %.2f, Step: %.2f).",
+                  BaseLotSize, symbolName, symbolData.minLot, symbolData.maxLot, symbolData.lotStep);
+      return(false);
+   }
+
+   if(!symbolData.isTradingAllowed)
+   {
+       PrintFormat("Warning: Trading is disabled for symbol %s.", symbolName);
+   }
+
+   PrintFormat("Initialized data for %s: Point=%.*f, Digits=%d, TickValue=%.2f, ContractSize=%.0f",
+               symbolName, symbolData.digits, symbolData.pointValue, symbolData.digits, 
+               symbolData.tickValue, symbolData.contractSize);
+
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   PrintFormat("BuyBot EA Deinitialized for %s. Reason: %d", currentSymbol.name, reason);
+   
+   //--- Release ATR handle
+   if(atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(atrHandle);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Check if trading is allowed globally
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return;
+
+   //--- Check global stop loss
+   if(CheckGlobalStopLoss())
+   {
+      PrintFormat("Global Stop Loss triggered! Closing all positions and restarting grid...");
+      CloseAllPositions();
+      
+      //--- Reset for restart
+      Sleep(1000); // Wait a bit for positions to close
+      gridActive = true;
+      PrintFormat("Grid restarted. Ready for new trades.");
+      return;
+   }
+
+   //--- Manage grid for current symbol only if active
+   if(currentSymbol.isTradingAllowed && gridActive)
+   {
+      ManageGrid();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check if global stop loss is reached                            |
+//+------------------------------------------------------------------+
+bool CheckGlobalStopLoss()
+{
+   double totalProfit = 0.0;
+   int totalPositions = PositionsTotal();
+   
+   for(int i = 0; i < totalPositions; i++)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
+      {
+         totalProfit += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+      }
+   }
+   
+   //--- Check if loss exceeds global stop loss
+   if(totalProfit < -globalSLAmount)
+   {
+      PrintFormat("Global SL reached: Current Loss = %.2f, SL Limit = %.2f", 
+                  totalProfit, globalSLAmount);
+      return true;
+   }
+   
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get current ATR value                                           |
+//+------------------------------------------------------------------+
+double GetCurrentATR()
+{
+   double atrBuffer[];
+   ArraySetAsSeries(atrBuffer, true);
+   
+   if(CopyBuffer(atrHandle, 0, 1, 1, atrBuffer) <= 0)
+   {
+      PrintFormat("Error: Could not get ATR value. Error code: %d", GetLastError());
+      return 0.0;
+   }
+   
+   return atrBuffer[0];
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size based on ATR and risk                        |
+//+------------------------------------------------------------------+
+double CalculateATRLotSize(double atrValue)
+{
+   if(!UseATRLotSizing || atrValue <= 0)
+      return BaseLotSize;
+
+   //--- Calculate risk amount in account currency
+   double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmount = accountBalance * (RiskPercent / 100.0);
+   
+   //--- Calculate ATR in account currency
+   double atrInAccountCurrency = atrValue * currentSymbol.tickValue * (currentSymbol.contractSize / currentSymbol.pointValue);
+   
+   //--- Calculate lot size based on risk
+   double calculatedLot = riskAmount / atrInAccountCurrency;
+   
+   //--- Normalize lot size
+   calculatedLot = NormalizeLotSize(calculatedLot);
+   
+   //--- Ensure minimum lot size
+   if(calculatedLot < BaseLotSize)
+      calculatedLot = BaseLotSize;
+   
+   return calculatedLot;
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot size according to symbol specifications           |
+//+------------------------------------------------------------------+
+double NormalizeLotSize(double lotSize)
+{
+   double normalizedLot = MathRound(lotSize / currentSymbol.lotStep) * currentSymbol.lotStep;
+   
+   if(normalizedLot < currentSymbol.minLot)
+      normalizedLot = currentSymbol.minLot;
+   else if(normalizedLot > currentSymbol.maxLot)
+      normalizedLot = currentSymbol.maxLot;
+      
+   return normalizedLot;
+}
+
+//+------------------------------------------------------------------+
+//| Manage the buy grid for current symbol                          |
+//+------------------------------------------------------------------+
+void ManageGrid()
+{
+   //--- Get current ATR value
+   double currentATR = GetCurrentATR();
+   if(currentATR <= 0)
+   {
+      Print("Invalid ATR value, skipping grid management.");
+      return;
+   }
+
+   //--- Get current price
+   double currentAsk = SymbolInfoDouble(currentSymbol.name, SYMBOL_ASK);
+   if(currentAsk == 0)
+   {
+      return;
+   }
+
+   //--- Calculate grid step based on ATR or fixed values
+   double gridStepPoints;
+   
+   if(UseFixedGrid)
+   {
+      gridStepPoints = FixedGridPips * currentSymbol.pointValue;
+   }
+   else
+   {
+      gridStepPoints = currentATR * ATRMultiplier;
+   }
+
+   //--- Calculate lot size
+   double lotSize = CalculateATRLotSize(currentATR);
+
+   //--- Count current positions and find the lowest buy price
+   double lowestBuyPrice = DBL_MAX;
+   int positionsCount = 0;
+   int totalPositions = PositionsTotal();
+
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+         {
+            positionsCount++;
+            if(posInfo.PriceOpen() < lowestBuyPrice)
+            {
+               lowestBuyPrice = posInfo.PriceOpen();
+            }
+         }
+      }
+   }
+
+   //--- Check if maximum positions reached
+   if(positionsCount >= MaxPositions)
+   {
+      return;
+   }
+
+   //--- Calculate individual take profit in price
+   double tpPoints = IndividualTP * currentSymbol.pointValue;
+   double tpPrice = NormalizeDouble(currentAsk + tpPoints, currentSymbol.digits);
+
+   //--- If no buy positions exist, open the first one
+   if(positionsCount == 0)
+   {
+      PrintFormat("[%s] Initial buy order - ATR: %.5f, GridStep: %.5f, Individual TP: %.0f points, Lot: %.2f",
+                  currentSymbol.name, currentATR, gridStepPoints, IndividualTP, lotSize);
+      PrintFormat("[%s] Placing initial buy at Ask: %.5f, TP: %.5f",
+                  currentSymbol.name, currentAsk, tpPrice);
+      
+      if(!trade.Buy(lotSize, currentSymbol.name, currentAsk, 0, tpPrice, "Initial Buy - Individual TP"))
+      {
+         PrintFormat("[%s] Error placing initial buy order: %d - %s", 
+                     currentSymbol.name, trade.ResultRetcode(), trade.ResultComment());
+      }
+      else
+      {
+         PrintFormat("[%s] Initial buy order placed successfully. Ticket: %d", 
+                     currentSymbol.name, trade.ResultOrder());
+      }
+      return;
+   }
+
+   //--- If positions exist, check if a new grid level is reached
+   double nextBuyLevel = NormalizeDouble(lowestBuyPrice - gridStepPoints, currentSymbol.digits);
+
+   // Check if price has dropped below the next grid level
+   if(currentAsk <= nextBuyLevel + (currentSymbol.pointValue * 2))
+   {
+      // Check if an order already exists very close to this level
+      bool orderExistsNearLevel = false;
+      for(int i = totalPositions - 1; i >= 0; i--)
+      {
+         if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && 
+            posInfo.Symbol() == currentSymbol.name && posInfo.PositionType() == POSITION_TYPE_BUY)
+         {
+            if(MathAbs(posInfo.PriceOpen() - nextBuyLevel) < (gridStepPoints / 3.0))
+            {
+               orderExistsNearLevel = true;
+               break;
+            }
+         }
+      }
+
+      if(!orderExistsNearLevel)
+      {
+         PrintFormat("[%s] Grid level reached - ATR: %.5f, Price: %.5f, Level: %.5f",
+                     currentSymbol.name, currentATR, currentAsk, nextBuyLevel);
+         PrintFormat("[%s] Placing grid buy #%d/%d, Lot: %.2f, Individual TP: %.5f",
+                     currentSymbol.name, positionsCount + 1, MaxPositions, lotSize, tpPrice);
+         
+         if(!trade.Buy(lotSize, currentSymbol.name, currentAsk, 0, tpPrice, 
+                       StringFormat("Grid Buy #%d - Individual TP", positionsCount + 1)))
+         {
+            PrintFormat("[%s] Error placing grid buy order: %d - %s", 
+                        currentSymbol.name, trade.ResultRetcode(), trade.ResultComment());
+         }
+         else
+         {
+            PrintFormat("[%s] Grid buy order placed successfully. Ticket: %d", 
+                        currentSymbol.name, trade.ResultOrder());
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions for current symbol                          |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   int totalPositions = PositionsTotal();
+   int closedCount = 0;
+   
+   PrintFormat("Attempting to close all positions for %s (Magic: %d)...", currentSymbol.name, MagicNumber);
+   
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
+      {
+         PrintFormat("Closing position #%d (%s %.2f @ %.5f)",
+                     posInfo.Ticket(),
+                     (posInfo.PositionType() == POSITION_TYPE_BUY ? "Buy" : "Sell"),
+                     posInfo.Volume(),
+                     posInfo.PriceOpen());
+         
+         if(!trade.PositionClose(posInfo.Ticket()))
+         {
+            PrintFormat("Error closing position #%d: %d - %s", 
+                        posInfo.Ticket(), trade.ResultRetcode(), trade.ResultComment());
+         }
+         else
+         {
+            PrintFormat("Position #%d closed successfully.", posInfo.Ticket());
+            closedCount++;
+         }
+      }
+   }
+   
+   PrintFormat("Closed %d positions for %s", closedCount, currentSymbol.name);
+}
+
+//+------------------------------------------------------------------+
+//| Get current positions info                                       |
+//+------------------------------------------------------------------+
+string GetPositionsInfo()
+{
+   int count = 0;
+   double totalProfit = 0.0;
+   double totalVolume = 0.0;
+   int totalPositions = PositionsTotal();
+   
+   for(int i = 0; i < totalPositions; i++)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
+      {
+         count++;
+         totalProfit += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+         totalVolume += posInfo.Volume();
+      }
+   }
+   
+   double slPercentage = (totalProfit / initialCapital) * 100.0;
+   
+   return StringFormat("Positions: %d, Volume: %.2f, P&L: %.2f (%.2f%%), SL at: %.2f%%", 
+                      count, totalVolume, totalProfit, slPercentage, -GlobalSLPercent);
+}
+
+//+------------------------------------------------------------------+
