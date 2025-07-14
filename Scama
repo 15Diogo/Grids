@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Manus Team"
 #property link      "https://www.google.com"
-#property version   "2.11"
-#property description "Enhanced Expert Advisor para estratégia de compra inicial e grid de venda com reset automático."
+#property version   "2.12"
+#property description "Enhanced Expert Advisor para estratégia de compra inicial e grid de venda com reset automático, com vendas a mercado por nível."
 
 //--- Input parameters
 input group "=== CONFIGURAÇÕES GERAIS ==="
@@ -20,9 +20,8 @@ input int    InitialBuyTakeProfitPips = 30;         // Take Profit da ordem de c
 input int    InitialBuyStopLossPips = 0;            // Stop Loss da ordem de compra inicial (0 = desabilitado)
 
 input group "=== GRID DE VENDA ==="
-input int    FallPipsForSellGrid = 30;              // Queda em pips para iniciar o grid de venda
+input int    SellGridStepPips = 100;                // Passo em pips entre as ordens de venda do grid (100 pips)
 input double SellGridVolume = 0.01;                 // Volume das ordens de venda do grid
-input int    SellGridStepPips = 15;                 // Passo em pips entre as ordens de venda do grid
 input int    SellGridTakeProfitPips = 15;           // Take Profit das ordens de venda do grid em pips
 input int    MaxSellOrders = 10;                    // Máximo de ordens de venda no grid
 input int    SellGridStopLossPips = 0;              // Stop Loss das ordens de venda (0 = desabilitado)
@@ -57,6 +56,7 @@ double price_buffer[];                           // Buffer para armazenar preço
 int price_buffer_size = 5;                      // Tamanho do buffer
 bool strategy_active = false;                    // Flag para controlar se a estratégia está ativa
 bool initial_tp_hit = false;                    // Flag para detectar quando TP inicial foi atingido
+double last_sell_price_level = 0.0;             // Preço do último nível de venda para controle de 100 pips
 
 //--- Trade object
 #include <Trade\Trade.mqh>
@@ -138,6 +138,34 @@ void CheckExistingPositions()
          }
       }
    }
+   
+   // Ao iniciar, se houver posições de venda abertas, definir o last_sell_price_level
+   // para o preço da posição de venda mais recente (maior preço de abertura)
+   double highest_sell_price = 0.0;
+   bool found_sell_position = false;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+         {
+            double price = PositionGetDouble(POSITION_PRICE_OPEN);
+            if(price > highest_sell_price)
+            {
+               highest_sell_price = price;
+               found_sell_position = true;
+            }
+         }
+      }
+   }
+   if(found_sell_position)
+   {
+      last_sell_price_level = highest_sell_price;
+      Print("Posição de venda existente encontrada. Definindo last_sell_price_level para: ", last_sell_price_level);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -183,55 +211,25 @@ double GetOpenBuyPositionPrice()
 }
 
 //+------------------------------------------------------------------+
-//| Função para contar ordens de venda pendentes                    |
+//| Função para contar ordens de venda abertas (a mercado)          |
 //+------------------------------------------------------------------+
 int GetSellGridOrdersCount()
 {
    int count = 0;
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      ulong ticket = OrderGetTicket(i);
+      ulong ticket = PositionGetTicket(i);
       if(ticket > 0)
       {
-         if(OrderGetString(ORDER_SYMBOL) == _Symbol && 
-            OrderGetInteger(ORDER_MAGIC) == MagicNumber &&
-            OrderGetInteger(ORDER_TYPE) == ORDER_TYPE_SELL_LIMIT)
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
          {
             count++;
          }
       }
    }
    return count;
-}
-
-//+------------------------------------------------------------------+
-//| Função para obter menor preço das ordens de venda               |
-//+------------------------------------------------------------------+
-double GetLowestSellLimitPrice()
-{
-   double lowest_price = 999999.0;
-   bool found = false;
-   
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = OrderGetTicket(i);
-      if(ticket > 0)
-      {
-         if(OrderGetString(ORDER_SYMBOL) == _Symbol && 
-            OrderGetInteger(ORDER_MAGIC) == MagicNumber &&
-            OrderGetInteger(ORDER_TYPE) == ORDER_TYPE_SELL_LIMIT)
-         {
-            double price = OrderGetDouble(ORDER_PRICE_OPEN);
-            if(price < lowest_price)
-            {
-               lowest_price = price;
-               found = true;
-            }
-         }
-      }
-   }
-   
-   return found ? lowest_price : 0.0;
 }
 
 //+------------------------------------------------------------------+
@@ -377,10 +375,10 @@ void ResetStrategy()
 {
    Print("=== RESETANDO ESTRATÉGIA ===");
    
-   // Cancelar todas as ordens pendentes
+   // Cancelar todas as ordens pendentes (se houver)
    CancelAllPendingOrders();
    
-   // Fechar todas as posições
+   // Fechar todas as posições (compra e venda)
    CloseAllPositions();
    
    // Resetar variáveis
@@ -391,6 +389,7 @@ void ResetStrategy()
    strategy_active = false;
    initial_tp_hit = false;
    last_reset_time = TimeCurrent();
+   last_sell_price_level = 0.0; // Resetar o nível da última venda
    
    // Limpar buffer de preços
    ArrayInitialize(price_buffer, 0.0);
@@ -468,21 +467,36 @@ bool IsMarketFalling()
 }
 
 //+------------------------------------------------------------------+
-//| Função para verificar se deve lançar ordem de venda             |
+//| Função para verificar se deve lançar ordem de venda (a mercado) |
 //+------------------------------------------------------------------+
-bool ShouldPlaceSellOrder(double current_price, double open_buy_price)
+bool ShouldPlaceMarketSellOrder(double current_bid)
 {
-   // Verificar se a queda mínima foi atingida
-   double fall_pips = (open_buy_price - current_price) / point_value;
-   if(fall_pips < FallPipsForSellGrid) return false;
-   
-   // Verificar se o mercado está caindo (se habilitado)
+   // Só lançar ordem se o mercado estiver caindo
    if(!IsMarketFalling()) return false;
    
-   // Verificar se não atingiu o máximo de ordens
-   if(GetSellGridOrdersCount() >= MaxSellOrders) return false;
+   // Se ainda não há vendas, a primeira venda pode ser feita
+   if(last_sell_price_level == 0.0)
+   {
+      // A primeira venda é feita quando o preço cai 100 pips da compra inicial
+      if (initial_buy_ticket != 0 && initial_buy_price != 0.0)
+      {
+         double fall_from_initial_buy = (initial_buy_price - current_bid) / point_value;
+         if (fall_from_initial_buy >= SellGridStepPips)
+         {
+            return true;
+         }
+      }
+      return false;
+   }
    
-   return true;
+   // Para vendas subsequentes, verificar se o preço caiu 100 pips do último nível de venda
+   double fall_from_last_sell = (last_sell_price_level - current_bid) / point_value;
+   if (fall_from_last_sell >= SellGridStepPips)
+   {
+      return true;
+   }
+   
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -638,56 +652,41 @@ void OnTick()
    }
    else if(strategy_active && !initial_tp_hit)
    {
-      double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      
       // Verificar se posição de compra ainda existe
       if(HasOpenPosition(POSITION_TYPE_BUY))
       {
-         double open_buy_price = GetOpenBuyPositionPrice();
-         
          // Verificar se deve lançar ordens de venda usando a nova lógica
-         if(ShouldPlaceSellOrder(current_bid, open_buy_price))
+         if(ShouldPlaceMarketSellOrder(current_bid))
          {
-            int current_sell_orders = GetSellGridOrdersCount();
-            double next_sell_price = 0.0;
-            double lowest_sell_price = GetLowestSellLimitPrice();
-            
-            if(lowest_sell_price == 0.0)
-            {
-               // Primeira ordem de venda do grid
-               next_sell_price = current_ask;
-            }
-            else
-            {
-               // Próxima ordem do grid
-               next_sell_price = lowest_sell_price - SellGridStepPips * point_value;
-            }
-            
-            // Verificar se o preço não está muito próximo do bid atual
-            if(next_sell_price > current_bid + 5 * point_value)
+            if(GetSellGridOrdersCount() < MaxSellOrders)
             {
                if(HasSufficientMargin(SellGridVolume))
                {
-                  double tp = next_sell_price - SellGridTakeProfitPips * point_value;
+                  double tp = current_bid - SellGridTakeProfitPips * point_value;
                   double sl = (SellGridStopLossPips > 0) ? 
-                             next_sell_price + SellGridStopLossPips * point_value : 0;
+                             current_bid + SellGridStopLossPips * point_value : 0;
                   
-                  if(trade.SellLimit(SellGridVolume, next_sell_price, _Symbol, sl, tp, 
-                                    ORDER_TIME_GTC, 0, "Grid Venda #" + IntegerToString(current_sell_orders + 1)))
+                  if(trade.Sell(SellGridVolume, _Symbol, current_bid, sl, tp, 
+                                "Venda Mercado #" + IntegerToString(GetSellGridOrdersCount() + 1)))
                   {
-                     Print("Ordem de venda #", current_sell_orders + 1, " colocada em: ", next_sell_price);
+                     Print("Ordem de venda a mercado #", GetSellGridOrdersCount() + 1, " colocada em: ", current_bid);
                      Print("Mercado caindo: ", IsMarketFalling() ? "SIM" : "NÃO");
                      last_trade_time = TimeCurrent();
+                     last_sell_price_level = current_bid; // Atualiza o nível da última venda
                   }
                   else
                   {
-                     Print("Erro ao colocar ordem de venda: ", trade.ResultRetcode());
+                     Print("Erro ao colocar ordem de venda a mercado: ", trade.ResultRetcode());
                   }
                }
                else
                {
                   Print("Margem insuficiente para nova ordem de venda!");
                }
+            }
+            else
+            {
+               Print("Máximo de ordens de venda atingido. Não será colocada nova ordem.");
             }
          }
       }
@@ -755,6 +754,7 @@ void OnChartEvent(const int id, const long& lparam, const double& dparam, const 
          {
             if(price_buffer[i] > 0) Print("  [", i, "] ", price_buffer[i]);
          }
+         Print("Último nível de venda: ", last_sell_price_level);
       }
       else if(lparam == 82) // Tecla 'R' - Reset manual
       {
@@ -765,3 +765,5 @@ void OnChartEvent(const int id, const long& lparam, const double& dparam, const 
 }
 
 //+------------------------------------------------------------------+
+
+
