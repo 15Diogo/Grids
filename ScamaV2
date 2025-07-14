@@ -1,0 +1,767 @@
+//+------------------------------------------------------------------+
+//|                                          MyStrategyEA_Enhanced.mq5 |
+//|                                                     Manus Team |
+//|                                             https://www.google.com |
+//+------------------------------------------------------------------+
+#property copyright "Manus Team"
+#property link      "https://www.google.com"
+#property version   "2.11"
+#property description "Enhanced Expert Advisor para estratégia de compra inicial e grid de venda com reset automático."
+
+//--- Input parameters
+input group "=== CONFIGURAÇÕES GERAIS ==="
+input bool   EnableTrading = true;                    // Habilitar negociação
+input double RiskPercentage = 2.0;                   // Risco por operação em %
+input int    MagicNumber = 12345;                    // Número mágico para identificação
+
+input group "=== COMPRA INICIAL ==="
+input double InitialBuyVolume = 1.0;                 // Volume da ordem de compra inicial
+input int    InitialBuyTakeProfitPips = 182;         // Take Profit da ordem de compra inicial em pips
+input int    InitialBuyStopLossPips =12;            // Stop Loss da ordem de compra inicial (0 = desabilitado)
+
+input group "=== GRID DE VENDA ==="
+input int    FallPipsForSellGrid = 13;              // Queda em pips para iniciar o grid de venda
+input double SellGridVolume = 0.1;                 // Volume das ordens de venda do grid
+input int    SellGridStepPips = 32;                 // Passo em pips entre as ordens de venda do grid
+input int    SellGridTakeProfitPips = 48;           // Take Profit das ordens de venda do grid em pips
+input int    MaxSellOrders = 12;                    // Máximo de ordens de venda no grid
+input int    SellGridStopLossPips = 12;              // Stop Loss das ordens de venda (0 = desabilitado)
+input bool   OnlyOnDowntrend = true;                // Só lançar ordens se mercado estiver caindo
+
+input group "=== RESET AUTOMÁTICO ==="
+input int    DelayAfterResetSeconds = 10;           // Delay em segundos após reset antes de nova compra
+input bool   EnableAutoReset = true;                // Habilitar reset automático após TP inicial
+
+input group "=== PROTEÇÃO E CONTROLE ==="
+input double MaxDrawdownPercent = 41.2141;             // Drawdown máximo em %
+input double MaxSpreadPoints = 3.2684;                 // Spread máximo permitido em pontos
+input bool   UseMarginCheck = true;                 // Verificar margem antes de abrir posições
+input int    MaxSlippage = 4;                       // Slippage máximo permitido
+
+input group "=== HORÁRIOS DE NEGOCIAÇÃO ==="
+input bool   UseTimeFilter = false;                 // Usar filtro de horário
+input int    StartHour = 9;                         // Hora de início (0-23)
+input int    EndHour = 17;                          // Hora de fim (0-23)
+
+//--- Global variables
+ulong  initial_buy_ticket = 0;
+double initial_buy_price = 0.0;
+double initial_buy_tp_price = 0.0;               // Preço do take profit inicial
+double initial_account_balance = 0.0;
+datetime last_trade_time = 0;
+datetime last_reset_time = 0;                    // Controle de delay após reset
+int sell_orders_count = 0;
+double point_value = 0.0;
+double previous_price = 0.0;                     // Preço anterior para detectar direção
+double price_buffer[];                           // Buffer para armazenar preços
+int price_buffer_size = 5;                      // Tamanho do buffer
+bool strategy_active = false;                    // Flag para controlar se a estratégia está ativa
+bool initial_tp_hit = false;                    // Flag para detectar quando TP inicial foi atingido
+
+//--- Trade object
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Configurar trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(MaxSlippage);
+   
+   // Definir valor do ponto
+   point_value = _Point;
+   if(_Digits == 5 || _Digits == 3) point_value *= 10;
+   
+   // Inicializar buffer de preços
+   ArrayResize(price_buffer, price_buffer_size);
+   ArrayInitialize(price_buffer, 0.0);
+   
+   // Armazenar saldo inicial
+   initial_account_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   
+   // Verificar se há posições abertas do EA
+   CheckExistingPositions();
+   
+   // Validações iniciais
+   if(InitialBuyVolume <= 0 || SellGridVolume <= 0)
+   {
+      Alert("Volumes devem ser maiores que zero!");
+      return(INIT_FAILED);
+   }
+   
+   if(MaxSellOrders <= 0)
+   {
+      Alert("Número máximo de ordens de venda deve ser maior que zero!");
+      return(INIT_FAILED);
+   }
+   
+   Print("EA Enhanced inicializado com sucesso!");
+   Print("Símbolo: ", _Symbol);
+   Print("Spread atual: ", SymbolInfoInteger(_Symbol, SYMBOL_SPREAD), " pontos");
+   Print("Saldo inicial: ", initial_account_balance);
+   Print("Reset automático: ", EnableAutoReset ? "HABILITADO" : "DESABILITADO");
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("EA Enhanced finalizado. Motivo: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Verificar posições existentes na inicialização                  |
+//+------------------------------------------------------------------+
+void CheckExistingPositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+         {
+            initial_buy_ticket = ticket;
+            initial_buy_price = PositionGetDouble(POSITION_PRICE_OPEN);
+            initial_buy_tp_price = PositionGetDouble(POSITION_TP);
+            strategy_active = true;
+            Print("Posição de compra existente encontrada: ", ticket, " | Preço: ", initial_buy_price, " | TP: ", initial_buy_tp_price);
+            break;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Função para verificar se há posição aberta                      |
+//+------------------------------------------------------------------+
+bool HasOpenPosition(ENUM_POSITION_TYPE type)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetInteger(POSITION_TYPE) == type)
+         {
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Função para obter preço da posição de compra aberta             |
+//+------------------------------------------------------------------+
+double GetOpenBuyPositionPrice()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+         {
+            return PositionGetDouble(POSITION_PRICE_OPEN);
+         }
+      }
+   }
+   return 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| Função para contar ordens de venda pendentes                    |
+//+------------------------------------------------------------------+
+int GetSellGridOrdersCount()
+{
+   int count = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket > 0)
+      {
+         if(OrderGetString(ORDER_SYMBOL) == _Symbol && 
+            OrderGetInteger(ORDER_MAGIC) == MagicNumber &&
+            OrderGetInteger(ORDER_TYPE) == ORDER_TYPE_SELL_LIMIT)
+         {
+            count++;
+         }
+      }
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Função para obter menor preço das ordens de venda               |
+//+------------------------------------------------------------------+
+double GetLowestSellLimitPrice()
+{
+   double lowest_price = 999999.0;
+   bool found = false;
+   
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket > 0)
+      {
+         if(OrderGetString(ORDER_SYMBOL) == _Symbol && 
+            OrderGetInteger(ORDER_MAGIC) == MagicNumber &&
+            OrderGetInteger(ORDER_TYPE) == ORDER_TYPE_SELL_LIMIT)
+         {
+            double price = OrderGetDouble(ORDER_PRICE_OPEN);
+            if(price < lowest_price)
+            {
+               lowest_price = price;
+               found = true;
+            }
+         }
+      }
+   }
+   
+   return found ? lowest_price : 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| Função para verificar spread                                    |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable()
+{
+   long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   return (spread <= MaxSpreadPoints * 10); // Convertendo pontos para spread
+}
+
+//+------------------------------------------------------------------+
+//| Função para verificar margem disponível                         |
+//+------------------------------------------------------------------+
+bool HasSufficientMargin(double volume)
+{
+   if(!UseMarginCheck) return true;
+   
+   double margin_required = 0.0;
+   if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, volume, 
+                      SymbolInfoDouble(_Symbol, SYMBOL_ASK), margin_required))
+   {
+      return false;
+   }
+   
+   double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   return (free_margin > margin_required * 2); // 200% de margem de segurança
+}
+
+//+------------------------------------------------------------------+
+//| Função para verificar drawdown                                  |
+//+------------------------------------------------------------------+
+bool IsDrawdownAcceptable()
+{
+   double current_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double drawdown_percent = ((initial_account_balance - current_balance) / initial_account_balance) * 100;
+   
+   return (drawdown_percent < MaxDrawdownPercent);
+}
+
+//+------------------------------------------------------------------+
+//| Função para verificar horário de negociação                     |
+//+------------------------------------------------------------------+
+bool IsWithinTradingHours()
+{
+   if(!UseTimeFilter) return true;
+   
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   
+   if(StartHour <= EndHour)
+   {
+      return (dt.hour >= StartHour && dt.hour < EndHour);
+   }
+   else
+   {
+      return (dt.hour >= StartHour || dt.hour < EndHour);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Função para verificar delay após reset                          |
+//+------------------------------------------------------------------+
+bool IsDelayAfterResetPassed()
+{
+   if(last_reset_time == 0) return true;
+   
+   return (TimeCurrent() - last_reset_time >= DelayAfterResetSeconds);
+}
+
+//+------------------------------------------------------------------+
+//| Função para validar condições de negociação                     |
+//+------------------------------------------------------------------+
+bool CanTrade()
+{
+   if(!EnableTrading) return false;
+   if(!IsSpreadAcceptable()) return false;
+   if(!IsDrawdownAcceptable()) return false;
+   if(!IsWithinTradingHours()) return false;
+   if(!IsDelayAfterResetPassed()) return false;
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Função para cancelar todas as ordens pendentes                  |
+//+------------------------------------------------------------------+
+void CancelAllPendingOrders()
+{
+   int cancelled_count = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket > 0)
+      {
+         if(OrderGetString(ORDER_SYMBOL) == _Symbol && 
+            OrderGetInteger(ORDER_MAGIC) == MagicNumber)
+         {
+            if(trade.OrderDelete(ticket))
+            {
+               cancelled_count++;
+            }
+         }
+      }
+   }
+   if(cancelled_count > 0)
+   {
+      Print("Canceladas ", cancelled_count, " ordens pendentes");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Função para fechar todas as posições                            |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   int closed_count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         {
+            if(trade.PositionClose(ticket))
+            {
+               closed_count++;
+            }
+         }
+      }
+   }
+   if(closed_count > 0)
+   {
+      Print("Fechadas ", closed_count, " posições");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Função para resetar a estratégia                                |
+//+------------------------------------------------------------------+
+void ResetStrategy()
+{
+   Print("=== RESETANDO ESTRATÉGIA ===");
+   
+   // Cancelar todas as ordens pendentes
+   CancelAllPendingOrders();
+   
+   // Fechar todas as posições
+   CloseAllPositions();
+   
+   // Resetar variáveis
+   initial_buy_ticket = 0;
+   initial_buy_price = 0.0;
+   initial_buy_tp_price = 0.0;
+   sell_orders_count = 0;
+   strategy_active = false;
+   initial_tp_hit = false;
+   last_reset_time = TimeCurrent();
+   
+   // Limpar buffer de preços
+   ArrayInitialize(price_buffer, 0.0);
+   
+   Print("Estratégia resetada com sucesso!");
+   Print("Próxima compra será executada em ", DelayAfterResetSeconds, " segundos");
+}
+
+//+------------------------------------------------------------------+
+//| Função para calcular volume baseado no risco                    |
+//+------------------------------------------------------------------+
+double CalculateVolume(double risk_pips)
+{
+   if(risk_pips <= 0) return InitialBuyVolume;
+   
+   double account_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk_amount = account_balance * (RiskPercentage / 100.0);
+   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   
+   double volume = risk_amount / (risk_pips * tick_value);
+   
+   double min_volume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_volume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double volume_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   volume = MathMax(volume, min_volume);
+   volume = MathMin(volume, max_volume);
+   volume = NormalizeDouble(volume / volume_step, 0) * volume_step;
+   
+   return volume;
+}
+
+//+------------------------------------------------------------------+
+//| Função para atualizar buffer de preços                          |
+//+------------------------------------------------------------------+
+void UpdatePriceBuffer(double price)
+{
+   // Mover todos os preços uma posição para a direita
+   for(int i = price_buffer_size - 1; i > 0; i--)
+   {
+      price_buffer[i] = price_buffer[i-1];
+   }
+   // Adicionar novo preço na primeira posição
+   price_buffer[0] = price;
+}
+
+//+------------------------------------------------------------------+
+//| Função para verificar se mercado está caindo                    |
+//+------------------------------------------------------------------+
+bool IsMarketFalling()
+{
+   if(!OnlyOnDowntrend) return true; // Se não usar filtro, sempre retorna true
+   
+   // Verificar se temos dados suficientes
+   int valid_prices = 0;
+   for(int i = 0; i < price_buffer_size; i++)
+   {
+      if(price_buffer[i] > 0.0) valid_prices++;
+   }
+   
+   if(valid_prices < 3) return true; // Poucos dados, permite negociação
+   
+   // Contar quantos preços estão em tendência de baixa
+   int falling_count = 0;
+   for(int i = 0; i < valid_prices - 1; i++)
+   {
+      if(price_buffer[i] < price_buffer[i+1]) // Preço atual menor que anterior
+      {
+         falling_count++;
+      }
+   }
+   
+   // Considerar mercado caindo se mais de 60% dos movimentos foram para baixo
+   return (falling_count >= (valid_prices - 1) * 0.6);
+}
+
+//+------------------------------------------------------------------+
+//| Função para verificar se deve lançar ordem de venda             |
+//+------------------------------------------------------------------+
+bool ShouldPlaceSellOrder(double current_price, double open_buy_price)
+{
+   // Verificar se a queda mínima foi atingida
+   double fall_pips = (open_buy_price - current_price) / point_value;
+   if(fall_pips < FallPipsForSellGrid) return false;
+   
+   // Verificar se o mercado está caindo (se habilitado)
+   if(!IsMarketFalling()) return false;
+   
+   // Verificar se não atingiu o máximo de ordens
+   if(GetSellGridOrdersCount() >= MaxSellOrders) return false;
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Função aprimorada para verificar se Take Profit inicial foi atingido |
+//+------------------------------------------------------------------+
+bool CheckInitialTakeProfitHit()
+{
+   if(initial_buy_ticket == 0 || !strategy_active) return false;
+   
+   // Verificar se a posição ainda existe
+   bool position_exists = false;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY &&
+            ticket == initial_buy_ticket)
+         {
+            position_exists = true;
+            break;
+         }
+      }
+   }
+   
+   if(!position_exists)
+   {
+      // Posição não existe mais, verificar se foi por take profit
+      double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      // Se tínhamos um preço de TP definido, verificar se foi atingido
+      if(initial_buy_tp_price > 0.0)
+      {
+         if(current_bid >= initial_buy_tp_price)
+         {
+            Print("=== TAKE PROFIT INICIAL ATINGIDO! ===");
+            Print("Preço TP: ", initial_buy_tp_price);
+            Print("Preço atual: ", current_bid);
+            return true;
+         }
+      }
+      else
+      {
+         // Calcular TP baseado no preço de abertura
+         double calculated_tp = initial_buy_price + InitialBuyTakeProfitPips * point_value;
+         if(current_bid >= calculated_tp)
+         {
+            Print("=== TAKE PROFIT INICIAL ATINGIDO! ===");
+            Print("Preço TP calculado: ", calculated_tp);
+            Print("Preço atual: ", current_bid);
+            return true;
+         }
+      }
+      
+      // Se chegou aqui, posição foi fechada por outro motivo
+      Print("AVISO: Posição inicial fechada por outro motivo (não TP)");
+      return false;
+   }
+   
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Função para monitorar fechamento da posição principal           |
+//+------------------------------------------------------------------+
+void MonitorMainPositionClosure()
+{
+   static bool main_position_existed = false;
+   
+   // Verificar se posição principal existe agora
+   bool main_position_exists = HasOpenPosition(POSITION_TYPE_BUY);
+   
+   // Se existia antes mas não existe mais, foi fechada
+   if(main_position_existed && !main_position_exists && strategy_active)
+   {
+      Print("ALERTA: Posição principal foi fechada!");
+      
+      // Verificar se foi por take profit
+      if(CheckInitialTakeProfitHit())
+      {
+         initial_tp_hit = true;
+      }
+   }
+   
+   // Atualizar estado
+   main_position_existed = main_position_exists;
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Verificar condições básicas
+   if(!CanTrade()) return;
+   
+   // Atualizar buffer de preços
+   double current_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   UpdatePriceBuffer(current_bid);
+   
+   // Monitorar fechamento da posição principal
+   MonitorMainPositionClosure();
+   
+   // PRIORIDADE MÁXIMA: Verificar se take profit inicial foi atingido
+   if(EnableAutoReset && (initial_tp_hit || CheckInitialTakeProfitHit()))
+   {
+      Print("=== TAKE PROFIT INICIAL ATINGIDO - REINICIANDO CICLO ===");
+      ResetStrategy();
+      return;
+   }
+   
+   // Verificar se é necessário fechar tudo por drawdown
+   if(!IsDrawdownAcceptable())
+   {
+      Print("Drawdown máximo atingido! Fechando todas as posições e cancelando ordens...");
+      ResetStrategy();
+      return;
+   }
+   
+   // Verificar se compra inicial não foi executada
+   if(initial_buy_ticket == 0 && !strategy_active)
+   {
+      if(!HasSufficientMargin(InitialBuyVolume))
+      {
+         Print("Margem insuficiente para compra inicial!");
+         return;
+      }
+      
+      // Executar compra inicial
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double tp = ask + InitialBuyTakeProfitPips * point_value;
+      double sl = (InitialBuyStopLossPips > 0) ? ask - InitialBuyStopLossPips * point_value : 0;
+      
+      if(trade.Buy(InitialBuyVolume, _Symbol, ask, sl, tp, "Compra Inicial"))
+      {
+         initial_buy_ticket = trade.ResultOrder();
+         initial_buy_price = ask;
+         initial_buy_tp_price = tp;
+         strategy_active = true;
+         initial_tp_hit = false;
+         last_trade_time = TimeCurrent();
+         
+         Print("=== COMPRA INICIAL EXECUTADA ===");
+         Print("Order: ", initial_buy_ticket, " | Preço: ", initial_buy_price);
+         Print("Take Profit: ", tp, " | Stop Loss: ", sl);
+      }
+      else
+      {
+         Print("Erro ao executar compra inicial: ", trade.ResultRetcode());
+      }
+   }
+   else if(strategy_active && !initial_tp_hit)
+   {
+      double current_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      
+      // Verificar se posição de compra ainda existe
+      if(HasOpenPosition(POSITION_TYPE_BUY))
+      {
+         double open_buy_price = GetOpenBuyPositionPrice();
+         
+         // Verificar se deve lançar ordens de venda usando a nova lógica
+         if(ShouldPlaceSellOrder(current_bid, open_buy_price))
+         {
+            int current_sell_orders = GetSellGridOrdersCount();
+            double next_sell_price = 0.0;
+            double lowest_sell_price = GetLowestSellLimitPrice();
+            
+            if(lowest_sell_price == 0.0)
+            {
+               // Primeira ordem de venda do grid
+               next_sell_price = current_ask;
+            }
+            else
+            {
+               // Próxima ordem do grid
+               next_sell_price = lowest_sell_price - SellGridStepPips * point_value;
+            }
+            
+            // Verificar se o preço não está muito próximo do bid atual
+            if(next_sell_price > current_bid + 5 * point_value)
+            {
+               if(HasSufficientMargin(SellGridVolume))
+               {
+                  double tp = next_sell_price - SellGridTakeProfitPips * point_value;
+                  double sl = (SellGridStopLossPips > 0) ? 
+                             next_sell_price + SellGridStopLossPips * point_value : 0;
+                  
+                  if(trade.SellLimit(SellGridVolume, next_sell_price, _Symbol, sl, tp, 
+                                    ORDER_TIME_GTC, 0, "Grid Venda #" + IntegerToString(current_sell_orders + 1)))
+                  {
+                     Print("Ordem de venda #", current_sell_orders + 1, " colocada em: ", next_sell_price);
+                     Print("Mercado caindo: ", IsMarketFalling() ? "SIM" : "NÃO");
+                     last_trade_time = TimeCurrent();
+                  }
+                  else
+                  {
+                     Print("Erro ao colocar ordem de venda: ", trade.ResultRetcode());
+                  }
+               }
+               else
+               {
+                  Print("Margem insuficiente para nova ordem de venda!");
+               }
+            }
+         }
+      }
+      else
+      {
+         // Posição de compra foi fechada
+         Print("Posição principal fechada - Verificando motivo...");
+         
+         // Verificar se foi por take profit
+         if(CheckInitialTakeProfitHit())
+         {
+            initial_tp_hit = true;
+         }
+         else
+         {
+            // Posição fechada por outro motivo
+            Print("Posição fechada por outro motivo (SL, fechamento manual, etc.)");
+            CancelAllPendingOrders();
+            
+            if(EnableAutoReset)
+            {
+               ResetStrategy();
+            }
+            else
+            {
+               // Comportamento original - reiniciar sem delay
+               initial_buy_ticket = 0;
+               initial_buy_price = 0.0;
+               initial_buy_tp_price = 0.0;
+               sell_orders_count = 0;
+               strategy_active = false;
+               initial_tp_hit = false;
+               ArrayInitialize(price_buffer, 0.0);
+               Print("EA reiniciado para nova compra");
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Função para exibir informações no painel                        |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long& lparam, const double& dparam, const string& sparam)
+{
+   if(id == CHARTEVENT_KEYDOWN)
+   {
+      if(lparam == 73) // Tecla 'I' - Informações
+      {
+         Print("=== STATUS DO EA ===");
+         Print("Estratégia ativa: ", strategy_active ? "SIM" : "NÃO");
+         Print("Compra inicial: ", (initial_buy_ticket > 0) ? "Executada" : "Pendente");
+         Print("Preço da compra: ", initial_buy_price);
+         Print("TP da compra: ", initial_buy_tp_price);
+         Print("TP atingido: ", initial_tp_hit ? "SIM" : "NÃO");
+         Print("Ordens de venda: ", GetSellGridOrdersCount(), "/", MaxSellOrders);
+         Print("Mercado caindo: ", IsMarketFalling() ? "SIM" : "NÃO");
+         Print("Reset automático: ", EnableAutoReset ? "HABILITADO" : "DESABILITADO");
+         Print("Delay após reset: ", IsDelayAfterResetPassed() ? "OK" : "AGUARDANDO");
+         Print("Spread atual: ", SymbolInfoInteger(_Symbol, SYMBOL_SPREAD));
+         Print("Saldo: ", AccountInfoDouble(ACCOUNT_BALANCE));
+         Print("Margem livre: ", AccountInfoDouble(ACCOUNT_MARGIN_FREE));
+         Print("Últimos 5 preços: ");
+         for(int i = 0; i < 5; i++)
+         {
+            if(price_buffer[i] > 0) Print("  [", i, "] ", price_buffer[i]);
+         }
+      }
+      else if(lparam == 82) // Tecla 'R' - Reset manual
+      {
+         Print("Reset manual solicitado pelo usuário");
+         ResetStrategy();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
