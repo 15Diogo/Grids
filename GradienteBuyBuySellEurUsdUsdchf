@@ -1,0 +1,458 @@
+//+------------------------------------------------------------------+
+//|                                                BuyBuy_Multi.mq5 |
+//|                        Copyright 2025, Manus AI Agent        |
+//|                                                                  |
+//+------------------------------------------------------------------+
+#property copyright "Manus AI Agent"
+#property link      ""
+#property version   "1.00"
+#property strict
+#property description "Expert Advisor que opera um grid de compra no EURUSD e USDCHF."
+
+#include <Trade/Trade.mqh>
+#include <Trade/PositionInfo.mqh>
+
+//--- Input parameters
+input double LotSize         = 0.01;    // Fixed Lot Size for each order
+input int    GridStepPips    = 500;     // Grid Step in Pips
+input int    TakeProfitPips  = 500;     // Take Profit in Pips for each order
+input ulong  MagicNumber     = 67890;   // EA Magic Number
+input double PendingLotSize  = 0.3;     // Lot Size for pending orders
+input int    PendingDistance = 400;     // Distance in pips for pending orders
+input int    PendingTakeProfit = 3000;  // Take Profit in pips for pending orders
+
+//--- Global variables
+CTrade          trade;
+CPositionInfo   posInfo;
+
+// Structure to hold symbol-specific data
+struct SymbolData
+{
+   string          name;
+   double          gridStepPoints;
+   double          takeProfitPoints;
+   double          pointValue;
+   int             digits;
+   double          minLot;
+   double          maxLot;
+   double          lotStep;
+   bool            isTradingAllowed;
+   double          pendingDistancePoints;
+   double          pendingTakeProfitPoints;
+};
+
+// Array to hold data for both symbols
+SymbolData symbols[2];
+string symbolNames[2] = {"EURUSD", "USDCHF"};
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   Print("Initializing BuyBuy Multi-Symbol EA...");
+
+   //--- Initialize trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(5); // Allow 5 points deviation
+   trade.SetTypeFilling(ORDER_FILLING_FOK); // Use FOK for simplicity, adjust if needed
+
+   //--- Initialize data for both symbols
+   bool initSuccess = true;
+   for(int i = 0; i < 2; i++)
+   {
+      if(!InitializeSymbolData(symbolNames[i], symbols[i]))
+      {
+         PrintFormat("Failed to initialize symbol: %s", symbolNames[i]);
+         initSuccess = false;
+      }
+   }
+
+   if(!initSuccess)
+   {
+      Print("Failed to initialize one or more symbols.");
+      return(INIT_FAILED);
+   }
+
+   Print("BuyBuy Multi-Symbol EA Initialized Successfully.");
+   PrintFormat("Operating on: %s and %s", symbolNames[0], symbolNames[1]);
+   PrintFormat("Grid - Lot Size: %.2f, Grid Step: %d pips, TP: %d pips", LotSize, GridStepPips, TakeProfitPips);
+   PrintFormat("Pending Orders - Lot Size: %.2f, Distance: %d pips, TP: %d pips", PendingLotSize, PendingDistance, PendingTakeProfit);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize data for a specific symbol                            |
+//+------------------------------------------------------------------+
+bool InitializeSymbolData(const string symbolName, SymbolData &symbolData)
+{
+   symbolData.name = symbolName;
+
+   //--- Ensure symbol is available in Market Watch
+   if(!SymbolSelect(symbolName, true))
+   {
+      PrintFormat("Error: Symbol %s not found or not enabled in Market Watch. Please add it.", symbolName);
+      return(false);
+   }
+
+   //--- Wait for symbol info to be available
+   int retries = 10;
+   while(SymbolInfoDouble(symbolName, SYMBOL_POINT) == 0 && retries > 0)
+   {
+      Sleep(500);
+      retries--;
+   }
+
+   symbolData.pointValue = SymbolInfoDouble(symbolName, SYMBOL_POINT);
+   if(symbolData.pointValue == 0)
+   {
+      PrintFormat("Error: Could not get point value for %s.", symbolName);
+      return(false);
+   }
+
+   symbolData.digits = (int)SymbolInfoInteger(symbolName, SYMBOL_DIGITS);
+   symbolData.gridStepPoints = GridStepPips * symbolData.pointValue;
+   symbolData.takeProfitPoints = TakeProfitPips * symbolData.pointValue;
+   symbolData.pendingDistancePoints = PendingDistance * symbolData.pointValue;
+   symbolData.pendingTakeProfitPoints = PendingTakeProfit * symbolData.pointValue;
+   symbolData.minLot = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_MIN);
+   symbolData.maxLot = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_MAX);
+   symbolData.lotStep = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_STEP);
+   symbolData.isTradingAllowed = SymbolInfoInteger(symbolName, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_DISABLED;
+
+   //--- Validate LotSize
+   if(LotSize < symbolData.minLot || LotSize > symbolData.maxLot || fmod(LotSize, symbolData.lotStep) > 0.0000001)
+   {
+      PrintFormat("Error: Lot size %.2f is invalid for %s (Min: %.2f, Max: %.2f, Step: %.2f).",
+                  LotSize, symbolName, symbolData.minLot, symbolData.maxLot, symbolData.lotStep);
+      return(false);
+   }
+
+   //--- Validate PendingLotSize
+   if(PendingLotSize < symbolData.minLot || PendingLotSize > symbolData.maxLot || fmod(PendingLotSize, symbolData.lotStep) > 0.0000001)
+   {
+      PrintFormat("Error: Pending lot size %.2f is invalid for %s (Min: %.2f, Max: %.2f, Step: %.2f).",
+                  PendingLotSize, symbolName, symbolData.minLot, symbolData.maxLot, symbolData.lotStep);
+      return(false);
+   }
+
+   if(!symbolData.isTradingAllowed)
+   {
+       PrintFormat("Warning: Trading is disabled for symbol %s.", symbolName);
+   }
+
+   PrintFormat("Initialized data for %s: Point=%.*f, Digits=%d, GridPoints=%.*f, TPPoints=%.*f, Trading Allowed: %s",
+               symbolName,
+               symbolData.digits, symbolData.pointValue,
+               symbolData.digits,
+               symbolData.digits, symbolData.gridStepPoints,
+               symbolData.digits, symbolData.takeProfitPoints,
+               symbolData.isTradingAllowed ? "Yes" : "No");
+
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("BuyBuy Multi-Symbol EA Deinitialized. Reason: ", reason);
+   //--- Optional: Close positions on deinit
+   // CloseAllPositions();
+   // CloseAllPendingOrders();
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Check if trading is allowed globally
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return;
+
+   //--- Manage grid for both symbols
+   for(int i = 0; i < 2; i++)
+   {
+      if(symbols[i].isTradingAllowed)
+      {
+         ManageGrid(symbols[i]);
+         ManagePendingOrders(symbols[i]);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage the buy grid for a specific symbol                        |
+//+------------------------------------------------------------------+
+void ManageGrid(SymbolData &symbolData)
+{
+   //--- Get current price
+   double currentAsk = SymbolInfoDouble(symbolData.name, SYMBOL_ASK);
+   if(currentAsk == 0) // Check for valid price
+   {
+      return;
+   }
+
+   //--- Find the lowest buy position for this symbol and magic number
+   double lowestBuyPrice = DBL_MAX;
+   int positionsCount = 0;
+   int totalPositions = PositionsTotal();
+
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+         {
+            positionsCount++;
+            if(posInfo.PriceOpen() < lowestBuyPrice)
+            {
+               lowestBuyPrice = posInfo.PriceOpen();
+            }
+         }
+      }
+   }
+
+   //--- If no buy positions exist, open the first one
+   if(positionsCount == 0)
+   {
+      double tpPrice = NormalizeDouble(currentAsk + symbolData.takeProfitPoints, symbolData.digits);
+      PrintFormat("[%s] No open buy positions. Placing initial buy order at market (Ask: %.5f), TP: %.5f, Lot: %.2f",
+                  symbolData.name, currentAsk, tpPrice, LotSize);
+      if(!trade.Buy(LotSize, symbolData.name, currentAsk, 0, tpPrice, "Initial Buy Grid"))
+      {
+         PrintFormat("[%s] Error placing initial buy order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+      }
+      return; // Exit after placing initial order
+   }
+
+   //--- If positions exist, check if a new grid level is reached
+   double nextBuyLevel = NormalizeDouble(lowestBuyPrice - symbolData.gridStepPoints, symbolData.digits);
+
+   // Check if price has dropped below the next grid level
+   if(currentAsk <= nextBuyLevel + symbolData.pointValue)
+   {
+      // Check if an order already exists very close to this level to prevent duplicates
+      bool orderExistsNearLevel = false;
+      for(int i = totalPositions - 1; i >= 0; i--)
+      {
+         if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name && posInfo.PositionType() == POSITION_TYPE_BUY)
+         {
+            // Check if open price is within a small range of the target level
+            if(MathAbs(posInfo.PriceOpen() - nextBuyLevel) < (symbolData.gridStepPoints / 2.0))
+            {
+               orderExistsNearLevel = true;
+               break;
+            }
+         }
+      }
+
+      if(!orderExistsNearLevel)
+      {
+         double tpPrice = NormalizeDouble(currentAsk + symbolData.takeProfitPoints, symbolData.digits);
+         PrintFormat("[%s] Price (%.5f) reached next grid level (%.5f). Placing new buy order. TP: %.5f, Lot: %.2f",
+                     symbolData.name, currentAsk, nextBuyLevel, tpPrice, LotSize);
+         if(!trade.Buy(LotSize, symbolData.name, currentAsk, 0, tpPrice, "Grid Buy"))
+         {
+            PrintFormat("[%s] Error placing grid buy order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage pending orders for a specific symbol                      |
+//+------------------------------------------------------------------+
+void ManagePendingOrders(SymbolData &symbolData)
+{
+   //--- Get current price
+   double currentBid = SymbolInfoDouble(symbolData.name, SYMBOL_BID);
+   double currentAsk = SymbolInfoDouble(symbolData.name, SYMBOL_ASK);
+   
+   if(currentBid == 0 || currentAsk == 0)
+      return;
+
+   //--- Find highest and lowest buy positions in the grid
+   double highestBuyPrice = 0;
+   double lowestBuyPrice = DBL_MAX;
+   bool hasGridPositions = false;
+   
+   int totalPositions = PositionsTotal();
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+         {
+            hasGridPositions = true;
+            if(posInfo.PriceOpen() > highestBuyPrice)
+               highestBuyPrice = posInfo.PriceOpen();
+            if(posInfo.PriceOpen() < lowestBuyPrice)
+               lowestBuyPrice = posInfo.PriceOpen();
+         }
+      }
+   }
+
+   //--- Only place pending orders if we have grid positions
+   if(!hasGridPositions)
+      return;
+
+   //--- Check existing pending orders
+   bool hasBuyStop = false;
+   bool hasSellStop = false;
+   
+   int totalOrders = OrdersTotal();
+   for(int i = totalOrders - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(OrderSelect(ticket) && OrderGetInteger(ORDER_MAGIC) == MagicNumber && OrderGetString(ORDER_SYMBOL) == symbolData.name)
+      {
+         ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         if(orderType == ORDER_TYPE_BUY_STOP)
+            hasBuyStop = true;
+         else if(orderType == ORDER_TYPE_SELL_STOP)
+            hasSellStop = true;
+      }
+   }
+
+   //--- Place Buy Stop above the highest grid position
+   if(!hasBuyStop && highestBuyPrice > 0)
+   {
+      double buyStopPrice = NormalizeDouble(highestBuyPrice + symbolData.pendingDistancePoints, symbolData.digits);
+      double buyStopTP = NormalizeDouble(buyStopPrice + symbolData.pendingTakeProfitPoints, symbolData.digits);
+      
+      PrintFormat("[%s] Placing Buy Stop at %.5f (%.0f pips above highest grid position), TP: %.5f, Lot: %.2f",
+                  symbolData.name, buyStopPrice, PendingDistance, buyStopTP, PendingLotSize);
+      
+      if(!trade.BuyStop(PendingLotSize, buyStopPrice, symbolData.name, 0, buyStopTP, ORDER_TIME_GTC, 0, "Buy Stop Pending"))
+      {
+         PrintFormat("[%s] Error placing Buy Stop order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+      }
+   }
+
+   //--- Place Sell Stop below the lowest grid position
+   if(!hasSellStop && lowestBuyPrice < DBL_MAX)
+   {
+      double sellStopPrice = NormalizeDouble(lowestBuyPrice - symbolData.pendingDistancePoints, symbolData.digits);
+      double sellStopTP = NormalizeDouble(sellStopPrice - symbolData.pendingTakeProfitPoints, symbolData.digits);
+      
+      PrintFormat("[%s] Placing Sell Stop at %.5f (%.0f pips below lowest grid position), TP: %.5f, Lot: %.2f",
+                  symbolData.name, sellStopPrice, PendingDistance, sellStopTP, PendingLotSize);
+      
+      if(!trade.SellStop(PendingLotSize, sellStopPrice, symbolData.name, 0, sellStopTP, ORDER_TIME_GTC, 0, "Sell Stop Pending"))
+      {
+         PrintFormat("[%s] Error placing Sell Stop order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions for all symbols                              |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   for(int s = 0; s < 2; s++)
+   {
+      int totalPositions = PositionsTotal();
+      PrintFormat("Attempting to close all positions for %s (Magic: %d)...", symbols[s].name, MagicNumber);
+      
+      for(int i = totalPositions - 1; i >= 0; i--)
+      {
+         if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbols[s].name)
+         {
+            PrintFormat("Closing position #%d (%s %.2f @ %.5f) for %s",
+                        posInfo.Ticket(),
+                        (posInfo.PositionType() == POSITION_TYPE_BUY ? "Buy" : "Sell"),
+                        posInfo.Volume(),
+                        posInfo.PriceOpen(),
+                        symbols[s].name);
+            if(!trade.PositionClose(posInfo.Ticket()))
+            {
+               PrintFormat("Error closing position #%d: %d - %s", posInfo.Ticket(), trade.ResultRetcode(), trade.ResultComment());
+            }
+            else
+            {
+                PrintFormat("Position #%d closed successfully.", posInfo.Ticket());
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close all pending orders for all symbols                         |
+//+------------------------------------------------------------------+
+void CloseAllPendingOrders()
+{
+   for(int s = 0; s < 2; s++)
+   {
+      int totalOrders = OrdersTotal();
+      PrintFormat("Attempting to close all pending orders for %s (Magic: %d)...", symbols[s].name, MagicNumber);
+      
+      for(int i = totalOrders - 1; i >= 0; i--)
+      {
+         ulong ticket = OrderGetTicket(i);
+         if(OrderSelect(ticket) && OrderGetInteger(ORDER_MAGIC) == MagicNumber && OrderGetString(ORDER_SYMBOL) == symbols[s].name)
+         {
+            ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            string orderTypeStr = "";
+            
+            switch(orderType)
+            {
+               case ORDER_TYPE_BUY_STOP: orderTypeStr = "Buy Stop"; break;
+               case ORDER_TYPE_SELL_STOP: orderTypeStr = "Sell Stop"; break;
+               default: orderTypeStr = "Unknown"; break;
+            }
+            
+            PrintFormat("Closing pending order #%d (%s %.2f @ %.5f) for %s",
+                        ticket, orderTypeStr, OrderGetDouble(ORDER_VOLUME_CURRENT), 
+                        OrderGetDouble(ORDER_PRICE_OPEN), symbols[s].name);
+            
+            if(!trade.OrderDelete(ticket))
+            {
+               PrintFormat("Error closing pending order #%d: %d - %s", ticket, trade.ResultRetcode(), trade.ResultComment());
+            }
+            else
+            {
+               PrintFormat("Pending order #%d closed successfully.", ticket);
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get symbol statistics                                             |
+//+------------------------------------------------------------------+
+void PrintSymbolStatistics()
+{
+   for(int s = 0; s < 2; s++)
+   {
+      int buyPositions = 0;
+      int sellPositions = 0;
+      double totalVolume = 0;
+      double totalProfit = 0;
+      
+      int totalPositions = PositionsTotal();
+      for(int i = totalPositions - 1; i >= 0; i--)
+      {
+         if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbols[s].name)
+         {
+            if(posInfo.PositionType() == POSITION_TYPE_BUY)
+               buyPositions++;
+            else
+               sellPositions++;
+            
+            totalVolume += posInfo.Volume();
+            totalProfit += posInfo.Profit();
+         }
+      }
+      
+      PrintFormat("[%s] Statistics - Buy Positions: %d, Sell Positions: %d, Total Volume: %.2f, Total Profit: %.2f",
+                  symbols[s].name, buyPositions, sellPositions, totalVolume, totalProfit);
+   }
+}
+//+------------------------------------------------------------------+
