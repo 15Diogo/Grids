@@ -1,13 +1,13 @@
 //+------------------------------------------------------------------+
-//|                                                BuyBuy_Single.mq5 |
-//|                        Copyright 2025, Manus AI Agent        |
+//|                          BuyBuy_Single_com_Painel_Backteste.mq5 |
+//|                        Copyright 2025, Manus AI Agent          |
 //|                                                                  |
 //+------------------------------------------------------------------+
 #property copyright "Manus AI Agent"
 #property link      ""
-#property version   "1.00"
+#property version   "1.10"
 #property strict
-#property description "Expert Advisor que opera um grid de compra no símbolo atual."
+#property description "Expert Advisor que opera um grid de compra no símbolo atual com painel de controle (compatível com backteste)."
 
 #include <Trade/Trade.mqh>
 #include <Trade/PositionInfo.mqh>
@@ -19,9 +19,29 @@ input int    GridStepPips    = 500;     // Grid Step in Pips
 input int    TakeProfitPips  = 500;     // Take Profit in Pips for each order
 input ulong  MagicNumber     = 67890;   // EA Magic Number
 
+// Backtesting settings
+input bool   AutoStartInBacktest = true; // Auto-start in backtest mode
+input int    DelayAfterStartBars = 5;    // Bars to wait before starting (backtest only)
+
+// Panel settings
+input int PanelX = 10;        // Panel X position
+input int PanelY = 10;        // Panel Y position
+
 //--- Global variables
 CTrade          trade;
 CPositionInfo   posInfo;
+
+// Panel objects
+string panelName = "TradingPanel";
+string buttonStart = "Iniciar";
+string buttonStop = "Parar";
+string buttonClose = "ZerarTudo";
+
+// Trading control
+bool tradingActive = false;
+bool isBacktesting = false;
+int barsAtStart = 0;
+bool backtestDelayComplete = false;
 
 // Structure to hold symbol-specific data
 struct SymbolData
@@ -45,12 +65,29 @@ SymbolData currentSymbol;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("Initializing BuyBuy Single-Symbol EA...");
+   Print("Initializing BuyBuy Single-Symbol EA with Panel (Backteste Compatible)...");
+
+   //--- Check if running in backtest
+   isBacktesting = MQLInfoInteger(MQL_TESTER);
+   
+   if(isBacktesting)
+   {
+      Print("*** MODO BACKTESTE DETECTADO ***");
+      barsAtStart = Bars(_Symbol, PERIOD_CURRENT);
+      if(AutoStartInBacktest)
+      {
+         Print("Auto-start habilitado para backteste. Aguardando ", DelayAfterStartBars, " barras...");
+      }
+   }
+   else
+   {
+      Print("*** MODO TEMPO REAL DETECTADO ***");
+   }
 
    //--- Initialize trade object
    trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetDeviationInPoints(5); // Allow 5 points deviation
-   trade.SetTypeFilling(ORDER_FILLING_FOK); // Use FOK for simplicity, adjust if needed
+   trade.SetDeviationInPoints(5);
+   trade.SetTypeFilling(ORDER_FILLING_FOK);
 
    //--- Get current symbol name
    string symbolName = _Symbol;
@@ -62,9 +99,20 @@ int OnInit()
       return(INIT_FAILED);
    }
 
+   //--- Create panel only if not in backtest
+   if(!isBacktesting)
+   {
+      CreatePanel();
+   }
+   else
+   {
+      Print("Panel desabilitado no backteste - usando controle automático");
+   }
+
    Print("BuyBuy Single-Symbol EA Initialized Successfully.");
    PrintFormat("Operating on: %s", currentSymbol.name);
-   PrintFormat("Initial Sell Lot: %.2f, Grid Buy Lot: %.2f, Grid Step: %d pips, TP: %d pips", InitialSellLot, GridLotSize, GridStepPips, TakeProfitPips);
+   PrintFormat("Initial Sell Lot: %.2f, Grid Buy Lot: %.2f, Grid Step: %d pips, TP: %d pips", 
+               InitialSellLot, GridLotSize, GridStepPips, TakeProfitPips);
 
    return(INIT_SUCCEEDED);
 }
@@ -139,13 +187,180 @@ bool InitializeSymbolData(const string symbolName, SymbolData &symbolData)
 }
 
 //+------------------------------------------------------------------+
+//| Create the horizontal trading panel                              |
+//+------------------------------------------------------------------+
+void CreatePanel()
+{
+   // Remove existing objects
+   RemovePanelObjects();
+
+   // Create main panel background
+   if(!ObjectCreate(0, panelName, OBJ_RECTANGLE_LABEL, 0, 0, 0))
+   {
+      Print("Error creating panel: ", GetLastError());
+      return;
+   }
+   
+   ObjectSetInteger(0, panelName, OBJPROP_XDISTANCE, PanelX);
+   ObjectSetInteger(0, panelName, OBJPROP_YDISTANCE, PanelY);
+   ObjectSetInteger(0, panelName, OBJPROP_XSIZE, 750);
+   ObjectSetInteger(0, panelName, OBJPROP_YSIZE, 60);
+   ObjectSetInteger(0, panelName, OBJPROP_BGCOLOR, C'30,30,35');
+   ObjectSetInteger(0, panelName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, panelName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, panelName, OBJPROP_COLOR, C'0,150,136');
+   ObjectSetInteger(0, panelName, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, panelName, OBJPROP_BACK, false);
+   ObjectSetInteger(0, panelName, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, panelName, OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, panelName, OBJPROP_HIDDEN, true);
+
+   // Create buttons with modern colors
+   CreateButton(buttonStart, PanelX + 10, PanelY + 35, 80, 20, "INICIAR", C'76,175,80');
+   CreateButton(buttonStop, PanelX + 100, PanelY + 35, 80, 20, "PARAR", C'255,193,7');
+   CreateButton(buttonClose, PanelX + 190, PanelY + 35, 90, 20, "ZERAR TUDO", C'244,67,54');
+
+   // Create text labels in horizontal layout
+   CreateLabel(panelName + "_symbol", PanelX + 10, PanelY + 5, currentSymbol.name);
+   CreateLabel(panelName + "_balance", PanelX + 100, PanelY + 5, "Saldo: $0.00");
+   CreateLabel(panelName + "_equity", PanelX + 220, PanelY + 5, "Capital: $0.00");
+   CreateLabel(panelName + "_profit", PanelX + 350, PanelY + 5, "Lucro: $0.00");
+   CreateLabel(panelName + "_positions", PanelX + 470, PanelY + 5, "Posições: 0");
+   CreateLabel(panelName + "_buy", PanelX + 550, PanelY + 5, "Compras: 0");
+   CreateLabel(panelName + "_sell", PanelX + 620, PanelY + 5, "Vendas: 0");
+   CreateLabel(panelName + "_volume", PanelX + 680, PanelY + 5, "Vol: 0.00");
+
+   // Create status label
+   CreateLabel(panelName + "_status", PanelX + 10, PanelY + 20, "Status: Parado");
+
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Create a button                                                  |
+//+------------------------------------------------------------------+
+void CreateButton(string name, int x, int y, int width, int height, string text, color bgcolor)
+{
+   if(!ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0))
+      return;
+   
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bgcolor);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial Bold");
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Create a text label                                              |
+//+------------------------------------------------------------------+
+void CreateLabel(string name, int x, int y, string text)
+{
+   if(!ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
+      return;
+      
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Update panel information                                         |
+//+------------------------------------------------------------------+
+void UpdatePanel()
+{
+   // Only update panel if not in backtest
+   if(isBacktesting) return;
+   
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   int buyPositions = 0;
+   int sellPositions = 0;
+   double totalVolume = 0;
+   double totalProfit = 0;
+   
+   int totalPositions = PositionsTotal();
+   for(int i = 0; i < totalPositions; i++)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+            buyPositions++;
+         else
+            sellPositions++;
+         
+         totalVolume += posInfo.Volume();
+         totalProfit += posInfo.Profit();
+      }
+   }
+   
+   // Update labels
+   ObjectSetString(0, panelName + "_balance", OBJPROP_TEXT, StringFormat("Saldo: $%.2f", balance));
+   ObjectSetString(0, panelName + "_equity", OBJPROP_TEXT, StringFormat("Capital: $%.2f", equity));
+   ObjectSetString(0, panelName + "_profit", OBJPROP_TEXT, StringFormat("Lucro: $%.2f", totalProfit));
+   ObjectSetString(0, panelName + "_positions", OBJPROP_TEXT, StringFormat("Posições: %d", buyPositions + sellPositions));
+   ObjectSetString(0, panelName + "_buy", OBJPROP_TEXT, StringFormat("Compras: %d", buyPositions));
+   ObjectSetString(0, panelName + "_sell", OBJPROP_TEXT, StringFormat("Vendas: %d", sellPositions));
+   ObjectSetString(0, panelName + "_volume", OBJPROP_TEXT, StringFormat("Vol: %.2f", totalVolume));
+   
+   // Update status
+   string status = "Parado";
+   if(tradingActive)
+      status = "BuyBuy Grid Ativo";
+      
+   ObjectSetString(0, panelName + "_status", OBJPROP_TEXT, StringFormat("Status: %s", status));
+   
+   // Update button colors based on active state
+   ObjectSetInteger(0, buttonStart, OBJPROP_BGCOLOR, tradingActive ? C'46,125,50' : C'76,175,80');
+   ObjectSetInteger(0, buttonStop, OBJPROP_BGCOLOR, tradingActive ? C'255,193,7' : C'180,140,5');
+}
+
+//+------------------------------------------------------------------+
+//| Remove all panel objects                                         |
+//+------------------------------------------------------------------+
+void RemovePanelObjects()
+{
+   ObjectDelete(0, panelName);
+   ObjectDelete(0, buttonStart);
+   ObjectDelete(0, buttonStop);
+   ObjectDelete(0, buttonClose);
+   ObjectDelete(0, panelName + "_symbol");
+   ObjectDelete(0, panelName + "_balance");
+   ObjectDelete(0, panelName + "_equity");
+   ObjectDelete(0, panelName + "_profit");
+   ObjectDelete(0, panelName + "_positions");
+   ObjectDelete(0, panelName + "_buy");
+   ObjectDelete(0, panelName + "_sell");
+   ObjectDelete(0, panelName + "_volume");
+   ObjectDelete(0, panelName + "_status");
+}
+
+//+------------------------------------------------------------------+
 //| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   Print("BuyBuy Single-Symbol EA Deinitialized. Reason: ", reason);
-   //--- Optional: Close positions on deinit
-   // CloseAllPositions();
+   Print("BuyBuy Single-Symbol EA with Panel Deinitialized. Reason: ", reason);
+   if(!isBacktesting)
+   {
+      RemovePanelObjects();
+      ChartRedraw();
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -157,10 +372,83 @@ void OnTick()
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
       return;
 
-   //--- Manage grid for current symbol
-   if(currentSymbol.isTradingAllowed)
+   //--- Handle backtest auto-start logic
+   if(isBacktesting && AutoStartInBacktest && !backtestDelayComplete)
+   {
+      int currentBars = Bars(_Symbol, PERIOD_CURRENT);
+      if(currentBars >= barsAtStart + DelayAfterStartBars)
+      {
+         tradingActive = true;
+         backtestDelayComplete = true;
+         Print("*** BACKTESTE: Trading ativado automaticamente após ", DelayAfterStartBars, " barras ***");
+         PrintSymbolStatistics();
+      }
+   }
+
+   //--- Manage grid for current symbol only if trading is active
+   if(tradingActive && currentSymbol.isTradingAllowed)
    {
       ManageGrid(currentSymbol);
+   }
+   
+   //--- Update panel every 10 ticks to reduce CPU usage (only in real-time)
+   if(!isBacktesting)
+   {
+      static int tickCounter = 0;
+      tickCounter++;
+      if(tickCounter >= 10)
+      {
+         UpdatePanel();
+         tickCounter = 0;
+      }
+   }
+   else
+   {
+      // Print statistics every 100 ticks in backtest
+      static int backtestTickCounter = 0;
+      backtestTickCounter++;
+      if(backtestTickCounter >= 100)
+      {
+         PrintSymbolStatistics();
+         backtestTickCounter = 0;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Chart event handler                                              |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   // Chart events only work in real-time, not in backtest
+   if(isBacktesting) return;
+   
+   if(id == CHARTEVENT_OBJECT_CLICK)
+   {
+      if(sparam == buttonStart)
+      {
+         tradingActive = true;
+         Print("BuyBuy Grid Trading ATIVADO");
+         ObjectSetInteger(0, buttonStart, OBJPROP_STATE, false);
+      }
+      else if(sparam == buttonStop)
+      {
+         tradingActive = false;
+         Print("BuyBuy Grid Trading DESATIVADO");
+         ObjectSetInteger(0, buttonStop, OBJPROP_STATE, false);
+      }
+      else if(sparam == buttonClose)
+      {
+         if(MessageBox("Tem certeza que deseja fechar todas as posições?", "Confirmar", MB_YESNO | MB_ICONQUESTION) == IDYES)
+         {
+            CloseAllPositions();
+            tradingActive = false;
+         }
+         ObjectSetInteger(0, buttonClose, OBJPROP_STATE, false);
+      }
+      
+      UpdatePanel();
+      ChartRedraw();
    }
 }
 
@@ -172,7 +460,7 @@ void ManageGrid(SymbolData &symbolData)
    //--- Get current price
    double currentAsk = SymbolInfoDouble(symbolData.name, SYMBOL_ASK);
    double currentBid = SymbolInfoDouble(symbolData.name, SYMBOL_BID);
-   if(currentAsk == 0 || currentBid == 0) // Check for valid price
+   if(currentAsk == 0 || currentBid == 0)
    {
       return;
    }
@@ -212,7 +500,7 @@ void ManageGrid(SymbolData &symbolData)
       {
          PrintFormat("[%s] Error placing initial sell order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
       }
-      return; // Exit after placing initial sell order
+      return;
    }
 
    //--- If no buy positions exist, open the first buy order
@@ -225,7 +513,7 @@ void ManageGrid(SymbolData &symbolData)
       {
          PrintFormat("[%s] Error placing initial buy order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
       }
-      return; // Exit after placing initial buy order
+      return;
    }
 
    //--- If buy positions exist, check if a new grid level is reached
@@ -268,13 +556,13 @@ void ManageGrid(SymbolData &symbolData)
 void CloseAllPositions()
 {
    int totalPositions = PositionsTotal();
-   PrintFormat("Attempting to close all positions for %s (Magic: %d)...", currentSymbol.name, MagicNumber);
+   PrintFormat("Fechando todas as posições para %s (Magic: %d)...", currentSymbol.name, MagicNumber);
    
    for(int i = totalPositions - 1; i >= 0; i--)
    {
       if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
       {
-         PrintFormat("Closing position #%d (%s %.2f @ %.5f) for %s",
+         PrintFormat("Fechando posição #%d (%s %.2f @ %.5f) para %s",
                      posInfo.Ticket(),
                      (posInfo.PositionType() == POSITION_TYPE_BUY ? "Buy" : "Sell"),
                      posInfo.Volume(),
@@ -282,11 +570,11 @@ void CloseAllPositions()
                      currentSymbol.name);
          if(!trade.PositionClose(posInfo.Ticket()))
          {
-            PrintFormat("Error closing position #%d: %d - %s", posInfo.Ticket(), trade.ResultRetcode(), trade.ResultComment());
+            PrintFormat("Erro fechando posição #%d: %d - %s", posInfo.Ticket(), trade.ResultRetcode(), trade.ResultComment());
          }
          else
          {
-             PrintFormat("Position #%d closed successfully.", posInfo.Ticket());
+             PrintFormat("Posição #%d fechada com sucesso.", posInfo.Ticket());
          }
       }
    }
@@ -319,5 +607,23 @@ void PrintSymbolStatistics()
    
    PrintFormat("[%s] Statistics - Buy Positions: %d, Sell Positions: %d, Total Volume: %.2f, Total Profit: %.2f",
                currentSymbol.name, buyPositions, sellPositions, totalVolume, totalProfit);
+}
+
+//+------------------------------------------------------------------+
+//| Manual start function (can be called from script)               |
+//+------------------------------------------------------------------+
+void ManualStart()
+{
+   tradingActive = true;
+   Print("*** Trading ativado manualmente ***");
+}
+
+//+------------------------------------------------------------------+
+//| Manual stop function (can be called from script)                |
+//+------------------------------------------------------------------+
+void ManualStop()
+{
+   tradingActive = false;
+   Print("*** Trading desativado manualmente ***");
 }
 //+------------------------------------------------------------------+
