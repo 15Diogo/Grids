@@ -14,12 +14,12 @@
 
 //--- Input parameters
 input double GridLotSize     = 0.01;    // Fixed Lot Size for grid orders
-input int    GridStepPips    = 500;     // Grid Step in Pips for initial buys
-input int    SellGridStepPips = 15;     // Grid Step in Pips for sells (after 20 buys)
-input int    TakeProfitPips  = 500;     // Take Profit in Pips for buy orders
-input int    SellTakeProfitPips = 15;   // Take Profit in Pips for sell orders
-input int    MaxBuyLevels    = 20;      // Max buy levels (changed to 20)
-input int    MaxSellLevels   = 15;      // Max sell levels
+input int    GridStepPips    = 300;     // Grid Step in Pips for initial buys
+input int    SellGridStepPips = 300;     // Grid Step in Pips for sells (after 20 buys)
+input int    TakeProfitPips  = 300;     // Take Profit in Pips for buy orders
+input int    SellTakeProfitPips = 300;   // Take Profit in Pips for sell orders
+input int    MaxBuyLevels    = 15;      // Max buy levels (changed to 20)
+input int    MaxSellLevels   = 100;      // Max sell levels
 input ulong  MagicNumber     = 67890;   // EA Magic Number
 
 // Backtesting settings
