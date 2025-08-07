@@ -1,0 +1,824 @@
+//+------------------------------------------------------------------+
+//|                          Hybrid_Grid_EA_Modified.mq5            |
+//|                        Copyright 2025, Manus AI Agent          |
+//|                                                                  |
+//+------------------------------------------------------------------+
+#property copyright "Manus AI Agent"
+#property link      ""
+#property version   "2.10"
+#property strict
+#property description "Expert Advisor híbrido: 20 compras primeiro, depois vendas com 15 pips de espaço"
+
+#include <Trade/Trade.mqh>
+#include <Trade/PositionInfo.mqh>
+
+//--- Input parameters
+input double GridLotSize     = 0.01;    // Fixed Lot Size for grid orders
+input int    GridStepPips    = 500;     // Grid Step in Pips for initial buys
+input int    SellGridStepPips = 15;     // Grid Step in Pips for sells (after 20 buys)
+input int    TakeProfitPips  = 500;     // Take Profit in Pips for buy orders
+input int    SellTakeProfitPips = 15;   // Take Profit in Pips for sell orders
+input int    MaxBuyLevels    = 20;      // Max buy levels (changed to 20)
+input int    MaxSellLevels   = 15;      // Max sell levels
+input ulong  MagicNumber     = 67890;   // EA Magic Number
+
+// Backtesting settings
+input bool   AutoStartInBacktest = true; // Auto-start in backtest mode
+input int    DelayAfterStartBars = 5;    // Bars to wait before starting (backtest only)
+
+// Panel settings
+input int PanelX = 10;        // Panel X position
+input int PanelY = 10;        // Panel Y position
+
+//--- Global variables
+CTrade          trade;
+CPositionInfo   posInfo;
+
+// Panel objects
+string panelName = "TradingPanel";
+string buttonStart = "Iniciar";
+string buttonStop = "Parar";
+string buttonClose = "ZerarTudo";
+
+// Trading control
+bool tradingActive = false;
+bool isBacktesting = false;
+int barsAtStart = 0;
+bool backtestDelayComplete = false;
+double initialPrice = 0; // Preço inicial para calcular níveis do grid
+
+// Grid phases tracking
+enum GRID_PHASE
+{
+   PHASE_BUYING,    // Fase de compras (até 20 ordens)
+   PHASE_SELLING    // Fase de vendas (depois de 20 compras)
+};
+
+GRID_PHASE currentPhase = PHASE_BUYING;
+double phaseTransitionPrice = 0; // Preço quando mudou de fase
+bool sellGridInitialized = false;
+
+// Grid levels tracking
+double highestBuyLevel = 0;    // Maior nível de compra atingido
+double lowestSellLevel = 0;    // Menor nível de venda atingido
+bool canBuyAtLevel[100];       // Array para rastrear níveis onde pode comprar
+bool canSellAtLevel[100];      // Array para rastrear níveis onde pode vender
+
+// Structure to hold symbol-specific data
+struct SymbolData
+{
+   string          name;
+   double          gridStepPoints;
+   double          sellGridStepPoints;
+   double          takeProfitPoints;
+   double          sellTakeProfitPoints;
+   double          pointValue;
+   int             digits;
+   double          minLot;
+   double          maxLot;
+   double          lotStep;
+   bool            isTradingAllowed;
+};
+
+// Symbol data for current symbol
+SymbolData currentSymbol;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   Print("Initializing Modified Hybrid Grid EA (20 Buys + Sells with 15 pips)...");
+
+   //--- Check if running in backtest
+   isBacktesting = MQLInfoInteger(MQL_TESTER);
+   
+   if(isBacktesting)
+   {
+      Print("*** MODO BACKTESTE DETECTADO ***");
+      barsAtStart = Bars(_Symbol, PERIOD_CURRENT);
+      if(AutoStartInBacktest)
+      {
+         Print("Auto-start habilitado para backteste. Aguardando ", DelayAfterStartBars, " barras...");
+      }
+   }
+   else
+   {
+      Print("*** MODO TEMPO REAL DETECTADO ***");
+   }
+
+   //--- Initialize trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(5);
+   trade.SetTypeFilling(ORDER_FILLING_FOK);
+
+   //--- Get current symbol name
+   string symbolName = _Symbol;
+   
+   //--- Initialize data for current symbol
+   if(!InitializeSymbolData(symbolName, currentSymbol))
+   {
+      PrintFormat("Failed to initialize symbol: %s", symbolName);
+      return(INIT_FAILED);
+   }
+
+   //--- Initialize grid level arrays
+   for(int i = 0; i < 100; i++)
+   {
+      canBuyAtLevel[i] = true;
+      canSellAtLevel[i] = true;
+   }
+
+   //--- Create panel only if not in backtest
+   if(!isBacktesting)
+   {
+      CreatePanel();
+   }
+   else
+   {
+      Print("Panel desabilitado no backteste - usando controle automático");
+   }
+
+   Print("Modified Hybrid Grid EA Initialized Successfully.");
+   PrintFormat("Operating on: %s", currentSymbol.name);
+   PrintFormat("Buy Grid - Lot: %.2f, Step: %d pips, TP: %d pips, Max: %d levels", 
+               GridLotSize, GridStepPips, TakeProfitPips, MaxBuyLevels);
+   PrintFormat("Sell Grid - Lot: %.2f, Step: %d pips, TP: %d pips, Max: %d levels", 
+               GridLotSize, SellGridStepPips, SellTakeProfitPips, MaxSellLevels);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize data for a specific symbol                            |
+//+------------------------------------------------------------------+
+bool InitializeSymbolData(const string symbolName, SymbolData &symbolData)
+{
+   symbolData.name = symbolName;
+
+   //--- Ensure symbol is available in Market Watch
+   if(!SymbolSelect(symbolName, true))
+   {
+      PrintFormat("Error: Symbol %s not found or not enabled in Market Watch. Please add it.", symbolName);
+      return(false);
+   }
+
+   //--- Wait for symbol info to be available
+   int retries = 10;
+   while(SymbolInfoDouble(symbolName, SYMBOL_POINT) == 0 && retries > 0)
+   {
+      Sleep(500);
+      retries--;
+   }
+
+   symbolData.pointValue = SymbolInfoDouble(symbolName, SYMBOL_POINT);
+   if(symbolData.pointValue == 0)
+   {
+      PrintFormat("Error: Could not get point value for %s.", symbolName);
+      return(false);
+   }
+
+   symbolData.digits = (int)SymbolInfoInteger(symbolName, SYMBOL_DIGITS);
+   symbolData.gridStepPoints = GridStepPips * symbolData.pointValue;
+   symbolData.sellGridStepPoints = SellGridStepPips * symbolData.pointValue; // 15 pips para vendas
+   symbolData.takeProfitPoints = TakeProfitPips * symbolData.pointValue;
+   symbolData.sellTakeProfitPoints = SellTakeProfitPips * symbolData.pointValue; // 15 pips TP para vendas
+   symbolData.minLot = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_MIN);
+   symbolData.maxLot = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_MAX);
+   symbolData.lotStep = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_STEP);
+   symbolData.isTradingAllowed = SymbolInfoInteger(symbolName, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_DISABLED;
+
+   //--- Validate GridLotSize
+   if(GridLotSize < symbolData.minLot || GridLotSize > symbolData.maxLot || fmod(GridLotSize, symbolData.lotStep) > 0.0000001)
+   {
+      PrintFormat("Error: Grid lot size %.2f is invalid for %s (Min: %.2f, Max: %.2f, Step: %.2f).",
+                  GridLotSize, symbolName, symbolData.minLot, symbolData.maxLot, symbolData.lotStep);
+      return(false);
+   }
+
+   if(!symbolData.isTradingAllowed)
+   {
+       PrintFormat("Warning: Trading is disabled for symbol %s.", symbolName);
+   }
+
+   PrintFormat("Initialized data for %s: Point=%.*f, Digits=%d", symbolName, symbolData.digits, symbolData.pointValue, symbolData.digits);
+   PrintFormat("Buy Grid - GridPoints=%.*f, TPPoints=%.*f", symbolData.digits, symbolData.gridStepPoints, symbolData.digits, symbolData.takeProfitPoints);
+   PrintFormat("Sell Grid - GridPoints=%.*f, TPPoints=%.*f", symbolData.digits, symbolData.sellGridStepPoints, symbolData.digits, symbolData.sellTakeProfitPoints);
+   PrintFormat("Trading Allowed: %s", symbolData.isTradingAllowed ? "Yes" : "No");
+
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Create the horizontal trading panel                              |
+//+------------------------------------------------------------------+
+void CreatePanel()
+{
+   // Remove existing objects
+   RemovePanelObjects();
+
+   // Create main panel background
+   if(!ObjectCreate(0, panelName, OBJ_RECTANGLE_LABEL, 0, 0, 0))
+   {
+      Print("Error creating panel: ", GetLastError());
+      return;
+   }
+   
+   ObjectSetInteger(0, panelName, OBJPROP_XDISTANCE, PanelX);
+   ObjectSetInteger(0, panelName, OBJPROP_YDISTANCE, PanelY);
+   ObjectSetInteger(0, panelName, OBJPROP_XSIZE, 800);
+   ObjectSetInteger(0, panelName, OBJPROP_YSIZE, 80);
+   ObjectSetInteger(0, panelName, OBJPROP_BGCOLOR, C'30,30,35');
+   ObjectSetInteger(0, panelName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, panelName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, panelName, OBJPROP_COLOR, C'0,150,136');
+   ObjectSetInteger(0, panelName, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, panelName, OBJPROP_BACK, false);
+   ObjectSetInteger(0, panelName, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, panelName, OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, panelName, OBJPROP_HIDDEN, true);
+
+   // Create buttons with modern colors
+   CreateButton(buttonStart, PanelX + 10, PanelY + 55, 80, 20, "INICIAR", C'76,175,80');
+   CreateButton(buttonStop, PanelX + 100, PanelY + 55, 80, 20, "PARAR", C'255,193,7');
+   CreateButton(buttonClose, PanelX + 190, PanelY + 55, 90, 20, "ZERAR TUDO", C'244,67,54');
+
+   // Create text labels in horizontal layout
+   CreateLabel(panelName + "_symbol", PanelX + 10, PanelY + 5, currentSymbol.name);
+   CreateLabel(panelName + "_balance", PanelX + 100, PanelY + 5, "Saldo: $0.00");
+   CreateLabel(panelName + "_equity", PanelX + 220, PanelY + 5, "Capital: $0.00");
+   CreateLabel(panelName + "_profit", PanelX + 350, PanelY + 5, "Lucro: $0.00");
+   CreateLabel(panelName + "_positions", PanelX + 470, PanelY + 5, "Posições: 0");
+   CreateLabel(panelName + "_buy", PanelX + 550, PanelY + 5, "Compras: 0");
+   CreateLabel(panelName + "_sell", PanelX + 620, PanelY + 5, "Vendas: 0");
+   CreateLabel(panelName + "_volume", PanelX + 680, PanelY + 5, "Vol: 0.00");
+
+   // Create status and phase labels
+   CreateLabel(panelName + "_status", PanelX + 10, PanelY + 20, "Status: Parado");
+   CreateLabel(panelName + "_phase", PanelX + 10, PanelY + 35, "Fase: Compras");
+
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Create a button                                                  |
+//+------------------------------------------------------------------+
+void CreateButton(string name, int x, int y, int width, int height, string text, color bgcolor)
+{
+   if(!ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0))
+      return;
+   
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bgcolor);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial Bold");
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Create a text label                                              |
+//+------------------------------------------------------------------+
+void CreateLabel(string name, int x, int y, string text)
+{
+   if(!ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
+      return;
+      
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Update panel information                                         |
+//+------------------------------------------------------------------+
+void UpdatePanel()
+{
+   // Only update panel if not in backtest
+   if(isBacktesting) return;
+   
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   int buyPositions = 0;
+   int sellPositions = 0;
+   double totalVolume = 0;
+   double totalProfit = 0;
+   
+   int totalPositions = PositionsTotal();
+   for(int i = 0; i < totalPositions; i++)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+            buyPositions++;
+         else
+            sellPositions++;
+         
+         totalVolume += posInfo.Volume();
+         totalProfit += posInfo.Profit();
+      }
+   }
+   
+   // Update labels
+   ObjectSetString(0, panelName + "_balance", OBJPROP_TEXT, StringFormat("Saldo: $%.2f", balance));
+   ObjectSetString(0, panelName + "_equity", OBJPROP_TEXT, StringFormat("Capital: $%.2f", equity));
+   ObjectSetString(0, panelName + "_profit", OBJPROP_TEXT, StringFormat("Lucro: $%.2f", totalProfit));
+   ObjectSetString(0, panelName + "_positions", OBJPROP_TEXT, StringFormat("Posições: %d", buyPositions + sellPositions));
+   ObjectSetString(0, panelName + "_buy", OBJPROP_TEXT, StringFormat("Compras: %d", buyPositions));
+   ObjectSetString(0, panelName + "_sell", OBJPROP_TEXT, StringFormat("Vendas: %d", sellPositions));
+   ObjectSetString(0, panelName + "_volume", OBJPROP_TEXT, StringFormat("Vol: %.2f", totalVolume));
+   
+   // Update status and phase
+   string status = "Parado";
+   if(tradingActive)
+      status = "Ativo";
+      
+   string phase = (currentPhase == PHASE_BUYING) ? "Compras" : "Vendas";
+   
+   ObjectSetString(0, panelName + "_status", OBJPROP_TEXT, StringFormat("Status: %s", status));
+   ObjectSetString(0, panelName + "_phase", OBJPROP_TEXT, StringFormat("Fase: %s (%d/%d)", phase, 
+                   (currentPhase == PHASE_BUYING) ? buyPositions : sellPositions,
+                   (currentPhase == PHASE_BUYING) ? MaxBuyLevels : MaxSellLevels));
+   
+   // Update button colors based on active state
+   ObjectSetInteger(0, buttonStart, OBJPROP_BGCOLOR, tradingActive ? C'46,125,50' : C'76,175,80');
+   ObjectSetInteger(0, buttonStop, OBJPROP_BGCOLOR, tradingActive ? C'255,193,7' : C'180,140,5');
+}
+
+//+------------------------------------------------------------------+
+//| Print symbol statistics (for backtest monitoring)               |
+//+------------------------------------------------------------------+
+void PrintSymbolStatistics()
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double usedMargin = AccountInfoDouble(ACCOUNT_MARGIN);
+   
+   int buyPositions = 0;
+   int sellPositions = 0;
+   double totalVolume = 0;
+   double totalProfit = 0;
+   double maxDrawdown = 0;
+   
+   int totalPositions = PositionsTotal();
+   for(int i = 0; i < totalPositions; i++)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+            buyPositions++;
+         else
+            sellPositions++;
+         
+         totalVolume += posInfo.Volume();
+         totalProfit += posInfo.Profit();
+         
+         // Calculate individual position drawdown
+         double positionDrawdown = posInfo.Profit();
+         if(positionDrawdown < maxDrawdown)
+            maxDrawdown = positionDrawdown;
+      }
+   }
+   
+   // Calculate current price info
+   double currentAsk = SymbolInfoDouble(currentSymbol.name, SYMBOL_ASK);
+   double currentBid = SymbolInfoDouble(currentSymbol.name, SYMBOL_BID);
+   double currentMid = (currentAsk + currentBid) / 2.0;
+   
+   string phaseText = (currentPhase == PHASE_BUYING) ? "COMPRAS" : "VENDAS";
+   
+   PrintFormat("=== MODIFIED HYBRID GRID STATISTICS [%s] ===", currentSymbol.name);
+   PrintFormat("Account - Balance: $%.2f | Equity: $%.2f | Free Margin: $%.2f | Used Margin: $%.2f", 
+               balance, equity, freeMargin, usedMargin);
+   PrintFormat("Positions - Total: %d | Buys: %d/%d | Sells: %d/%d | Volume: %.2f lots", 
+               buyPositions + sellPositions, buyPositions, MaxBuyLevels, sellPositions, MaxSellLevels, totalVolume);
+   PrintFormat("P&L - Total Profit: $%.2f | Max Position DD: $%.2f", totalProfit, maxDrawdown);
+   PrintFormat("Price - Current: %.5f | Initial: %.5f | Transition: %.5f", 
+               currentMid, initialPrice, phaseTransitionPrice);
+   PrintFormat("Grid - Buy Step: %d pips | Sell Step: %d pips | Buy TP: %d pips | Sell TP: %d pips", 
+               GridStepPips, SellGridStepPips, TakeProfitPips, SellTakeProfitPips);
+   PrintFormat("Status - Phase: %s | Trading: %s | Backtest: %s", 
+               phaseText, tradingActive ? "ACTIVE" : "INACTIVE", isBacktesting ? "YES" : "NO");
+   PrintFormat("================================================");
+}
+
+//+------------------------------------------------------------------+
+//| Remove all panel objects                                         |
+//+------------------------------------------------------------------+
+void RemovePanelObjects()
+{
+   ObjectDelete(0, panelName);
+   ObjectDelete(0, buttonStart);
+   ObjectDelete(0, buttonStop);
+   ObjectDelete(0, buttonClose);
+   ObjectDelete(0, panelName + "_symbol");
+   ObjectDelete(0, panelName + "_balance");
+   ObjectDelete(0, panelName + "_equity");
+   ObjectDelete(0, panelName + "_profit");
+   ObjectDelete(0, panelName + "_positions");
+   ObjectDelete(0, panelName + "_buy");
+   ObjectDelete(0, panelName + "_sell");
+   ObjectDelete(0, panelName + "_volume");
+   ObjectDelete(0, panelName + "_status");
+   ObjectDelete(0, panelName + "_phase");
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("Modified Hybrid Grid EA Deinitialized. Reason: ", reason);
+   if(!isBacktesting)
+   {
+      RemovePanelObjects();
+      ChartRedraw();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Check if trading is allowed globally
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return;
+
+   //--- Handle backtest auto-start logic
+   if(isBacktesting && AutoStartInBacktest && !backtestDelayComplete)
+   {
+      int currentBars = Bars(_Symbol, PERIOD_CURRENT);
+      if(currentBars >= barsAtStart + DelayAfterStartBars)
+      {
+         tradingActive = true;
+         backtestDelayComplete = true;
+         Print("*** BACKTESTE: Trading ativado automaticamente após ", DelayAfterStartBars, " barras ***");
+         PrintSymbolStatistics();
+      }
+   }
+
+   //--- Manage grid for current symbol only if trading is active
+   if(tradingActive && currentSymbol.isTradingAllowed)
+   {
+      ManageModifiedHybridGrid(currentSymbol);
+   }
+   
+   //--- Update panel every 10 ticks to reduce CPU usage (only in real-time)
+   if(!isBacktesting)
+   {
+      static int tickCounter = 0;
+      tickCounter++;
+      if(tickCounter >= 10)
+      {
+         UpdatePanel();
+         tickCounter = 0;
+      }
+   }
+   else
+   {
+      // Print statistics every 100 ticks in backtest
+      static int backtestTickCounter = 0;
+      backtestTickCounter++;
+      if(backtestTickCounter >= 100)
+      {
+         PrintSymbolStatistics();
+         backtestTickCounter = 0;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Chart event handler                                              |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   // Chart events only work in real-time, not in backtest
+   if(isBacktesting) return;
+   
+   if(id == CHARTEVENT_OBJECT_CLICK)
+   {
+      if(sparam == buttonStart)
+      {
+         tradingActive = true;
+         Print("Modified Hybrid Grid Trading ATIVADO");
+         ObjectSetInteger(0, buttonStart, OBJPROP_STATE, false);
+      }
+      else if(sparam == buttonStop)
+      {
+         tradingActive = false;
+         Print("Modified Hybrid Grid Trading DESATIVADO");
+         ObjectSetInteger(0, buttonStop, OBJPROP_STATE, false);
+      }
+      else if(sparam == buttonClose)
+      {
+         if(MessageBox("Tem certeza que deseja fechar todas as posições?", "Confirmar", MB_YESNO | MB_ICONQUESTION) == IDYES)
+         {
+            CloseAllPositions();
+            tradingActive = false;
+         }
+         ObjectSetInteger(0, buttonClose, OBJPROP_STATE, false);
+      }
+      
+      UpdatePanel();
+      ChartRedraw();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage the modified hybrid grid system                           |
+//+------------------------------------------------------------------+
+void ManageModifiedHybridGrid(SymbolData &symbolData)
+{
+   //--- Get current price
+   double currentAsk = SymbolInfoDouble(symbolData.name, SYMBOL_ASK);
+   double currentBid = SymbolInfoDouble(symbolData.name, SYMBOL_BID);
+   if(currentAsk == 0 || currentBid == 0)
+   {
+      return;
+   }
+
+   //--- Set initial price if not set
+   if(initialPrice == 0)
+   {
+      initialPrice = (currentAsk + currentBid) / 2.0;
+      highestBuyLevel = initialPrice;
+      lowestSellLevel = initialPrice;
+      PrintFormat("[%s] Initial price set to: %.5f", symbolData.name, initialPrice);
+   }
+
+   //--- Count existing positions
+   int buyPositionsCount = 0;
+   int sellPositionsCount = 0;
+   double lowestBuyPrice = DBL_MAX;
+   double highestSellPrice = 0;
+   int totalPositions = PositionsTotal();
+
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+         {
+            buyPositionsCount++;
+            if(posInfo.PriceOpen() < lowestBuyPrice)
+            {
+               lowestBuyPrice = posInfo.PriceOpen();
+            }
+         }
+         else if(posInfo.PositionType() == POSITION_TYPE_SELL)
+         {
+            sellPositionsCount++;
+            if(posInfo.PriceOpen() > highestSellPrice)
+            {
+               highestSellPrice = posInfo.PriceOpen();
+            }
+         }
+      }
+   }
+
+   //--- Check for phase transition: after 20 buy orders, switch to sell phase
+   if(currentPhase == PHASE_BUYING && buyPositionsCount >= MaxBuyLevels)
+   {
+      currentPhase = PHASE_SELLING;
+      phaseTransitionPrice = (currentAsk + currentBid) / 2.0;
+      sellGridInitialized = false;
+      PrintFormat("[%s] *** PHASE TRANSITION *** Switching to SELL phase at price %.5f after %d buy orders", 
+                  symbolData.name, phaseTransitionPrice, buyPositionsCount);
+   }
+
+   int totalGridPositions = buyPositionsCount + sellPositionsCount;
+   double currentMid = (currentAsk + currentBid) / 2.0;
+
+   //--- PHASE 1: BUYING PHASE (until 20 buy orders)
+   if(currentPhase == PHASE_BUYING)
+   {
+      //--- If no positions exist, open the first buy order
+      if(totalGridPositions == 0)
+      {
+         double buyTpPrice = NormalizeDouble(currentAsk + symbolData.takeProfitPoints, symbolData.digits);
+         PrintFormat("[%s] Opening first buy position at market (Ask: %.5f), TP: %.5f, Lot: %.2f",
+                     symbolData.name, currentAsk, buyTpPrice, GridLotSize);
+         if(trade.Buy(GridLotSize, symbolData.name, currentAsk, 0, buyTpPrice, "Buy Grid #1"))
+         {
+            highestBuyLevel = currentAsk;
+         }
+         else
+         {
+            PrintFormat("[%s] Error placing first buy order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+         }
+         return;
+      }
+
+      //--- Place additional buy orders if price goes down and we haven't reached max
+      if(buyPositionsCount < MaxBuyLevels)
+      {
+         double nextBuyLevel = NormalizeDouble(lowestBuyPrice - symbolData.gridStepPoints, symbolData.digits);
+
+         // Check if price has dropped to trigger a buy
+         if(currentAsk <= nextBuyLevel + symbolData.pointValue)
+         {
+            // Check if an order already exists very close to this level
+            bool orderExistsNearLevel = false;
+            for(int i = totalPositions - 1; i >= 0; i--)
+            {
+               if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name && posInfo.PositionType() == POSITION_TYPE_BUY)
+               {
+                  if(MathAbs(posInfo.PriceOpen() - nextBuyLevel) < (symbolData.gridStepPoints / 2.0))
+                  {
+                     orderExistsNearLevel = true;
+                     break;
+                  }
+               }
+            }
+
+            if(!orderExistsNearLevel)
+            {
+               double buyTpPrice = NormalizeDouble(currentAsk + symbolData.takeProfitPoints, symbolData.digits);
+               PrintFormat("[%s] BUYING PHASE: Price (%.5f) reached buy level %d (%.5f). TP: %.5f, Lot: %.2f",
+                           symbolData.name, currentAsk, buyPositionsCount + 1, nextBuyLevel, buyTpPrice, GridLotSize);
+               if(trade.Buy(GridLotSize, symbolData.name, currentAsk, 0, buyTpPrice, StringFormat("Buy Grid #%d", buyPositionsCount + 1)))
+               {
+                  if(currentAsk > highestBuyLevel)
+                     highestBuyLevel = currentAsk;
+               }
+               else
+               {
+                  PrintFormat("[%s] Error placing buy order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+               }
+            }
+         }
+      }
+   }
+   
+   //--- PHASE 2: SELLING PHASE (after 20 buy orders are reached)
+   else if(currentPhase == PHASE_SELLING)
+   {
+      //--- Initialize sell grid levels based on current price if not done yet
+      if(!sellGridInitialized)
+      {
+         lowestSellLevel = phaseTransitionPrice;
+         sellGridInitialized = true;
+         PrintFormat("[%s] Sell grid initialized at transition price: %.5f", symbolData.name, lowestSellLevel);
+      }
+
+      //--- Place sell orders with 15 pips spacing
+      if(sellPositionsCount < MaxSellLevels)
+      {
+         double nextSellLevelUp, nextSellLevelDown;
+         
+         if(sellPositionsCount == 0)
+         {
+            // First sell orders: place both above and below current price
+            nextSellLevelUp = NormalizeDouble(currentMid + symbolData.sellGridStepPoints, symbolData.digits);
+            nextSellLevelDown = NormalizeDouble(currentMid - symbolData.sellGridStepPoints, symbolData.digits);
+         }
+         else
+         {
+            // Subsequent sell orders: place above highest and below lowest existing sell positions
+            nextSellLevelUp = NormalizeDouble(highestSellPrice + symbolData.sellGridStepPoints, symbolData.digits);
+            nextSellLevelDown = NormalizeDouble(lowestSellLevel - symbolData.sellGridStepPoints, symbolData.digits);
+         }
+
+         // Check if we should place sell order above current price
+         if(currentBid >= nextSellLevelUp - symbolData.pointValue && sellPositionsCount < MaxSellLevels)
+         {
+            // Check if an order already exists near this level
+            bool orderExistsNearLevelUp = false;
+            for(int i = totalPositions - 1; i >= 0; i--)
+            {
+               if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name && posInfo.PositionType() == POSITION_TYPE_SELL)
+               {
+                  if(MathAbs(posInfo.PriceOpen() - nextSellLevelUp) < (symbolData.sellGridStepPoints / 2.0))
+                  {
+                     orderExistsNearLevelUp = true;
+                     break;
+                  }
+               }
+            }
+
+            if(!orderExistsNearLevelUp)
+            {
+               double sellTpPrice = NormalizeDouble(currentBid - symbolData.sellTakeProfitPoints, symbolData.digits);
+               PrintFormat("[%s] SELLING PHASE UP: Price (%.5f) reached sell level %d (%.5f). TP: %.5f, Lot: %.2f",
+                           symbolData.name, currentBid, sellPositionsCount + 1, nextSellLevelUp, sellTpPrice, GridLotSize);
+               if(trade.Sell(GridLotSize, symbolData.name, currentBid, 0, sellTpPrice, StringFormat("Sell Grid Up #%d", sellPositionsCount + 1)))
+               {
+                  if(currentBid > highestSellPrice || highestSellPrice == 0)
+                     highestSellPrice = currentBid;
+               }
+               else
+               {
+                  PrintFormat("[%s] Error placing sell order (up): %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+               }
+            }
+         }
+
+         // Check if we should place sell order below current price
+         if(currentBid <= nextSellLevelDown + symbolData.pointValue && sellPositionsCount < MaxSellLevels)
+         {
+            // Check if an order already exists near this level
+            bool orderExistsNearLevelDown = false;
+            for(int i = totalPositions - 1; i >= 0; i--)
+            {
+               if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name && posInfo.PositionType() == POSITION_TYPE_SELL)
+               {
+                  if(MathAbs(posInfo.PriceOpen() - nextSellLevelDown) < (symbolData.sellGridStepPoints / 2.0))
+                  {
+                     orderExistsNearLevelDown = true;
+                     break;
+                  }
+               }
+            }
+
+            if(!orderExistsNearLevelDown)
+            {
+               double sellTpPrice = NormalizeDouble(currentBid + symbolData.sellTakeProfitPoints, symbolData.digits);
+               PrintFormat("[%s] SELLING PHASE DOWN: Price (%.5f) reached sell level %d (%.5f). TP: %.5f, Lot: %.2f",
+                           symbolData.name, currentBid, sellPositionsCount + 1, nextSellLevelDown, sellTpPrice, GridLotSize);
+               if(trade.Sell(GridLotSize, symbolData.name, currentBid, 0, sellTpPrice, StringFormat("Sell Grid Down #%d", sellPositionsCount + 1)))
+               {
+                  if(currentBid < lowestSellLevel)
+                     lowestSellLevel = currentBid;
+               }
+               else
+               {
+                  PrintFormat("[%s] Error placing sell order (down): %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+               }
+            }
+         }
+      }
+   }
+
+   //--- DEBUG INFO
+   static int debugCounter = 0;
+   debugCounter++;
+   if(debugCounter >= 50) // Print debug info every 50 ticks
+   {
+      string phaseText = (currentPhase == PHASE_BUYING) ? "BUYING" : "SELLING";
+      PrintFormat("[%s] DEBUG - Phase: %s, Price: %.5f, Buys: %d/%d, Sells: %d/%d",
+                  symbolData.name, phaseText, currentMid, buyPositionsCount, MaxBuyLevels, sellPositionsCount, MaxSellLevels);
+      debugCounter = 0;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions for current symbol                           |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   int totalPositions = PositionsTotal();
+   PrintFormat("Fechando todas as posições para %s (Magic: %d)...", currentSymbol.name, MagicNumber);
+   
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
+      {
+         string positionType = (posInfo.PositionType() == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+         PrintFormat("Fechando posição #%d (%s %.2f lots) - Ticket: %d", 
+                     i, positionType, posInfo.Volume(), posInfo.Ticket());
+         
+         if(!trade.PositionClose(posInfo.Ticket()))
+         {
+            PrintFormat("Erro ao fechar posição %d: %d - %s", 
+                        posInfo.Ticket(), trade.ResultRetcode(), trade.ResultComment());
+         }
+         else
+         {
+            PrintFormat("Posição %d fechada com sucesso", posInfo.Ticket());
+         }
+      }
+   }
+   
+   // Reset all tracking variables
+   initialPrice = 0;
+   highestBuyLevel = 0;
+   lowestSellLevel = 0;
+   currentPhase = PHASE_BUYING;
+   phaseTransitionPrice = 0;
+   sellGridInitialized = false;
+   
+   // Reset level arrays
+   for(int i = 0; i < 100; i++)
+   {
+      canBuyAtLevel[i] = true;
+      canSellAtLevel[i] = true;
+   }
+   
+   Print("Todas as posições foram fechadas e sistema resetado para fase de compras.");
+}
