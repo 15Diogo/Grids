@@ -1,0 +1,1070 @@
+//+------------------------------------------------------------------+
+//|                     BuyBuy_Bidirectional_Grid_EA.mq5             |
+//|                        Copyright 2025, Manus AI Agent          |
+//|                                                                  |
+//+------------------------------------------------------------------+
+#property copyright "Manus AI Agent"
+#property link      ""
+#property version   "3.00"
+#property strict
+#property description "Expert Advisor com grid bidirecional dinâmico e martingale inteligente"
+
+#include <Trade/Trade.mqh>
+#include <Trade/PositionInfo.mqh>
+
+//--- Input parameters
+input double GridLotSize     = 0.01;    // Fixed Lot Size for grid orders
+input int    GridStepPips    = 500;     // Grid Step in Pips
+input int    TakeProfitPips  = 500;     // Take Profit in Pips for each order
+input int    MaxBuyOrders    = 20;      // Maximum buy orders before switching to sell
+input ulong  MagicNumber     = 67890;   // EA Magic Number
+
+// Martingale settings
+input bool   EnableMartingale = true;           // Habilitar Martingale Inteligente
+input int    MartingaleTriggerOrders = 10;      // Ordens para ativar martingale
+input double MartingaleSellMultiplier = 2.0;    // Multiplicador para vendas (ex: 3x)
+input double MartingaleBuyMultiplier = 3.0;     // Multiplicador para recompra (ex: 9x)
+input int    MaxMartingaleCycles = 10;           // Máximo de ciclos de martingale
+
+// Backtesting settings
+input bool   AutoStartInBacktest = true; // Auto-start in backtest mode
+input int    DelayAfterStartBars = 5;    // Bars to wait before starting (backtest only)
+
+// Panel settings
+input int PanelX = 10;        // Panel X position
+input int PanelY = 10;        // Panel Y position
+
+//--- Global variables
+CTrade          trade;
+CPositionInfo   posInfo;
+
+// Panel objects
+string panelName = "TradingPanel";
+string buttonStart = "Iniciar";
+string buttonStop = "Parar";
+string buttonClose = "ZerarTudo";
+
+// Trading control
+bool tradingActive = false;
+bool isBacktesting = false;
+int barsAtStart = 0;
+bool backtestDelayComplete = false;
+
+// Grid direction control
+enum GridDirection
+{
+   GRID_BUY,      // Fazendo grid de compra
+   GRID_SELL      // Fazendo grid de venda
+};
+
+// Martingale system
+struct MartingaleState
+{
+   int currentCycle;                    // Ciclo atual do martingale
+   int buyOrdersInCycle;               // Ordens de compra no ciclo atual
+   int sellOrdersInCycle;              // Ordens de venda no ciclo atual
+   double currentBuyLotSize;           // Tamanho do lote atual para compras
+   double currentSellLotSize;          // Tamanho do lote atual para vendas
+   bool inMartingaleMode;              // Se está em modo martingale
+   double cycleStartBalance;           // Saldo no início do ciclo
+   string currentPhase;                // Fase atual: "NORMAL", "MARTINGALE_SELL", "MARTINGALE_BUY"
+};
+
+MartingaleState martingale;
+GridDirection currentGridDirection = GRID_BUY;
+double buyZoneHighest = 0;     // Preço mais alto da zona de compra
+double sellZoneLowest = DBL_MAX; // Preço mais baixo da zona de venda
+
+// Structure to hold symbol-specific data
+struct SymbolData
+{
+   string          name;
+   double          gridStepPoints;
+   double          takeProfitPoints;
+   double          pointValue;
+   int             digits;
+   double          minLot;
+   double          maxLot;
+   double          lotStep;
+   bool            isTradingAllowed;
+};
+
+// Symbol data for current symbol
+SymbolData currentSymbol;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   Print("Initializing BuyBuy Bidirectional Grid EA with Smart Martingale...");
+
+   //--- Check if running in backtest
+   isBacktesting = MQLInfoInteger(MQL_TESTER);
+   
+   if(isBacktesting)
+   {
+      Print("*** MODO BACKTESTE DETECTADO ***");
+      barsAtStart = Bars(_Symbol, PERIOD_CURRENT);
+      if(AutoStartInBacktest)
+      {
+         Print("Auto-start habilitado para backteste. Aguardando ", DelayAfterStartBars, " barras...");
+      }
+   }
+   else
+   {
+      Print("*** MODO TEMPO REAL DETECTADO ***");
+   }
+
+   //--- Initialize trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(5);
+   trade.SetTypeFilling(ORDER_FILLING_FOK);
+
+   //--- Get current symbol name
+   string symbolName = _Symbol;
+   
+   //--- Initialize data for current symbol
+   if(!InitializeSymbolData(symbolName, currentSymbol))
+   {
+      PrintFormat("Failed to initialize symbol: %s", symbolName);
+      return(INIT_FAILED);
+   }
+
+   //--- Initialize martingale system
+   InitializeMartingale();
+
+   //--- Create panel only if not in backtest
+   if(!isBacktesting)
+   {
+      CreatePanel();
+   }
+   else
+   {
+      Print("Panel desabilitado no backteste - usando controle automático");
+   }
+
+   // Initialize grid direction
+   currentGridDirection = GRID_BUY;
+   double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   buyZoneHighest = currentPrice;
+   sellZoneLowest = DBL_MAX;
+
+   Print("BuyBuy Bidirectional Grid EA with Smart Martingale Initialized Successfully.");
+   PrintFormat("Operating on: %s", currentSymbol.name);
+   PrintFormat("Grid Lot: %.2f, Grid Step: %d pips, TP: %d pips, Max Buy Orders: %d", 
+               GridLotSize, GridStepPips, TakeProfitPips, MaxBuyOrders);
+   
+   if(EnableMartingale)
+   {
+      PrintFormat("Martingale: ATIVADO - Trigger: %d ordens, Sell Mult: %.1fx, Buy Mult: %.1fx, Max Cycles: %d", 
+                  MartingaleTriggerOrders, MartingaleSellMultiplier, MartingaleBuyMultiplier, MaxMartingaleCycles);
+   }
+   else
+   {
+      Print("Martingale: DESATIVADO");
+   }
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize martingale system                                     |
+//+------------------------------------------------------------------+
+void InitializeMartingale()
+{
+   martingale.currentCycle = 0;
+   martingale.buyOrdersInCycle = 0;
+   martingale.sellOrdersInCycle = 0;
+   martingale.currentBuyLotSize = GridLotSize;
+   martingale.currentSellLotSize = GridLotSize;
+   martingale.inMartingaleMode = false;
+   martingale.cycleStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   martingale.currentPhase = "NORMAL";
+   
+   Print("Martingale system initialized - Starting with normal lot size: ", GridLotSize);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize data for a specific symbol                            |
+//+------------------------------------------------------------------+
+bool InitializeSymbolData(const string symbolName, SymbolData &symbolData)
+{
+   symbolData.name = symbolName;
+
+   //--- Ensure symbol is available in Market Watch
+   if(!SymbolSelect(symbolName, true))
+   {
+      PrintFormat("Error: Symbol %s not found or not enabled in Market Watch. Please add it.", symbolName);
+      return(false);
+   }
+
+   //--- Wait for symbol info to be available
+   int retries = 10;
+   while(SymbolInfoDouble(symbolName, SYMBOL_POINT) == 0 && retries > 0)
+   {
+      Sleep(500);
+      retries--;
+   }
+
+   symbolData.pointValue = SymbolInfoDouble(symbolName, SYMBOL_POINT);
+   if(symbolData.pointValue == 0)
+   {
+      PrintFormat("Error: Could not get point value for %s.", symbolName);
+      return(false);
+   }
+
+   symbolData.digits = (int)SymbolInfoInteger(symbolName, SYMBOL_DIGITS);
+   symbolData.gridStepPoints = GridStepPips * symbolData.pointValue;
+   symbolData.takeProfitPoints = TakeProfitPips * symbolData.pointValue;
+   symbolData.minLot = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_MIN);
+   symbolData.maxLot = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_MAX);
+   symbolData.lotStep = SymbolInfoDouble(symbolName, SYMBOL_VOLUME_STEP);
+   symbolData.isTradingAllowed = SymbolInfoInteger(symbolName, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_DISABLED;
+
+   //--- Validate GridLotSize
+   if(GridLotSize < symbolData.minLot || GridLotSize > symbolData.maxLot || fmod(GridLotSize, symbolData.lotStep) > 0.0000001)
+   {
+      PrintFormat("Error: Grid lot size %.2f is invalid for %s (Min: %.2f, Max: %.2f, Step: %.2f).",
+                  GridLotSize, symbolName, symbolData.minLot, symbolData.maxLot, symbolData.lotStep);
+      return(false);
+   }
+
+   if(!symbolData.isTradingAllowed)
+   {
+       PrintFormat("Warning: Trading is disabled for symbol %s.", symbolName);
+   }
+
+   PrintFormat("Initialized data for %s: Point=%.*f, Digits=%d, GridPoints=%.*f, TPPoints=%.*f, Trading Allowed: %s",
+               symbolName,
+               symbolData.digits, symbolData.pointValue,
+               symbolData.digits,
+               symbolData.digits, symbolData.gridStepPoints,
+               symbolData.digits, symbolData.takeProfitPoints,
+               symbolData.isTradingAllowed ? "Yes" : "No");
+
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Create the horizontal trading panel                              |
+//+------------------------------------------------------------------+
+void CreatePanel()
+{
+   // Remove existing objects
+   RemovePanelObjects();
+
+   // Create main panel background (increased height for martingale info)
+   if(!ObjectCreate(0, panelName, OBJ_RECTANGLE_LABEL, 0, 0, 0))
+   {
+      Print("Error creating panel: ", GetLastError());
+      return;
+   }
+   
+   ObjectSetInteger(0, panelName, OBJPROP_XDISTANCE, PanelX);
+   ObjectSetInteger(0, panelName, OBJPROP_YDISTANCE, PanelY);
+   ObjectSetInteger(0, panelName, OBJPROP_XSIZE, 750);
+   ObjectSetInteger(0, panelName, OBJPROP_YSIZE, 100);
+   ObjectSetInteger(0, panelName, OBJPROP_BGCOLOR, C'30,30,35');
+   ObjectSetInteger(0, panelName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, panelName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, panelName, OBJPROP_COLOR, C'0,150,136');
+   ObjectSetInteger(0, panelName, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, panelName, OBJPROP_BACK, false);
+   ObjectSetInteger(0, panelName, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, panelName, OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, panelName, OBJPROP_HIDDEN, true);
+
+   // Create buttons with modern colors
+   CreateButton(buttonStart, PanelX + 10, PanelY + 75, 80, 20, "INICIAR", C'76,175,80');
+   CreateButton(buttonStop, PanelX + 100, PanelY + 75, 80, 20, "PARAR", C'255,193,7');
+   CreateButton(buttonClose, PanelX + 190, PanelY + 75, 90, 20, "ZERAR TUDO", C'244,67,54');
+
+   // Create text labels in horizontal layout
+   CreateLabel(panelName + "_symbol", PanelX + 10, PanelY + 5, currentSymbol.name);
+   CreateLabel(panelName + "_balance", PanelX + 100, PanelY + 5, "Saldo: $0.00");
+   CreateLabel(panelName + "_equity", PanelX + 220, PanelY + 5, "Capital: $0.00");
+   CreateLabel(panelName + "_profit", PanelX + 350, PanelY + 5, "Lucro: $0.00");
+   CreateLabel(panelName + "_positions", PanelX + 470, PanelY + 5, "Posições: 0");
+   CreateLabel(panelName + "_buy", PanelX + 550, PanelY + 5, "Compras: 0");
+   CreateLabel(panelName + "_sell", PanelX + 620, PanelY + 5, "Vendas: 0");
+   CreateLabel(panelName + "_volume", PanelX + 680, PanelY + 5, "Vol: 0.00");
+
+   // Create status and grid direction labels
+   CreateLabel(panelName + "_status", PanelX + 10, PanelY + 20, "Status: Parado");
+   CreateLabel(panelName + "_direction", PanelX + 10, PanelY + 35, "Direção: COMPRA");
+   
+   // Create martingale info labels
+   CreateLabel(panelName + "_martingale", PanelX + 10, PanelY + 50, "Martingale: OFF");
+   CreateLabel(panelName + "_cycle", PanelX + 200, PanelY + 50, "Ciclo: 0/0");
+   CreateLabel(panelName + "_lotsize", PanelX + 350, PanelY + 50, "Lote Atual: 0.01");
+   CreateLabel(panelName + "_phase", PanelX + 500, PanelY + 50, "Fase: NORMAL");
+
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Create a button                                                  |
+//+------------------------------------------------------------------+
+void CreateButton(string name, int x, int y, int width, int height, string text, color bgcolor)
+{
+   if(!ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0))
+      return;
+   
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bgcolor);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial Bold");
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Create a text label                                              |
+//+------------------------------------------------------------------+
+void CreateLabel(string name, int x, int y, string text)
+{
+   if(!ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
+      return;
+      
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Update panel information                                         |
+//+------------------------------------------------------------------+
+void UpdatePanel()
+{
+   // Only update panel if not in backtest
+   if(isBacktesting) return;
+   
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   int buyPositions = 0;
+   int sellPositions = 0;
+   double totalVolume = 0;
+   double totalProfit = 0;
+   
+   int totalPositions = PositionsTotal();
+   for(int i = 0; i < totalPositions; i++)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+            buyPositions++;
+         else
+            sellPositions++;
+         
+         totalVolume += posInfo.Volume();
+         totalProfit += posInfo.Profit();
+      }
+   }
+   
+   // Update labels
+   ObjectSetString(0, panelName + "_balance", OBJPROP_TEXT, StringFormat("Saldo: $%.2f", balance));
+   ObjectSetString(0, panelName + "_equity", OBJPROP_TEXT, StringFormat("Capital: $%.2f", equity));
+   ObjectSetString(0, panelName + "_profit", OBJPROP_TEXT, StringFormat("Lucro: $%.2f", totalProfit));
+   ObjectSetString(0, panelName + "_positions", OBJPROP_TEXT, StringFormat("Posições: %d", buyPositions + sellPositions));
+   ObjectSetString(0, panelName + "_buy", OBJPROP_TEXT, StringFormat("Compras: %d", buyPositions));
+   ObjectSetString(0, panelName + "_sell", OBJPROP_TEXT, StringFormat("Vendas: %d", sellPositions));
+   ObjectSetString(0, panelName + "_volume", OBJPROP_TEXT, StringFormat("Vol: %.2f", totalVolume));
+   
+   // Update status
+   string status = "Parado";
+   if(tradingActive)
+      status = "Grid Bidirecional Ativo";
+      
+   ObjectSetString(0, panelName + "_status", OBJPROP_TEXT, StringFormat("Status: %s", status));
+   
+   // Update grid direction
+   string direction = (currentGridDirection == GRID_BUY) ? "COMPRA" : "VENDA";
+   ObjectSetString(0, panelName + "_direction", OBJPROP_TEXT, StringFormat("Direção: %s (%d/%d)", 
+                   direction, buyPositions, MaxBuyOrders));
+   
+   // Update martingale info
+   string martingaleStatus = EnableMartingale ? (martingale.inMartingaleMode ? "ON" : "READY") : "OFF";
+   ObjectSetString(0, panelName + "_martingale", OBJPROP_TEXT, StringFormat("Martingale: %s", martingaleStatus));
+   ObjectSetString(0, panelName + "_cycle", OBJPROP_TEXT, StringFormat("Ciclo: %d/%d", martingale.currentCycle, MaxMartingaleCycles));
+   ObjectSetString(0, panelName + "_lotsize", OBJPROP_TEXT, StringFormat("Lote: %.2f/%.2f", martingale.currentBuyLotSize, martingale.currentSellLotSize));
+   ObjectSetString(0, panelName + "_phase", OBJPROP_TEXT, StringFormat("Fase: %s", martingale.currentPhase));
+   
+   // Update button colors based on active state
+   ObjectSetInteger(0, buttonStart, OBJPROP_BGCOLOR, tradingActive ? C'46,125,50' : C'76,175,80');
+   ObjectSetInteger(0, buttonStop, OBJPROP_BGCOLOR, tradingActive ? C'255,193,7' : C'180,140,5');
+}
+
+//+------------------------------------------------------------------+
+//| Remove all panel objects                                         |
+//+------------------------------------------------------------------+
+void RemovePanelObjects()
+{
+   ObjectDelete(0, panelName);
+   ObjectDelete(0, buttonStart);
+   ObjectDelete(0, buttonStop);
+   ObjectDelete(0, buttonClose);
+   ObjectDelete(0, panelName + "_symbol");
+   ObjectDelete(0, panelName + "_balance");
+   ObjectDelete(0, panelName + "_equity");
+   ObjectDelete(0, panelName + "_profit");
+   ObjectDelete(0, panelName + "_positions");
+   ObjectDelete(0, panelName + "_buy");
+   ObjectDelete(0, panelName + "_sell");
+   ObjectDelete(0, panelName + "_volume");
+   ObjectDelete(0, panelName + "_status");
+   ObjectDelete(0, panelName + "_direction");
+   ObjectDelete(0, panelName + "_martingale");
+   ObjectDelete(0, panelName + "_cycle");
+   ObjectDelete(0, panelName + "_lotsize");
+   ObjectDelete(0, panelName + "_phase");
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("BuyBuy Bidirectional Grid EA Deinitialized. Reason: ", reason);
+   if(!isBacktesting)
+   {
+      RemovePanelObjects();
+      ChartRedraw();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Check if trading is allowed globally
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return;
+
+   //--- Handle backtest auto-start logic
+   if(isBacktesting && AutoStartInBacktest && !backtestDelayComplete)
+   {
+      int currentBars = Bars(_Symbol, PERIOD_CURRENT);
+      if(currentBars >= barsAtStart + DelayAfterStartBars)
+      {
+         tradingActive = true;
+         backtestDelayComplete = true;
+         Print("*** BACKTESTE: Trading ativado automaticamente após ", DelayAfterStartBars, " barras ***");
+         PrintSymbolStatistics();
+      }
+   }
+
+   //--- Update martingale state
+   if(EnableMartingale && tradingActive)
+   {
+      UpdateMartingaleState();
+   }
+
+   //--- Manage bidirectional grid if trading is active
+   if(tradingActive && currentSymbol.isTradingAllowed)
+   {
+      ManageBidirectionalGrid(currentSymbol);
+   }
+   
+   //--- Update panel every 10 ticks to reduce CPU usage (only in real-time)
+   if(!isBacktesting)
+   {
+      static int tickCounter = 0;
+      tickCounter++;
+      if(tickCounter >= 10)
+      {
+         UpdatePanel();
+         tickCounter = 0;
+      }
+   }
+   else
+   {
+      // Print statistics every 100 ticks in backtest
+      static int backtestTickCounter = 0;
+      backtestTickCounter++;
+      if(backtestTickCounter >= 100)
+      {
+         PrintSymbolStatistics();
+         backtestTickCounter = 0;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update martingale state                                          |
+//+------------------------------------------------------------------+
+void UpdateMartingaleState()
+{
+   int buyPositions = 0;
+   int sellPositions = 0;
+   
+   int totalPositions = PositionsTotal();
+   for(int i = 0; i < totalPositions; i++)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+            buyPositions++;
+         else
+            sellPositions++;
+      }
+   }
+   
+   // Check martingale trigger conditions
+   if(!martingale.inMartingaleMode)
+   {
+      // First trigger: switch to martingale sell mode after MartingaleTriggerOrders buy orders
+      if(buyPositions >= MartingaleTriggerOrders && currentGridDirection == GRID_BUY)
+      {
+         ActivateMartingaleMode("SELL");
+      }
+   }
+   else
+   {
+      // Already in martingale mode - check for phase transitions
+      if(martingale.currentPhase == "MARTINGALE_SELL")
+      {
+         // If we have MartingaleTriggerOrders sell positions, switch to martingale buy
+         if(sellPositions >= MartingaleTriggerOrders && martingale.currentCycle < MaxMartingaleCycles)
+         {
+            NextMartingaleCycle("BUY");
+         }
+      }
+      else if(martingale.currentPhase == "MARTINGALE_BUY")
+      {
+         // If we have MartingaleTriggerOrders buy positions again, switch to martingale sell
+         if(buyPositions >= MartingaleTriggerOrders && martingale.currentCycle < MaxMartingaleCycles)
+         {
+            NextMartingaleCycle("SELL");
+         }
+      }
+      
+      // Check if max cycles reached
+      if(martingale.currentCycle >= MaxMartingaleCycles)
+      {
+         Print("*** MARTINGALE: Máximo de ciclos atingido (", MaxMartingaleCycles, ") - Mantendo configuração atual ***");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Activate martingale mode                                         |
+//+------------------------------------------------------------------+
+void ActivateMartingaleMode(string phase)
+{
+   martingale.inMartingaleMode = true;
+   martingale.currentCycle = 1;
+   martingale.currentPhase = "MARTINGALE_" + phase;
+   
+   if(phase == "SELL")
+   {
+      martingale.currentSellLotSize = NormalizeLotSize(GridLotSize * MartingaleSellMultiplier);
+      currentGridDirection = GRID_SELL;
+      Print("*** MARTINGALE ATIVADO: Mudando para vendas com lote ", martingale.currentSellLotSize, " (", MartingaleSellMultiplier, "x) ***");
+   }
+   else if(phase == "BUY")
+   {
+      martingale.currentBuyLotSize = NormalizeLotSize(GridLotSize * MartingaleBuyMultiplier);
+      currentGridDirection = GRID_BUY;
+      Print("*** MARTINGALE ATIVADO: Mudando para compras com lote ", martingale.currentBuyLotSize, " (", MartingaleBuyMultiplier, "x) ***");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Move to next martingale cycle                                    |
+//+------------------------------------------------------------------+
+void NextMartingaleCycle(string phase)
+{
+   martingale.currentCycle++;
+   martingale.currentPhase = "MARTINGALE_" + phase;
+   
+   if(phase == "SELL")
+   {
+      // Increase sell lot size for next cycle
+      double multiplier = MathPow(MartingaleSellMultiplier, martingale.currentCycle);
+      martingale.currentSellLotSize = NormalizeLotSize(GridLotSize * multiplier);
+      currentGridDirection = GRID_SELL;
+      Print("*** MARTINGALE CICLO ", martingale.currentCycle, ": Mudando para vendas com lote ", martingale.currentSellLotSize, " ***");
+   }
+   else if(phase == "BUY")
+   {
+      // Increase buy lot size for next cycle
+      double multiplier = MathPow(MartingaleBuyMultiplier, martingale.currentCycle);
+      martingale.currentBuyLotSize = NormalizeLotSize(GridLotSize * multiplier);
+      currentGridDirection = GRID_BUY;
+      Print("*** MARTINGALE CICLO ", martingale.currentCycle, ": Mudando para compras com lote ", martingale.currentBuyLotSize, " ***");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot size according to broker requirements              |
+//+------------------------------------------------------------------+
+double NormalizeLotSize(double lotSize)
+{
+   double normalizedLot = MathRound(lotSize / currentSymbol.lotStep) * currentSymbol.lotStep;
+   
+   if(normalizedLot < currentSymbol.minLot)
+      normalizedLot = currentSymbol.minLot;
+   if(normalizedLot > currentSymbol.maxLot)
+      normalizedLot = currentSymbol.maxLot;
+      
+   return normalizedLot;
+}
+
+//+------------------------------------------------------------------+
+//| Get current lot size based on direction and martingale state    |
+//+------------------------------------------------------------------+
+double GetCurrentLotSize(bool isBuyOrder)
+{
+   if(!EnableMartingale || !martingale.inMartingaleMode)
+   {
+      return GridLotSize;
+   }
+   
+   if(isBuyOrder)
+   {
+      return martingale.currentBuyLotSize;
+   }
+   else
+   {
+      return martingale.currentSellLotSize;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Chart event handler                                              |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   // Chart events only work in real-time, not in backtest
+   if(isBacktesting) return;
+   
+   if(id == CHARTEVENT_OBJECT_CLICK)
+   {
+      if(sparam == buttonStart)
+      {
+         tradingActive = true;
+         Print("BuyBuy Bidirectional Grid Trading ATIVADO");
+         ObjectSetInteger(0, buttonStart, OBJPROP_STATE, false);
+      }
+      else if(sparam == buttonStop)
+      {
+         tradingActive = false;
+         Print("BuyBuy Bidirectional Grid Trading DESATIVADO");
+         ObjectSetInteger(0, buttonStop, OBJPROP_STATE, false);
+      }
+      else if(sparam == buttonClose)
+      {
+         if(MessageBox("Tem certeza que deseja fechar todas as posições e resetar o martingale?", "Confirmar", MB_YESNO | MB_ICONQUESTION) == IDYES)
+         {
+            CloseAllPositions();
+            tradingActive = false;
+            // Reset grid direction and martingale
+            ResetSystem();
+         }
+         ObjectSetInteger(0, buttonClose, OBJPROP_STATE, false);
+      }
+      
+      UpdatePanel();
+      ChartRedraw();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage the bidirectional grid system                             |
+//+------------------------------------------------------------------+
+void ManageBidirectionalGrid(SymbolData &symbolData)
+{
+   //--- Get current prices
+   double currentAsk = SymbolInfoDouble(symbolData.name, SYMBOL_ASK);
+   double currentBid = SymbolInfoDouble(symbolData.name, SYMBOL_BID);
+   if(currentAsk == 0 || currentBid == 0)
+   {
+      return;
+   }
+
+   //--- Count existing positions
+   int buyPositionsCount = 0;
+   int sellPositionsCount = 0;
+   double lowestBuyPrice = DBL_MAX;
+   double highestSellPrice = 0;
+   
+   int totalPositions = PositionsTotal();
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+         {
+            buyPositionsCount++;
+            if(posInfo.PriceOpen() < lowestBuyPrice)
+            {
+               lowestBuyPrice = posInfo.PriceOpen();
+            }
+            // Update buy zone highest
+            if(posInfo.PriceOpen() > buyZoneHighest)
+            {
+               buyZoneHighest = posInfo.PriceOpen();
+            }
+         }
+         else if(posInfo.PositionType() == POSITION_TYPE_SELL)
+         {
+            sellPositionsCount++;
+            if(posInfo.PriceOpen() > highestSellPrice)
+            {
+               highestSellPrice = posInfo.PriceOpen();
+            }
+            // Update sell zone lowest
+            if(posInfo.PriceOpen() < sellZoneLowest)
+            {
+               sellZoneLowest = posInfo.PriceOpen();
+            }
+         }
+      }
+   }
+
+   //--- Original logic for non-martingale transitions
+   if(!EnableMartingale || !martingale.inMartingaleMode)
+   {
+      if(buyPositionsCount >= MaxBuyOrders && currentGridDirection == GRID_BUY)
+      {
+         currentGridDirection = GRID_SELL;
+         PrintFormat("[%s] Mudando direção do grid para VENDA após %d ordens de compra. Zona de compra: %.5f", 
+                     symbolData.name, buyPositionsCount, buyZoneHighest);
+      }
+   }
+   
+   //--- Check if market returned to buy zone (resume buy grid)
+   if(currentGridDirection == GRID_SELL && buyZoneHighest > 0 && !martingale.inMartingaleMode)
+   {
+      // If current price is back at or above the highest buy zone, resume buying
+      if(currentBid >= buyZoneHighest - (symbolData.gridStepPoints * 2)) // Allow some tolerance
+      {
+         currentGridDirection = GRID_BUY;
+         PrintFormat("[%s] RETOMANDO grid de COMPRA! Mercado voltou à zona: %.5f (atual: %.5f)", 
+                     symbolData.name, buyZoneHighest, currentBid);
+      }
+   }
+
+   //--- Execute grid logic based on current direction
+   if(currentGridDirection == GRID_BUY)
+   {
+      ManageBuyGrid(symbolData, buyPositionsCount, lowestBuyPrice, currentAsk);
+   }
+   else // GRID_SELL
+   {
+      ManageSellGrid(symbolData, sellPositionsCount, highestSellPrice, currentBid);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage buy grid                                                   |
+//+------------------------------------------------------------------+
+void ManageBuyGrid(SymbolData &symbolData, int buyPositionsCount, double lowestBuyPrice, double currentAsk)
+{
+   double currentLotSize = GetCurrentLotSize(true);
+   
+   //--- If no buy positions exist, open the first buy order
+   if(buyPositionsCount == 0)
+   {
+      double buyTpPrice = NormalizeDouble(currentAsk + symbolData.takeProfitPoints, symbolData.digits);
+      string orderComment = martingale.inMartingaleMode ? 
+                           StringFormat("Martingale Buy C%d", martingale.currentCycle) : "Initial Buy Grid";
+      
+      PrintFormat("[%s] No open buy positions. Placing initial buy order at market (Ask: %.5f), TP: %.5f, Lot: %.2f",
+                  symbolData.name, currentAsk, buyTpPrice, currentLotSize);
+      if(!trade.Buy(currentLotSize, symbolData.name, currentAsk, 0, buyTpPrice, orderComment))
+      {
+         PrintFormat("[%s] Error placing initial buy order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+      }
+      return;
+   }
+
+   //--- Check if we should place another buy order
+   bool allowUnlimitedBuying = false;
+   int maxOrdersForPhase = MaxBuyOrders;
+   
+   if(martingale.inMartingaleMode)
+   {
+      // In martingale mode, allow more orders
+      maxOrdersForPhase = MartingaleTriggerOrders;
+      if(martingale.currentPhase == "MARTINGALE_BUY")
+      {
+         allowUnlimitedBuying = false; // Stick to trigger limit for martingale cycles
+      }
+   }
+   else if(currentGridDirection == GRID_BUY)
+   {
+      // If we switched back from sell mode, allow unlimited buying
+      if(sellZoneLowest < DBL_MAX) // We had sell positions before
+      {
+         allowUnlimitedBuying = true;
+      }
+   }
+   
+   if(buyPositionsCount < maxOrdersForPhase || allowUnlimitedBuying)
+   {
+      double nextBuyLevel = NormalizeDouble(lowestBuyPrice - symbolData.gridStepPoints, symbolData.digits);
+
+      // Check if price has dropped below the next grid level
+      if(currentAsk <= nextBuyLevel + symbolData.pointValue)
+      {
+         // Check if an order already exists very close to this level to prevent duplicates
+         bool orderExistsNearLevel = false;
+         int totalPositions = PositionsTotal();
+         for(int i = totalPositions - 1; i >= 0; i--)
+         {
+            if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name && posInfo.PositionType() == POSITION_TYPE_BUY)
+            {
+               // Check if open price is within a small range of the target level
+               if(MathAbs(posInfo.PriceOpen() - nextBuyLevel) < (symbolData.gridStepPoints / 2.0))
+               {
+                  orderExistsNearLevel = true;
+                  break;
+               }
+            }
+         }
+
+         if(!orderExistsNearLevel)
+         {
+            double buyTpPrice = NormalizeDouble(currentAsk + symbolData.takeProfitPoints, symbolData.digits);
+            string orderComment = "Grid Buy";
+            string logPrefix = "[NORMAL]";
+            
+            if(martingale.inMartingaleMode)
+            {
+               orderComment = StringFormat("Martingale Buy C%d", martingale.currentCycle);
+               logPrefix = StringFormat("[MARTINGALE C%d]", martingale.currentCycle);
+            }
+            else if(allowUnlimitedBuying)
+            {
+               orderComment = "Grid Buy Resumed";
+               logPrefix = "[RESUMED]";
+            }
+            
+            PrintFormat("%s [%s] Price (%.5f) reached buy level (%.5f). Placing buy order (%d). TP: %.5f, Lot: %.2f",
+                       logPrefix, symbolData.name, currentAsk, nextBuyLevel, buyPositionsCount + 1, buyTpPrice, currentLotSize);
+            
+            if(!trade.Buy(currentLotSize, symbolData.name, currentAsk, 0, buyTpPrice, orderComment))
+            {
+               PrintFormat("[%s] Error placing grid buy order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage sell grid                                                  |
+//+------------------------------------------------------------------+
+void ManageSellGrid(SymbolData &symbolData, int sellPositionsCount, double highestSellPrice, double currentBid)
+{
+   double currentLotSize = GetCurrentLotSize(false);
+   
+   //--- If no sell positions exist, open the first sell order
+   if(sellPositionsCount == 0)
+   {
+      double sellTpPrice = NormalizeDouble(currentBid - symbolData.takeProfitPoints, symbolData.digits);
+      string orderComment = martingale.inMartingaleMode ? 
+                           StringFormat("Martingale Sell C%d", martingale.currentCycle) : "Initial Sell Grid";
+      
+      PrintFormat("[%s] No open sell positions. Placing initial sell order at market (Bid: %.5f), TP: %.5f, Lot: %.2f",
+                  symbolData.name, currentBid, sellTpPrice, currentLotSize);
+      if(!trade.Sell(currentLotSize, symbolData.name, currentBid, 0, sellTpPrice, orderComment))
+      {
+         PrintFormat("[%s] Error placing initial sell order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+      }
+      return;
+   }
+
+   //--- Check if we should place another sell order
+   int maxOrdersForPhase = martingale.inMartingaleMode ? MartingaleTriggerOrders : INT_MAX; // Unlimited in normal sell mode
+   
+   if(sellPositionsCount < maxOrdersForPhase)
+   {
+      double nextSellLevel = NormalizeDouble(highestSellPrice + symbolData.gridStepPoints, symbolData.digits);
+
+      // Check if price has risen above the next grid level
+      if(currentBid >= nextSellLevel - symbolData.pointValue)
+      {
+         // Check if an order already exists very close to this level to prevent duplicates
+         bool orderExistsNearLevel = false;
+         int totalPositions = PositionsTotal();
+         for(int i = totalPositions - 1; i >= 0; i--)
+         {
+            if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == symbolData.name && posInfo.PositionType() == POSITION_TYPE_SELL)
+            {
+               // Check if open price is within a small range of the target level
+               if(MathAbs(posInfo.PriceOpen() - nextSellLevel) < (symbolData.gridStepPoints / 2.0))
+               {
+                  orderExistsNearLevel = true;
+                  break;
+               }
+            }
+         }
+
+         if(!orderExistsNearLevel)
+         {
+            double sellTpPrice = NormalizeDouble(currentBid - symbolData.takeProfitPoints, symbolData.digits);
+            string orderComment = "Grid Sell";
+            string logPrefix = "[NORMAL]";
+            
+            if(martingale.inMartingaleMode)
+            {
+               orderComment = StringFormat("Martingale Sell C%d", martingale.currentCycle);
+               logPrefix = StringFormat("[MARTINGALE C%d]", martingale.currentCycle);
+            }
+            
+            PrintFormat("%s [%s] Price (%.5f) reached sell level (%.5f). Placing sell order (%d). TP: %.5f, Lot: %.2f",
+                       logPrefix, symbolData.name, currentBid, nextSellLevel, sellPositionsCount + 1, sellTpPrice, currentLotSize);
+            
+            if(!trade.Sell(currentLotSize, symbolData.name, currentBid, 0, sellTpPrice, orderComment))
+            {
+               PrintFormat("[%s] Error placing grid sell order: %d - %s", symbolData.name, trade.ResultRetcode(), trade.ResultComment());
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions for current symbol                           |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   int totalPositions = PositionsTotal();
+   PrintFormat("Fechando todas as posições para %s (Magic: %d)...", currentSymbol.name, MagicNumber);
+   
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
+      {
+         PrintFormat("Fechando posição #%d (%s %.2f @ %.5f) para %s",
+                     posInfo.Ticket(),
+                     (posInfo.PositionType() == POSITION_TYPE_BUY ? "Buy" : "Sell"),
+                     posInfo.Volume(),
+                     posInfo.PriceOpen(),
+                     currentSymbol.name);
+         if(!trade.PositionClose(posInfo.Ticket()))
+         {
+            PrintFormat("Erro fechando posição #%d: %d - %s", posInfo.Ticket(), trade.ResultRetcode(), trade.ResultComment());
+         }
+         else
+         {
+             PrintFormat("Posição #%d fechada com sucesso.", posInfo.Ticket());
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Reset entire system                                              |
+//+------------------------------------------------------------------+
+void ResetSystem()
+{
+   // Reset grid direction
+   currentGridDirection = GRID_BUY;
+   double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   buyZoneHighest = currentPrice;
+   sellZoneLowest = DBL_MAX;
+   
+   // Reset martingale system
+   InitializeMartingale();
+   
+   Print("*** SISTEMA RESETADO: Grid direction = COMPRA, Martingale = OFF ***");
+}
+
+//+------------------------------------------------------------------+
+//| Get symbol statistics                                             |
+//+------------------------------------------------------------------+
+void PrintSymbolStatistics()
+{
+   int buyPositions = 0;
+   int sellPositions = 0;
+   double totalVolume = 0;
+   double totalProfit = 0;
+   double totalBuyVolume = 0;
+   double totalSellVolume = 0;
+   
+   int totalPositions = PositionsTotal();
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i) && posInfo.Magic() == MagicNumber && posInfo.Symbol() == currentSymbol.name)
+      {
+         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+         {
+            buyPositions++;
+            totalBuyVolume += posInfo.Volume();
+         }
+         else
+         {
+            sellPositions++;
+            totalSellVolume += posInfo.Volume();
+         }
+         
+         totalVolume += posInfo.Volume();
+         totalProfit += posInfo.Profit();
+      }
+   }
+   
+   string direction = (currentGridDirection == GRID_BUY) ? "COMPRA" : "VENDA";
+   string zoneStatus = "";
+   if(currentGridDirection == GRID_BUY && sellZoneLowest < DBL_MAX)
+   {
+      zoneStatus = " (RETOMADA)";
+   }
+   
+   string martingaleInfo = "";
+   if(EnableMartingale && martingale.inMartingaleMode)
+   {
+      martingaleInfo = StringFormat(" | Martingale: %s C%d (Buy:%.2f/Sell:%.2f)", 
+                                   martingale.currentPhase, martingale.currentCycle,
+                                   martingale.currentBuyLotSize, martingale.currentSellLotSize);
+   }
+   
+   PrintFormat("[%s] Stats - Dir: %s%s | Buy: %d (Vol:%.2f) | Sell: %d (Vol:%.2f) | Profit: %.2f | Zone: %.5f%s",
+               currentSymbol.name, direction, zoneStatus, buyPositions, totalBuyVolume, 
+               sellPositions, totalSellVolume, totalProfit, buyZoneHighest, martingaleInfo);
+}
+
+//+------------------------------------------------------------------+
+//| Manual start function (can be called from script)               |
+//+------------------------------------------------------------------+
+void ManualStart()
+{
+   tradingActive = true;
+   Print("*** Trading ativado manualmente ***");
+}
+
+//+------------------------------------------------------------------+
+//| Manual stop function (can be called from script)                |
+//+------------------------------------------------------------------+
+void ManualStop()
+{
+   tradingActive = false;
+   Print("*** Trading desativado manualmente ***");
+}
+
+//+------------------------------------------------------------------+
+//| Reset grid system (can be called from script)                   |
+//+------------------------------------------------------------------+
+void ResetGrid()
+{
+   ResetSystem();
+}
+//+------------------------------------------------------------------+
