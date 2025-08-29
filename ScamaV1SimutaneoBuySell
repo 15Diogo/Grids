@@ -1,0 +1,206 @@
+//+------------------------------------------------------------------+
+//|         EA DualGrid Custom - by Diogo + ChatGPT                  |
+//+------------------------------------------------------------------+
+#property copyright "Diogo + ChatGPT"
+#property version   "1.04"
+#property strict
+#property description "Compras: a cada ±15 pips (lote 0.01, TP 15 pips)"
+#property description "Vendas: a cada alta de 30 pips (lote 0.02, TP 30 pips)"
+
+#include <Trade/Trade.mqh>
+CTrade Trade;
+
+// ===================== Inputs =====================
+input string   InpSymbol              = "";          // ("" = símbolo atual)
+input double   InpLotBuy              = 0.01;        // Lote das compras (±15 pips)
+input double   InpLotSell             = 0.02;        // Lote das vendas (alta 30 pips)
+input int      InpBuyStepPips         = 15;          // Passo p/ compras
+input int      InpSellStepPips        = 30;          // Passo p/ vendas (apenas na alta)
+input int      InpBuyTP_Pips          = 15;          // Take Profit compras
+input int      InpSellTP_Pips         = 30;          // Take Profit vendas
+input int      InpSlippagePoints      = 3;           // Desvio máximo (points)
+input int      InpMaxOrders           = 20;          // Máx ordens abertas pelo EA (0 = ilimitado)
+input bool     InpOnlyOnePerStep      = true;        // Evitar múltiplas ordens no mesmo tick
+input bool     InpShowPanel           = true;        // Mostrar painel
+
+// ===================== Constantes =====================
+const long MAGIC_BUY_15  = 15150001;
+const long MAGIC_SELL_30 = 30300002;
+
+// ===================== Variáveis =====================
+double buy_anchor  = 0.0; // preço-âncora p/ compras
+double sell_anchor = 0.0; // preço-âncora p/ vendas
+datetime last_trade_time_buy  = 0;
+datetime last_trade_time_sell = 0;
+
+// ===================== Utilidades =====================
+string Sym() { return (InpSymbol=="" ? _Symbol : InpSymbol); }
+int    DigitsOfSymbol() { return (int)SymbolInfoInteger(Sym(), SYMBOL_DIGITS); }
+double PointOfSymbol() { return SymbolInfoDouble(Sym(), SYMBOL_POINT); }
+
+// 1 pip em preço
+double PipSize()
+{
+   int d = DigitsOfSymbol();
+   double p = PointOfSymbol();
+   if(d==3 || d==5) return 10.0*p;
+   return p;
+}
+
+double PipsToPrice(const double pips) { return pips * PipSize(); }
+
+double NormalizeVolume(double lots)
+{
+   double minlot  = SymbolInfoDouble(Sym(), SYMBOL_VOLUME_MIN);
+   double maxlot  = SymbolInfoDouble(Sym(), SYMBOL_VOLUME_MAX);
+   double step    = SymbolInfoDouble(Sym(), SYMBOL_VOLUME_STEP);
+   lots = MathMax(minlot, MathMin(maxlot, lots));
+   return MathRound(lots/step)*step;
+}
+
+int CountOpenByMagic(long magic1, long magic2)
+{
+   int total=0;
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         string s; long m;
+         PositionGetString(POSITION_SYMBOL, s);
+         PositionGetInteger(POSITION_MAGIC, m);
+         if(s==Sym() && (m==magic1 || m==magic2)) total++;
+      }
+   }
+   return total;
+}
+
+// ===================== Inicialização =====================
+int OnInit()
+{
+   if(!SymbolSelect(Sym(), true))
+   {
+      Print("[ERRO] Não foi possível selecionar símbolo ", Sym());
+      return(INIT_FAILED);
+   }
+
+   double bid=0, ask=0;
+   SymbolInfoDouble(Sym(), SYMBOL_BID, bid);
+   SymbolInfoDouble(Sym(), SYMBOL_ASK, ask);
+
+   double mid = (bid+ask)/2.0;
+   buy_anchor  = mid;
+   sell_anchor = mid;
+
+   PrintFormat("[Init] %s pip=%.5f | buy_anchor=%.5f | sell_anchor=%.5f",
+               Sym(), PipSize(), buy_anchor, sell_anchor);
+
+   return(INIT_SUCCEEDED);
+}
+
+// ===================== Lógica principal =====================
+void OnTick()
+{
+   // Limite de ordens
+   if(InpMaxOrders>0)
+   {
+      int openEA = CountOpenByMagic(MAGIC_BUY_15, MAGIC_SELL_30);
+      if(openEA >= InpMaxOrders) { if(InpShowPanel) DrawInfo(); return; }
+   }
+
+   double bid=0, ask=0;
+   if(!SymbolInfoDouble(Sym(), SYMBOL_BID, bid)) return;
+   if(!SymbolInfoDouble(Sym(), SYMBOL_ASK, ask)) return;
+
+   // --------- Compras (±15 pips) ---------
+   double buyStep = PipsToPrice(InpBuyStepPips);
+   if(MathAbs(ask - buy_anchor) >= buyStep)
+   {
+      if(!(InpOnlyOnePerStep && last_trade_time_buy == TimeCurrent()))
+      {
+         double volume   = NormalizeVolume(InpLotBuy);
+         double tp_price = ask + PipsToPrice(InpBuyTP_Pips);
+
+         Trade.SetExpertMagicNumber(MAGIC_BUY_15);
+         Trade.SetDeviationInPoints(InpSlippagePoints);
+
+         if(Trade.Buy(volume, Sym(), ask, 0.0, tp_price))
+         {
+            last_trade_time_buy = TimeCurrent();
+            buy_anchor = ask; // redefine âncora no preço atual
+            PrintFormat("[BUY-15] ticket=%I64u @%.5f TP=%.5f | novo buy_anchor=%.5f",
+                        Trade.ResultOrder(), ask, tp_price, buy_anchor);
+         }
+         else
+            PrintFormat("[ERRO BUY] %d - %s", GetLastError(), ErrorDescription(GetLastError()));
+      }
+   }
+
+   // --------- Vendas (cada alta de 30 pips) ---------
+   double sellStep = PipsToPrice(InpSellStepPips);
+   if(ask >= sell_anchor + sellStep)
+   {
+      if(!(InpOnlyOnePerStep && last_trade_time_sell == TimeCurrent()))
+      {
+         double volume   = NormalizeVolume(InpLotSell);
+         double tp_price = bid - PipsToPrice(InpSellTP_Pips);
+
+         Trade.SetExpertMagicNumber(MAGIC_SELL_30);
+         Trade.SetDeviationInPoints(InpSlippagePoints);
+
+         if(Trade.Sell(volume, Sym(), bid, 0.0, tp_price))
+         {
+            last_trade_time_sell = TimeCurrent();
+            // ✅ incrementa o anchor em passos de 30 pips
+            sell_anchor += sellStep;
+
+            PrintFormat("[SELL-30-UP] ticket=%I64u @%.5f TP=%.5f | novo sell_anchor=%.5f",
+                        Trade.ResultOrder(), bid, tp_price, sell_anchor);
+         }
+         else
+            PrintFormat("[ERRO SELL] %d - %s", GetLastError(), ErrorDescription(GetLastError()));
+      }
+   }
+
+   if(InpShowPanel) DrawInfo();
+}
+
+// ===================== Painel =====================
+void DrawInfo()
+{
+   string name = "DG15_30_INFO";
+   if(!ObjectFind(0, name))
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+
+   string txt = StringFormat(
+      "EA Custom 15/30\n"
+      "Símbolo: %s | Digits: %d | Pip: %.5f\n"
+      "Buy step: %d pips | TP: %d pips | Lote: %.2f\n"
+      "Sell step: %d pips (só na alta) | TP: %d pips | Lote: %.2f\n"
+      "buy_anchor: %.5f | sell_anchor: %.5f\n"
+      "Ordens EA abertas: %d / %d",
+      Sym(), DigitsOfSymbol(), PipSize(),
+      InpBuyStepPips, InpBuyTP_Pips, InpLotBuy,
+      InpSellStepPips, InpSellTP_Pips, InpLotSell,
+      buy_anchor, sell_anchor,
+      CountOpenByMagic(MAGIC_BUY_15, MAGIC_SELL_30),
+      (InpMaxOrders==0 ? -1 : InpMaxOrders)
+   );
+
+   ObjectSetString(0, name, OBJPROP_TEXT, txt);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 15);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 10);
+}
+
+// ===================== Erros =====================
+string ErrorDescription(int code)
+{
+   switch(code)
+   {
+      case 0: return "No error";
+      case 4756: return "Trade is disabled (mercado fechado ou símbolo proibido)";
+      default: return IntegerToString(code);
+   }
+}
