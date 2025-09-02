@@ -2,10 +2,10 @@
 //|         EA DualGrid Custom - by Diogo + ChatGPT                  |
 //+------------------------------------------------------------------+
 #property copyright "Diogo + ChatGPT"
-#property version   "1.06"
+#property version   "1.07"
 #property strict
 #property description "Compras: a cada ±15 pips (múltiplas ordens por grid)"
-#property description "Vendas: a cada alta de 30 pips (múltiplas ordens por grid)"
+#property description "Vendas: a cada ±30 pips (alta ou baixa - múltiplas ordens por grid)"
 
 #include <Trade/Trade.mqh>
 CTrade Trade;
@@ -13,15 +13,15 @@ CTrade Trade;
 // ===================== Inputs =====================
 input string   InpSymbol              = "";          // ("" = símbolo atual)
 input double   InpLotBuy              = 0.01;        // Lote das compras (±15 pips)
-input double   InpLotSell             = 0.02;        // Lote das vendas (alta 30 pips)
-input int      InpBuyStepPips         = 15;          // Passo p/ compras
-input int      InpSellStepPips        = 30;          // Passo p/ vendas (apenas na alta)
-input int      InpBuyTP_Pips          = 15;          // Take Profit compras
-input int      InpSellTP_Pips         = 30;          // Take Profit vendas
+input double   InpLotSell             = 0.03;        // Lote das vendas (±30 pips)
+input int      InpBuyStepPips         = 30;          // Passo p/ compras
+input int      InpSellStepPips        = 120;          // Passo p/ vendas (alta ou baixa)
+input int      InpBuyTP_Pips          = 30;          // Take Profit compras
+input int      InpSellTP_Pips         = 120;          // Take Profit vendas
 input int      InpSlippagePoints      = 3;           // Desvio máximo (points)
-input int      InpMaxBuyOrders        = 10;          // Máx ordens de COMPRA (0 = ilimitado)
-input int      InpMaxSellOrders       = 10;          // Máx ordens de VENDA (0 = ilimitado)
-input bool     InpOnlyOnePerStep      = true;        // Evitar múltiplas ordens no mesmo tick
+input int      InpMaxBuyOrders        = 1000;          // Máx ordens de COMPRA (0 = ilimitado)
+input int      InpMaxSellOrders       = 4;          // Máx ordens de VENDA (0 = ilimitado)
+input bool     InpOnlyOnePerStep      = false;        // Evitar múltiplas ordens no mesmo tick
 input bool     InpShowPanel           = true;        // Mostrar painel
 
 // ============= NOVOS INPUTS PARA MÚLTIPLAS ORDENS =============
@@ -167,8 +167,8 @@ void PlaceMultipleBuyOrders(double basePrice)
    PrintFormat("[BUY GRID COMPLETO] %d ordens lançadas | novo buy_anchor=%.5f", ordersToPlace, buy_anchor);
 }
 
-// ===================== NOVA FUNÇÃO: Lançar múltiplas ordens SELL =====================
-void PlaceMultipleSellOrders(double basePrice)
+// ===================== FUNÇÃO MODIFICADA: Lançar múltiplas ordens SELL =====================
+void PlaceMultipleSellOrders(double basePrice, bool isUpMove)
 {
    // Verifica limite de ordens de venda
    if(InpMaxSellOrders > 0)
@@ -198,6 +198,8 @@ void PlaceMultipleSellOrders(double basePrice)
    
    if(ordersToPlace <= 0) return;
    
+   string direction = isUpMove ? "ALTA" : "BAIXA";
+   
    for(int i = 0; i < ordersToPlace; i++)
    {
       double orderPrice = basePrice - (i * spacing);
@@ -209,8 +211,8 @@ void PlaceMultipleSellOrders(double basePrice)
       
       if(Trade.Sell(volume, Sym(), orderPrice, 0.0, tp_price))
       {
-         PrintFormat("[SELL-30] Grid %d/%d - ticket=%I64u @%.5f lot=%.3f TP=%.5f", 
-                     i+1, ordersToPlace, Trade.ResultOrder(), orderPrice, volume, tp_price);
+         PrintFormat("[SELL-30 %s] Grid %d/%d - ticket=%I64u @%.5f lot=%.3f TP=%.5f", 
+                     direction, i+1, ordersToPlace, Trade.ResultOrder(), orderPrice, volume, tp_price);
       }
       else
       {
@@ -218,10 +220,11 @@ void PlaceMultipleSellOrders(double basePrice)
       }
    }
    
-   // ✅ incrementa o anchor em passos de 30 pips
-   sell_anchor += PipsToPrice(InpSellStepPips);
+   // Atualiza o anchor baseado na direção do movimento
+   sell_anchor = basePrice;
    last_trade_time_sell = TimeCurrent();
-   PrintFormat("[SELL GRID COMPLETO] %d ordens lançadas | novo sell_anchor=%.5f", ordersToPlace, sell_anchor);
+   PrintFormat("[SELL GRID %s COMPLETO] %d ordens lançadas | novo sell_anchor=%.5f", 
+               direction, ordersToPlace, sell_anchor);
 }
 
 // ===================== Inicialização =====================
@@ -257,11 +260,12 @@ int OnInit()
                MathMax(1, MathMin(10, InpBuyOrdersPerGrid)), InpMaxBuyOrders,
                MathMax(1, MathMin(10, InpSellOrdersPerGrid)), InpMaxSellOrders,
                InpOrderSpacingPips);
+   PrintFormat("[Vendas] Acionamento bidirecional: ±%d pips do anchor", InpSellStepPips);
 
    return(INIT_SUCCEEDED);
 }
 
-// ===================== Lógica principal =====================
+// ===================== Lógica principal MODIFICADA =====================
 void OnTick()
 {
    double bid=0, ask=0;
@@ -278,20 +282,30 @@ void OnTick()
       }
    }
 
-   // --------- Vendas (cada alta de 30 pips) ---------
+   // --------- VENDAS MODIFICADO: Agora funciona tanto na alta quanto na baixa (±30 pips) ---------
    double sellStep = PipsToPrice(InpSellStepPips);
-   if(ask >= sell_anchor + sellStep)
+   
+   // Verifica movimento para CIMA (alta)
+   if(bid >= sell_anchor + sellStep)
    {
       if(!(InpOnlyOnePerStep && last_trade_time_sell == TimeCurrent()))
       {
-         PlaceMultipleSellOrders(bid);
+         PlaceMultipleSellOrders(bid, true); // true = movimento de alta
+      }
+   }
+   // Verifica movimento para BAIXO (queda)
+   else if(bid <= sell_anchor - sellStep)
+   {
+      if(!(InpOnlyOnePerStep && last_trade_time_sell == TimeCurrent()))
+      {
+         PlaceMultipleSellOrders(bid, false); // false = movimento de baixa
       }
    }
 
    if(InpShowPanel) DrawInfo();
 }
 
-// ===================== Painel =====================
+// ===================== Painel ATUALIZADO =====================
 void DrawInfo()
 {
    string name = "DG15_30_INFO";
@@ -301,14 +315,23 @@ void DrawInfo()
    int buyOrders = CountOpenByMagicAndType(MAGIC_BUY_15, POSITION_TYPE_BUY);
    int sellOrders = CountOpenByMagicAndType(MAGIC_SELL_30, POSITION_TYPE_SELL);
    int totalOrders = buyOrders + sellOrders;
+   
+   double bid=0, ask=0;
+   SymbolInfoDouble(Sym(), SYMBOL_BID, bid);
+   SymbolInfoDouble(Sym(), SYMBOL_ASK, ask);
+   
+   double sellStep = PipsToPrice(InpSellStepPips);
+   double distanceUp = (bid - sell_anchor) / PipSize();
+   double distanceDown = (sell_anchor - bid) / PipSize();
 
    string txt = StringFormat(
-      "EA Custom 15/30 Multi-Grid v1.06\n"
+      "EA Custom v1.07 - Grid Bidirecional\n"
       "Símbolo: %s | Digits: %d | Pip: %.5f\n"
-      "Buy: %d pips step | %d ordens/grid | TP: %d pips | Lote: %.2f\n"
-      "Sell: %d pips step | %d ordens/grid | TP: %d pips | Lote: %.2f\n"
+      "Buy: ±%d pips | %d ordens/grid | TP: %d pips | Lote: %.2f\n"
+      "Sell: ±%d pips | %d ordens/grid | TP: %d pips | Lote: %.2f\n"
       "Espaçamento: %d pips | Multiplicador: %.2f (%s)\n"
       "buy_anchor: %.5f | sell_anchor: %.5f\n"
+      "Distância p/ próx venda: ↑%.1f pips | ↓%.1f pips\n"
       "Ordens Abertas:\n"
       "  • Compras: %d / %s\n"
       "  • Vendas: %d / %s\n"
@@ -318,6 +341,7 @@ void DrawInfo()
       InpSellStepPips, MathMax(1, MathMin(10, InpSellOrdersPerGrid)), InpSellTP_Pips, InpLotSell,
       InpOrderSpacingPips, InpLotMultiplier, (InpUseMultiplierLot ? "ON" : "OFF"),
       buy_anchor, sell_anchor,
+      InpSellStepPips - distanceUp, InpSellStepPips + distanceDown,
       buyOrders, (InpMaxBuyOrders==0 ? "∞" : IntegerToString(InpMaxBuyOrders)),
       sellOrders, (InpMaxSellOrders==0 ? "∞" : IntegerToString(InpMaxSellOrders)),
       totalOrders
