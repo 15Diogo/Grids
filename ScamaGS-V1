@@ -1,0 +1,442 @@
+//+------------------------------------------------------------------+
+//|         EA DualGrid Custom - by Diogo + ChatGPT                  |
+//+------------------------------------------------------------------+
+#property copyright "Diogo + ChatGPT"
+#property version   "1.08"
+#property strict
+#property description "Compras: a cada ±15 pips (múltiplas ordens por grid)"
+#property description "Vendas: a cada ±30 pips (alta ou baixa - múltiplas ordens por grid)"
+
+#include <Trade/Trade.mqh>
+CTrade Trade;
+
+// ===================== Inputs =====================
+input string   InpSymbol              = "";          // ("" = símbolo atual)
+input double   InpLotBuy              = 0.01;        // Lote das compras (±15 pips)
+input double   InpLotSell             = 0.03;        // Lote das vendas (±30 pips)
+input int      InpBuyStepPips         = 200;          // Passo p/ compras
+input int      InpSellStepPips        = 1000;          // Passo p/ vendas (alta ou baixa)
+input int      InpBuyTP_Pips          = 200;          // Take Profit compras
+input int      InpSellTP_Pips         = 1000;          // Take Profit vendas
+input int      InpSlippagePoints      = 3;           // Desvio máximo (points)
+input int      InpMaxBuyOrders        = 1000;          // Máx ordens de COMPRA (0 = ilimitado)
+input int      InpMaxSellOrders       = 4;          // Máx ordens de VENDA (0 = ilimitado)
+input bool     InpOnlyOnePerStep      = false;        // Evitar múltiplas ordens no mesmo tick
+input bool     InpShowPanel           = true;        // Mostrar painel
+input int      InpBuyOrdersPerGrid    = 1;           // Qtd de ordens BUY por grid (1-10)
+input int      InpSellOrdersPerGrid   = 1;           // Qtd de ordens SELL por grid (1-10)
+input bool     InpUseMultiplierLot    = false;       // Usar multiplicador de lote
+input double   InpLotMultiplier       = 1.5;         // Multiplicador para ordens subsequentes
+input int      InpOrderSpacingPips    = 2;           // Espaçamento entre ordens do mesmo grid (pips)
+
+// ===================== Constantes =====================
+const long MAGIC_BUY_15  = 15150001;
+const long MAGIC_SELL_30 = 30300002;
+
+// ===================== Variáveis =====================
+double buy_anchor  = 0.0;
+double sell_anchor = 0.0;
+datetime last_trade_time_buy  = 0;
+datetime last_trade_time_sell = 0;
+
+// ===================== Utilidades =====================
+string Sym() { return (InpSymbol=="" ? _Symbol : InpSymbol); }
+int    DigitsOfSymbol() { return (int)SymbolInfoInteger(Sym(), SYMBOL_DIGITS); }
+double PointOfSymbol() { return SymbolInfoDouble(Sym(), SYMBOL_POINT); }
+
+double PipSize()
+{
+   int d = DigitsOfSymbol();
+   double p = PointOfSymbol();
+   if(d==3 || d==5) return 10.0*p;
+   return p;
+}
+
+double PipsToPrice(const double pips) { return pips * PipSize(); }
+
+double NormalizeVolume(double lots)
+{
+   double minlot  = SymbolInfoDouble(Sym(), SYMBOL_VOLUME_MIN);
+   double maxlot  = SymbolInfoDouble(Sym(), SYMBOL_VOLUME_MAX);
+   double step    = SymbolInfoDouble(Sym(), SYMBOL_VOLUME_STEP);
+   lots = MathMax(minlot, MathMin(maxlot, lots));
+   return MathRound(lots/step)*step;
+}
+
+int CountOpenByMagicAndType(long magic, ENUM_POSITION_TYPE posType)
+{
+   int total=0;
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         string s = PositionGetString(POSITION_SYMBOL);
+         long m = PositionGetInteger(POSITION_MAGIC);
+         ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+         
+         if(s==Sym() && m==magic && type==posType) total++;
+      }
+   }
+   return total;
+}
+
+int CountOpenByMagic(long magic1, long magic2)
+{
+   int total=0;
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         string s = PositionGetString(POSITION_SYMBOL);
+         long m = PositionGetInteger(POSITION_MAGIC);
+         if(s==Sym() && (m==magic1 || m==magic2)) total++;
+      }
+   }
+   return total;
+}
+
+double CalculateLotSize(double baseLot, int orderIndex)
+{
+   if(!InpUseMultiplierLot || orderIndex == 0) 
+      return baseLot;
+   
+   double calculatedLot = baseLot * MathPow(InpLotMultiplier, orderIndex);
+   return NormalizeVolume(calculatedLot);
+}
+
+void PlaceMultipleBuyOrders(double basePrice)
+{
+   if(InpMaxBuyOrders > 0)
+   {
+      int currentBuyOrders = CountOpenByMagicAndType(MAGIC_BUY_15, POSITION_TYPE_BUY);
+      if(currentBuyOrders >= InpMaxBuyOrders)
+      {
+         PrintFormat("[LIMITE BUY] Já existem %d/%d ordens de compra abertas", currentBuyOrders, InpMaxBuyOrders);
+         return;
+      }
+   }
+
+   int ordersToPlace = MathMax(1, MathMin(10, InpBuyOrdersPerGrid));
+   double spacing = PipsToPrice(InpOrderSpacingPips);
+   
+   if(InpMaxBuyOrders > 0)
+   {
+      int currentBuyOrders = CountOpenByMagicAndType(MAGIC_BUY_15, POSITION_TYPE_BUY);
+      int remainingSlots = InpMaxBuyOrders - currentBuyOrders;
+      if(ordersToPlace > remainingSlots)
+      {
+         ordersToPlace = remainingSlots;
+         PrintFormat("[AJUSTE BUY] Reduzindo para %d ordens para não ultrapassar limite", ordersToPlace);
+      }
+   }
+   
+   if(ordersToPlace <= 0) return;
+   
+   for(int i = 0; i < ordersToPlace; i++)
+   {
+      double orderPrice = basePrice + (i * spacing);
+      double volume = CalculateLotSize(InpLotBuy, i);
+      double tp_price = orderPrice + PipsToPrice(InpBuyTP_Pips);
+      
+      Trade.SetExpertMagicNumber(MAGIC_BUY_15);
+      Trade.SetDeviationInPoints(InpSlippagePoints);
+      
+      if(Trade.Buy(volume, Sym(), orderPrice, 0.0, tp_price))
+      {
+         PrintFormat("[BUY-15] Grid %d/%d - ticket=%I64u @%.5f lot=%.3f TP=%.5f", 
+                     i+1, ordersToPlace, Trade.ResultOrder(), orderPrice, volume, tp_price);
+      }
+      else
+      {
+         PrintFormat("[ERRO BUY %d/%d] %d - %s", i+1, ordersToPlace, GetLastError(), ErrorDescription(GetLastError()));
+      }
+   }
+   
+   buy_anchor = basePrice;
+   last_trade_time_buy = TimeCurrent();
+   PrintFormat("[BUY GRID COMPLETO] %d ordens lançadas | novo buy_anchor=%.5f", ordersToPlace, buy_anchor);
+}
+
+void PlaceMultipleSellOrders(double basePrice, bool isUpMove)
+{
+   if(InpMaxSellOrders > 0)
+   {
+      int currentSellOrders = CountOpenByMagicAndType(MAGIC_SELL_30, POSITION_TYPE_SELL);
+      if(currentSellOrders >= InpMaxSellOrders)
+      {
+         PrintFormat("[LIMITE SELL] Já existem %d/%d ordens de venda abertas", currentSellOrders, InpMaxSellOrders);
+         return;
+      }
+   }
+
+   int ordersToPlace = MathMax(1, MathMin(10, InpSellOrdersPerGrid));
+   double spacing = PipsToPrice(InpOrderSpacingPips);
+   
+   if(InpMaxSellOrders > 0)
+   {
+      int currentSellOrders = CountOpenByMagicAndType(MAGIC_SELL_30, POSITION_TYPE_SELL);
+      int remainingSlots = InpMaxSellOrders - currentSellOrders;
+      if(ordersToPlace > remainingSlots)
+      {
+         ordersToPlace = remainingSlots;
+         PrintFormat("[AJUSTE SELL] Reduzindo para %d ordens para não ultrapassar limite", ordersToPlace);
+      }
+   }
+   
+   if(ordersToPlace <= 0) return;
+   
+   string direction = isUpMove ? "ALTA" : "BAIXA";
+   
+   for(int i = 0; i < ordersToPlace; i++)
+   {
+      double orderPrice = basePrice - (i * spacing);
+      double volume = CalculateLotSize(InpLotSell, i);
+      double tp_price = orderPrice - PipsToPrice(InpSellTP_Pips);
+      
+      Trade.SetExpertMagicNumber(MAGIC_SELL_30);
+      Trade.SetDeviationInPoints(InpSlippagePoints);
+      
+      if(Trade.Sell(volume, Sym(), orderPrice, 0.0, tp_price))
+      {
+         PrintFormat("[SELL-30 %s] Grid %d/%d - ticket=%I64u @%.5f lot=%.3f TP=%.5f", 
+                     direction, i+1, ordersToPlace, Trade.ResultOrder(), orderPrice, volume, tp_price);
+      }
+      else
+      {
+         PrintFormat("[ERRO SELL %d/%d] %d - %s", i+1, ordersToPlace, GetLastError(), ErrorDescription(GetLastError()));
+      }
+   }
+   
+   sell_anchor = basePrice;
+   last_trade_time_sell = TimeCurrent();
+   PrintFormat("[SELL GRID %s COMPLETO] %d ordens lançadas | novo sell_anchor=%.5f", 
+               direction, ordersToPlace, sell_anchor);
+}
+
+int OnInit()
+{
+   if(!SymbolSelect(Sym(), true))
+   {
+      Print("[ERRO] Não foi possível selecionar símbolo ", Sym());
+      return(INIT_FAILED);
+   }
+
+   if(InpBuyOrdersPerGrid < 1 || InpBuyOrdersPerGrid > 10)
+   {
+      PrintFormat("[AVISO] InpBuyOrdersPerGrid (%d) ajustado para 1", InpBuyOrdersPerGrid);
+   }
+   
+   if(InpSellOrdersPerGrid < 1 || InpSellOrdersPerGrid > 10)
+   {
+      PrintFormat("[AVISO] InpSellOrdersPerGrid (%d) ajustado para 1", InpSellOrdersPerGrid);
+   }
+
+   double bid=0, ask=0;
+   SymbolInfoDouble(Sym(), SYMBOL_BID, bid);
+   SymbolInfoDouble(Sym(), SYMBOL_ASK, ask);
+
+   double mid = (bid+ask)/2.0;
+   buy_anchor  = mid;
+   sell_anchor = mid;
+
+   PrintFormat("[Init] %s pip=%.5f | buy_anchor=%.5f | sell_anchor=%.5f", Sym(), PipSize(), buy_anchor, sell_anchor);
+   PrintFormat("[Config] Buy: %d ordens/grid (máx: %d) | Sell: %d ordens/grid (máx: %d) | Espaçamento: %d pips", 
+               MathMax(1, MathMin(10, InpBuyOrdersPerGrid)), InpMaxBuyOrders,
+               MathMax(1, MathMin(10, InpSellOrdersPerGrid)), InpMaxSellOrders,
+               InpOrderSpacingPips);
+   PrintFormat("[Vendas] Acionamento bidirecional: ±%d pips do anchor", InpSellStepPips);
+
+   return(INIT_SUCCEEDED);
+}
+
+void OnTick()
+{
+   double bid=0, ask=0;
+   if(!SymbolInfoDouble(Sym(), SYMBOL_BID, bid)) return;
+   if(!SymbolInfoDouble(Sym(), SYMBOL_ASK, ask)) return;
+
+   double buyStep = PipsToPrice(InpBuyStepPips);
+   if(MathAbs(ask - buy_anchor) >= buyStep)
+   {
+      if(!(InpOnlyOnePerStep && last_trade_time_buy == TimeCurrent()))
+      {
+         PlaceMultipleBuyOrders(ask);
+      }
+   }
+
+   double sellStep = PipsToPrice(InpSellStepPips);
+   
+   if(bid >= sell_anchor + sellStep)
+   {
+      if(!(InpOnlyOnePerStep && last_trade_time_sell == TimeCurrent()))
+      {
+         PlaceMultipleSellOrders(bid, true);
+      }
+   }
+   else if(bid <= sell_anchor - sellStep)
+   {
+      if(!(InpOnlyOnePerStep && last_trade_time_sell == TimeCurrent()))
+      {
+         PlaceMultipleSellOrders(bid, false);
+      }
+   }
+
+   if(InpShowPanel) DrawModernPanel();
+}
+
+void OnDeinit(const int reason)
+{
+   ObjectDelete(0, "DG_Panel_BG");
+   ObjectDelete(0, "DG_Panel_Header");
+   ObjectDelete(0, "DG_Panel_Title");
+   ObjectDelete(0, "DG_Panel_Version");
+   ObjectDelete(0, "DG_Panel_Info");
+   ObjectDelete(0, "DG_Panel_BuyBox");
+   ObjectDelete(0, "DG_Panel_SellBox");
+   ObjectDelete(0, "DG_Panel_StatsBox");
+   ChartRedraw();
+}
+
+// ===================== PAINEL MODERNIZADO =====================
+void DrawModernPanel()
+{
+   int x = 15;
+   int y = 20;
+   int width = 320;
+   int headerHeight = 60;
+   int sectionHeight = 95;
+   int margin = 8;
+   
+   // Cores modernas
+   color bgColor = C'25,25,35';
+   color headerColor = C'35,45,65';
+   color buyColor = C'30,100,80';
+   color sellColor = C'140,50,50';
+   color textColor = clrWhite;
+   color accentColor = C'70,130,255';
+   
+   int buyOrders = CountOpenByMagicAndType(MAGIC_BUY_15, POSITION_TYPE_BUY);
+   int sellOrders = CountOpenByMagicAndType(MAGIC_SELL_30, POSITION_TYPE_SELL);
+   
+   double bid=0, ask=0;
+   SymbolInfoDouble(Sym(), SYMBOL_BID, bid);
+   SymbolInfoDouble(Sym(), SYMBOL_ASK, ask);
+   
+   double distanceUp = (bid - sell_anchor) / PipSize();
+   double distanceDown = (sell_anchor - bid) / PipSize();
+   double buyDistance = (ask - buy_anchor) / PipSize();
+   
+   // Fundo principal
+   CreateRectangle("DG_Panel_BG", x, y, width, headerHeight + (sectionHeight * 3) + (margin * 4), bgColor, 2, clrGray);
+   
+   // Header
+   CreateRectangle("DG_Panel_Header", x, y, width, headerHeight, headerColor, 0, headerColor);
+   
+   // Título
+   CreateLabel("DG_Panel_Title", x + 15, y + 12, "⚡ DUALGRID TRADING", clrWhite, 11, "Arial Black");
+   CreateLabel("DG_Panel_Version", x + 15, y + 35, "v1.08 • " + Sym() + " • Pip: " + DoubleToString(PipSize(), 5), accentColor, 8, "Arial");
+   
+   // Box de Compras (BUY)
+   int buyY = y + headerHeight + margin;
+   CreateRectangle("DG_Panel_BuyBox", x, buyY, width, sectionHeight, buyColor, 1, C'50,150,120');
+   
+   string buyInfo = StringFormat(
+      "🔼 COMPRAS - Grid %.0f pips\n"
+      "━━━━━━━━━━━━━━━━━━━━━\n"
+      "Ordens: %d / %s  •  Lote: %.2f\n"
+      "Ordens/Grid: %d  •  TP: %d pips\n"
+      "Distância: %.1f pips  •  Anchor: %.5f",
+      (double)InpBuyStepPips,
+      buyOrders, (InpMaxBuyOrders==0 ? "∞" : IntegerToString(InpMaxBuyOrders)),
+      InpLotBuy,
+      MathMax(1, MathMin(10, InpBuyOrdersPerGrid)),
+      InpBuyTP_Pips,
+      MathAbs(buyDistance),
+      buy_anchor
+   );
+   CreateLabel("DG_Panel_BuyInfo", x + 12, buyY + 8, buyInfo, textColor, 8, "Consolas");
+   
+   // Box de Vendas (SELL)
+   int sellY = buyY + sectionHeight + margin;
+   CreateRectangle("DG_Panel_SellBox", x, sellY, width, sectionHeight, sellColor, 1, C'180,70,70');
+   
+   string sellInfo = StringFormat(
+      "🔽 VENDAS - Grid %.0f pips (±)\n"
+      "━━━━━━━━━━━━━━━━━━━━━\n"
+      "Ordens: %d / %s  •  Lote: %.2f\n"
+      "Ordens/Grid: %d  •  TP: %d pips\n"
+      "Próx: ↑%.1f | ↓%.1f  •  Anchor: %.5f",
+      (double)InpSellStepPips,
+      sellOrders, (InpMaxSellOrders==0 ? "∞" : IntegerToString(InpMaxSellOrders)),
+      InpLotSell,
+      MathMax(1, MathMin(10, InpSellOrdersPerGrid)),
+      InpSellTP_Pips,
+      InpSellStepPips - distanceUp,
+      InpSellStepPips + distanceDown,
+      sell_anchor
+   );
+   CreateLabel("DG_Panel_SellInfo", x + 12, sellY + 8, sellInfo, textColor, 8, "Consolas");
+   
+   // Box de Estatísticas
+   int statsY = sellY + sectionHeight + margin;
+   CreateRectangle("DG_Panel_StatsBox", x, statsY, width, sectionHeight, C'40,50,70', 1, accentColor);
+   
+   string statsInfo = StringFormat(
+      "📊 CONFIGURAÇÕES & STATUS\n"
+      "━━━━━━━━━━━━━━━━━━━━━\n"
+      "Espaçamento: %d pips  •  Mult: %.2f %s\n"
+      "Total Ordens: %d  •  Bid: %.5f\n"
+      "Ask: %.5f  •  Spread: %.1f pips",
+      InpOrderSpacingPips,
+      InpLotMultiplier,
+      (InpUseMultiplierLot ? "✓" : "✗"),
+      buyOrders + sellOrders,
+      bid,
+      ask,
+      (ask - bid) / PipSize()
+   );
+   CreateLabel("DG_Panel_StatsInfo", x + 12, statsY + 8, statsInfo, textColor, 8, "Consolas");
+}
+
+void CreateRectangle(string name, int x, int y, int width, int height, color bgColor, int borderWidth, color borderColor)
+{
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bgColor);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, borderWidth);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, borderColor);
+   ObjectSetInteger(0, name, OBJPROP_BACK, true);
+}
+
+void CreateLabel(string name, int x, int y, string text, color clr, int fontSize, string font)
+{
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetString(0, name, OBJPROP_FONT, font);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+}
+
+string ErrorDescription(int code)
+{
+   switch(code)
+   {
+      case 0: return "No error";
+      case 4756: return "Trade is disabled (mercado fechado ou símbolo proibido)";
+      default: return IntegerToString(code);
+   }
+}
