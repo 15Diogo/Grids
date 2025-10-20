@@ -1,0 +1,428 @@
+//+------------------------------------------------------------------+
+//|                                      GridFractalXAU_Adaptive.mq5 |
+//|                    Estratégia: Grid adaptativo com reversão      |
+//|   Lógica: Alterna entre BUY e SELL baseado em níveis anteriores  |
+//|   Aumenta lote para 0.02 após certas condições                   |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "2.00"
+#property description "EA de grid adaptativo que alterna direção baseado em níveis anteriores."
+
+#include <Trade/Trade.mqh>
+#include <Trade/PositionInfo.mqh>
+
+CTrade Trade;
+CPositionInfo PositionInfo;
+
+// ============================= Inputs ============================= //
+input string Inp____Geral        = "==== Geral ====";
+input long   InpMagic            = 20250816;    // Magic Number
+input int    InpSlippage         = 5;           // Slippage máximo (points)
+
+input string Inp____Pipagem      = "==== Pipagem ====";
+input int    InpPipInPoints      = 10;          // Quantos points valem 1 pip (padrão ouro: 10)
+
+input string Inp____Strategy     = "==== Estratégia Adaptativa ====";
+input double InpInitialLot       = 0.01;        // Lote inicial
+input double InpIncreasedLot     = 0.02;        // Lote após trigger
+input int    InpStepPips         = 15;          // Espaçamento entre ordens (pips)
+input int    InpTPPips           = 15;          // TP individual (pips)
+input int    InpTriggerAfterOrders = 3;         // Após quantas ordens começar lógica adaptativa
+input int    InpMaxTotalOrders   = 20;          // Máximo de ordens totais (0 = infinito)
+
+input string Inp____Volume       = "==== Volume Progressivo ====";
+input bool   InpEnableProgressiveLot = true;    // Ativar volume progressivo
+input int    InpOrdersPerLevel   = 10;          // Ordens por nível antes de aumentar volume
+input double InpLotIncrement     = 0.01;        // Incremento de volume por nível
+
+input string Inp____Reversal     = "==== Lógica de Reversão ====";
+input bool   InpEnableReversal   = true;        // Ativar reversão automática
+input int    InpReversalLookback = 5;           // Quantos níveis anteriores verificar para reversão
+
+// ============================ Variáveis =========================== //
+bool   g_initialized = false;
+string g_symbol;
+int    g_digits;
+double g_point;
+double g_pip;
+
+// Estrutura para armazenar histórico de ordens
+struct OrderLevel {
+    double price;
+    ENUM_POSITION_TYPE type;
+    datetime time;
+    bool is_active;
+};
+
+// Arrays para histórico
+OrderLevel g_orderHistory[];
+int g_historyCount = 0;
+
+// Estado da estratégia
+enum ENUM_STRATEGY_MODE {
+    MODE_INITIAL,      // Modo inicial (primeiras ordens)
+    MODE_ADAPTIVE_BUY, // Modo adaptativo - comprando
+    MODE_ADAPTIVE_SELL // Modo adaptativo - vendendo
+};
+
+ENUM_STRATEGY_MODE g_currentMode = MODE_INITIAL;
+double g_lastAnchor = 0.0;
+int g_totalOrders = 0;
+
+// Contadores para volume progressivo
+int g_buyOrderCount = 0;    // Contador de ordens BUY
+int g_sellOrderCount = 0;   // Contador de ordens SELL
+
+// ============================ Funções Auxiliares ========================== //
+
+// Converte pips para preço
+double PipToPrice(const int pips) 
+{ 
+   return(pips * g_pip); 
+}
+
+// Normaliza preço
+double NormalizePrice(const double price) 
+{ 
+   return(NormalizeDouble(price, g_digits)); 
+}
+
+// Conta posições totais
+int CountAllPositions()
+{
+   int total = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionInfo.SelectByIndex(i))
+      {
+         if(PositionInfo.Magic() != InpMagic) continue;
+         if(PositionInfo.Symbol() != g_symbol) continue;
+         total++;
+      }
+   }
+   return total;
+}
+
+// Conta posições por tipo
+int CountPositions(const ENUM_POSITION_TYPE dir)
+{
+   int total = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionInfo.SelectByIndex(i))
+      {
+         if(PositionInfo.Magic() != InpMagic) continue;
+         if(PositionInfo.Symbol() != g_symbol) continue;
+         if(PositionInfo.PositionType() == dir) total++;
+      }
+   }
+   return total;
+}
+
+// Adiciona nível ao histórico
+void AddToHistory(double price, ENUM_POSITION_TYPE type)
+{
+   ArrayResize(g_orderHistory, g_historyCount + 1);
+   g_orderHistory[g_historyCount].price = price;
+   g_orderHistory[g_historyCount].type = type;
+   g_orderHistory[g_historyCount].time = TimeCurrent();
+   g_orderHistory[g_historyCount].is_active = true;
+   g_historyCount++;
+   
+   Print("[HISTORY] Adicionado nível: ", price, " Tipo: ", EnumToString(type), " Total: ", g_historyCount);
+}
+
+// Verifica se preço está próximo a níveis anteriores do tipo oposto
+bool IsNearOppositeTypeLevel(double current_price, ENUM_POSITION_TYPE current_type)
+{
+   if(!InpEnableReversal || g_historyCount < InpReversalLookback) return false;
+   
+   ENUM_POSITION_TYPE opposite_type = (current_type == POSITION_TYPE_BUY) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+   double tolerance = PipToPrice(InpStepPips) * 0.5; // Tolerância de meio step
+   
+   // Verifica os últimos níveis do tipo oposto
+   int checked = 0;
+   for(int i = g_historyCount - 1; i >= 0 && checked < InpReversalLookback; i--)
+   {
+      if(g_orderHistory[i].type == opposite_type)
+      {
+         double diff = MathAbs(current_price - g_orderHistory[i].price);
+         if(diff <= tolerance)
+         {
+            Print("[REVERSAL] Preço ", current_price, " próximo ao nível ", opposite_type, " em ", g_orderHistory[i].price, " (diff: ", diff, ")");
+            return true;
+         }
+         checked++;
+      }
+   }
+   
+   return false;
+}
+
+// Determina qual tipo de ordem abrir baseado na lógica adaptativa
+ENUM_POSITION_TYPE GetNextOrderType(double current_price)
+{
+   // Modo inicial - sempre BUY
+   if(g_currentMode == MODE_INITIAL)
+   {
+      return POSITION_TYPE_BUY;
+   }
+   
+   // Verifica se deve reverter direção
+   ENUM_POSITION_TYPE intended_type = (g_currentMode == MODE_ADAPTIVE_BUY) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+   
+   if(IsNearOppositeTypeLevel(current_price, intended_type))
+   {
+      // Reverte a direção
+      ENUM_POSITION_TYPE new_type = (intended_type == POSITION_TYPE_BUY) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+      g_currentMode = (new_type == POSITION_TYPE_BUY) ? MODE_ADAPTIVE_BUY : MODE_ADAPTIVE_SELL;
+      
+      Print("[STRATEGY] Reversão detectada! Mudando de ", EnumToString(intended_type), " para ", EnumToString(new_type));
+      return new_type;
+   }
+   
+   return intended_type;
+}
+
+// Calcula o lote a ser usado baseado no tipo de ordem e volume progressivo
+double GetLotSize(ENUM_POSITION_TYPE type)
+{
+   if(!InpEnableProgressiveLot)
+   {
+      // Sistema antigo - baseado apenas no número total de ordens
+      return (g_totalOrders < InpTriggerAfterOrders) ? InpInitialLot : InpIncreasedLot;
+   }
+   
+   // Sistema novo - volume progressivo por tipo
+   int current_count = 0;
+   
+   if(type == POSITION_TYPE_BUY)
+   {
+      current_count = g_buyOrderCount;
+   }
+   else
+   {
+      current_count = g_sellOrderCount;
+   }
+   
+   // Calcula o nível de volume baseado em quantas ordens do mesmo tipo já foram abertas
+   int volume_level = current_count / InpOrdersPerLevel;
+   double lot = InpInitialLot + (volume_level * InpLotIncrement);
+   
+   // Garante um mínimo
+   if(lot < InpInitialLot) lot = InpInitialLot;
+   
+   Print("[VOLUME] Tipo:", EnumToString(type), " Count:", current_count, " Level:", volume_level, " Lot:", lot);
+   
+   return lot;
+}
+
+// Abre posição
+bool OpenPosition(ENUM_POSITION_TYPE type)
+{
+   if(InpMaxTotalOrders > 0 && CountAllPositions() >= InpMaxTotalOrders) 
+   {
+      Print("[DEBUG] Máximo de ordens atingido:", InpMaxTotalOrders);
+      return false;
+   }
+      
+   MqlTick tick; 
+   if(!SymbolInfoTick(g_symbol, tick)) 
+   {
+      Print("[DEBUG] Erro ao obter tick");
+      return false;
+   }
+   
+   double price, tp;
+   double lot = GetLotSize(type);  // Passa o tipo para calcular lote correto
+   
+   if(type == POSITION_TYPE_BUY)
+   {
+      price = tick.ask;
+      tp = NormalizePrice(price + PipToPrice(InpTPPips));
+   }
+   else
+   {
+      price = tick.bid;
+      tp = NormalizePrice(price - PipToPrice(InpTPPips));
+   }
+   
+   Trade.SetExpertMagicNumber(InpMagic);
+   Trade.SetTypeFilling(ORDER_FILLING_FOK);
+   
+   bool ok = false;
+   string comment = StringFormat("Grid %s L%.2f O%d", EnumToString(type), lot, g_totalOrders + 1);
+   
+   if(type == POSITION_TYPE_BUY)
+   {
+      ok = Trade.Buy(lot, g_symbol, price, 0.0, tp, comment);
+   }
+   else
+   {
+      ok = Trade.Sell(lot, g_symbol, price, 0.0, tp, comment);
+   }
+   
+   if(ok)
+   {
+      Print("[SUCCESS] ", EnumToString(type), " executado: Preço=", price, " TP=", tp, " Lote=", lot);
+      AddToHistory(price, type);
+      g_totalOrders++;
+      
+      // Incrementa contador específico do tipo
+      if(type == POSITION_TYPE_BUY)
+      {
+         g_buyOrderCount++;
+         Print("[COUNTER] BUY orders: ", g_buyOrderCount, " (Próximo volume em ", InpOrdersPerLevel - (g_buyOrderCount % InpOrdersPerLevel), " ordens)");
+      }
+      else
+      {
+         g_sellOrderCount++;
+         Print("[COUNTER] SELL orders: ", g_sellOrderCount, " (Próximo volume em ", InpOrdersPerLevel - (g_sellOrderCount % InpOrdersPerLevel), " ordens)");
+      }
+      
+      // Atualiza modo após trigger
+      if(g_totalOrders == InpTriggerAfterOrders)
+      {
+         g_currentMode = MODE_ADAPTIVE_BUY; // Começa modo adaptativo com BUY
+         Print("[STRATEGY] Modo adaptativo ativado! Modo atual: ", EnumToString(g_currentMode));
+      }
+   }
+   else
+   {
+      Print("[ERROR] Falha ao executar ", EnumToString(type), ": ", Trade.ResultRetcode(), " - ", Trade.ResultRetcodeDescription());
+   }
+   
+   return ok;
+}
+
+// Inicializa anchor
+void InitAnchor()
+{
+   MqlTick tick; 
+   if(!SymbolInfoTick(g_symbol, tick)) return;
+   
+   g_lastAnchor = tick.ask;
+   
+   // Abre primeira ordem
+   OpenPosition(POSITION_TYPE_BUY);
+}
+
+// Verifica se deve abrir próxima ordem
+void TryOpenNextOrder()
+{
+   MqlTick tick; 
+   if(!SymbolInfoTick(g_symbol, tick)) return;
+   
+   double current_price = tick.ask;
+   double step = PipToPrice(InpStepPips);
+   
+   // Verifica movimento para cima ou para baixo
+   double trigger_up = g_lastAnchor + step;
+   double trigger_down = g_lastAnchor - step;
+   
+   bool should_open = false;
+   ENUM_POSITION_TYPE next_type;
+   
+   if(current_price >= trigger_up)
+   {
+      // Preço subiu
+      g_lastAnchor = trigger_up;
+      next_type = GetNextOrderType(current_price);
+      should_open = true;
+   }
+   else if(current_price <= trigger_down)
+   {
+      // Preço desceu
+      g_lastAnchor = trigger_down;
+      next_type = GetNextOrderType(current_price);
+      should_open = true;
+   }
+   
+   if(should_open)
+   {
+      OpenPosition(next_type);
+   }
+}
+
+// Exibe informações na tela
+void PrintHUD()
+{
+   int buys = CountPositions(POSITION_TYPE_BUY);
+   int sells = CountPositions(POSITION_TYPE_SELL);
+   double current_buy_lot = GetLotSize(POSITION_TYPE_BUY);
+   double current_sell_lot = GetLotSize(POSITION_TYPE_SELL);
+   string mode_str = "";
+   
+   switch(g_currentMode)
+   {
+      case MODE_INITIAL: mode_str = "INICIAL"; break;
+      case MODE_ADAPTIVE_BUY: mode_str = "ADAPTATIVO (BUY)"; break;
+      case MODE_ADAPTIVE_SELL: mode_str = "ADAPTATIVO (SELL)"; break;
+   }
+   
+   Comment(
+      "GridFractalXAU Adaptive — ", g_symbol, "\n",
+      "Modo: ", mode_str, "\n",
+      "Ordens: ", g_totalOrders, "/", (InpMaxTotalOrders > 0 ? IntegerToString(InpMaxTotalOrders) : "∞"), "\n",
+      "BUYs: ", buys, " (", g_buyOrderCount, " total) | SELLs: ", sells, " (", g_sellOrderCount, " total)\n",
+      "Próximo lote BUY: ", DoubleToString(current_buy_lot, 2), " | SELL: ", DoubleToString(current_sell_lot, 2), "\n",
+      "Step: ", InpStepPips, "p | TP: ", InpTPPips, "p\n",
+      "Volume progressivo: ", (InpEnableProgressiveLot ? "ATIVO" : "INATIVO"), " (", InpOrdersPerLevel, " ordens/nível)\n",
+      "Trigger após: ", InpTriggerAfterOrders, " ordens\n",
+      "Reversão: ", (InpEnableReversal ? "ATIVADA" : "DESATIVADA"), "\n",
+      "Anchor: ", DoubleToString(g_lastAnchor, g_digits), "\n",
+      "Histórico: ", g_historyCount, " níveis"
+   );
+}
+
+// ============================ Callbacks =========================== //
+int OnInit()
+{
+   g_symbol = _Symbol;
+   g_digits = (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS);
+   g_point = SymbolInfoDouble(g_symbol, SYMBOL_POINT);
+   g_pip = InpPipInPoints * g_point;
+
+   Trade.SetExpertMagicNumber(InpMagic);
+   
+   // Reset variáveis
+   g_currentMode = MODE_INITIAL;
+   g_totalOrders = 0;
+   g_buyOrderCount = 0;
+   g_sellOrderCount = 0;
+   g_historyCount = 0;
+   ArrayResize(g_orderHistory, 0);
+   
+   InitAnchor();
+   g_initialized = true;
+   
+   Print("EA GridFractalXAU Adaptive inicializado com sucesso.");
+   return(INIT_SUCCEEDED);
+}
+
+void OnTick()
+{
+   if(!g_initialized) return;
+   
+   TryOpenNextOrder();
+   PrintHUD();
+}
+
+void OnDeinit(const int reason)
+{
+   Comment("");
+   Print("EA GridFractalXAU Adaptive finalizado. Razão: ", reason);
+}
+
+// ============================ Notas =============================== //
+// 1) MODO INICIAL: Abre as primeiras ordens sempre como BUY com lote inicial
+// 2) MODO ADAPTATIVO: Após X ordens, alterna entre BUY/SELL baseado em níveis anteriores
+// 3) REVERSÃO: Se preço chegar próximo a níveis do tipo oposto, reverte a direção
+// 4) VOLUME PROGRESSIVO: A cada 10 ordens do mesmo tipo, aumenta 0.01 no volume
+//    - BUY: 0.01 (ordens 1-10) → 0.02 (ordens 11-20) → 0.03 (ordens 21-30)...
+//    - SELL: 0.01 (ordens 1-10) → 0.02 (ordens 11-20) → 0.03 (ordens 21-30)...
+// 5) HISTÓRICO: Mantém registro de todos os níveis para decisões futuras
+// 6) TOLERÂNCIA: Usa meio step como tolerância para detectar reversões
+// 7) CONFIGURÁVEL: Todos os parâmetros são ajustáveis via inputs
+// 8) CONTADORES SEPARADOS: BUY e SELL têm contadores independentes para volume
+//+------------------------------------------------------------------+
