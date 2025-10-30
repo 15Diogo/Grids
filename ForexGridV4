@@ -5,8 +5,8 @@
 //+------------------------------------------------------------------+
 #property copyright "EA Grid Duplo Profissional"
 #property link      "https://www.mql5.com"
-#property version   "3.10"
-#property description "Grid duplo simultâneo com execução a mercado instantânea"
+#property version   "3.11"
+#property description "Grid duplo simultâneo com execução a mercado - Grids independentes"
 
 #include <Trade\Trade.mqh>
 
@@ -55,6 +55,9 @@ double m_first_buy_price = 0.0;
 double m_last_buy_price = 0.0;
 double m_last_sell_price = 0.0;
 
+bool   m_grid_active = false;
+int    m_previous_position_count = 0;
+
 //--- Variáveis do Painel
 string m_panel_prefix = "GridPanel_";
 int m_panel_width = 300;
@@ -89,6 +92,7 @@ int OnInit()
    Print("✅ EA Grid Duplo (Ordens a Mercado) Iniciado");
    Print("Símbolo: ", m_symbol, " | Dígitos: ", m_digits);
    Print("Compras: ", BuyGridPips, " pips | Vendas: ", SellGridPips, " pips");
+   Print("⚡ MODO: Grids independentes e contínuos");
    Print("═══════════════════════════════════════════════");
    
    return(INIT_SUCCEEDED);
@@ -113,17 +117,20 @@ void OnTick()
 
    if(ask == 0 || bid == 0) return;
 
-   // 1. Stop Financeiro
+   // 1. Verifica se todas as posições foram fechadas para reiniciar
+   CheckAndRestartGrid();
+
+   // 2. Stop Financeiro
    if(CheckGlobalFinancialStop()) return;
 
-   // 2. Inicialização
+   // 3. Inicialização
    if(!InitializeGrid(ask)) return;
 
-   // 3. Gerencia grids com execução a mercado
+   // 4. Gerencia grids com execução a mercado (INDEPENDENTES)
    ManageBuyGrid(bid);
    ManageSellGrid(ask);
    
-   // 4. Atualiza painel
+   // 5. Atualiza painel
    if(ShowPanel)
       UpdatePanel();
 }
@@ -250,10 +257,15 @@ void UpdatePanel()
    string status_text = "🟢 A MERCADO";
    color status_color = clrLime;
    
-   if(GlobalStopLossAmount > 0 && total_profit <= -GlobalStopLossAmount * 0.8)
+   if(!m_grid_active && total_count == 0)
+   {
+      status_text = "⏳ AGUARDANDO";
+      status_color = clrYellow;
+   }
+   else if(GlobalStopLossAmount > 0 && total_profit <= -GlobalStopLossAmount * 0.8)
    {
       status_text = "⚠️ ATENÇÃO";
-      status_color = clrYellow;
+      status_color = clrOrange;
    }
    
    ObjectSetString(0, m_panel_prefix + "StatusText", OBJPROP_TEXT, status_text);
@@ -349,6 +361,8 @@ bool InitializeGrid(double current_ask)
       {
          m_first_buy_price = current_ask;
          m_last_buy_price = current_ask;
+         m_grid_active = true;
+         m_previous_position_count = 1;
          Print("✅ Primeira compra executada: ", m_first_buy_price);
       }
       return false;
@@ -358,13 +372,45 @@ bool InitializeGrid(double current_ask)
    {
       m_first_buy_price = GetLowestBuyPrice();
       m_last_buy_price = m_first_buy_price;
+      if(m_first_buy_price > 0.0)
+         m_grid_active = true;
    }
 
    return true;
 }
 
+//+------------------------------------------------------------------+
+//| Verifica e Reinicia o Grid Automaticamente                       |
+//+------------------------------------------------------------------+
+void CheckAndRestartGrid()
+{
+   int current_positions = CountPositions();
+   
+   // Se o grid estava ativo e agora não tem mais posições
+   if(m_grid_active && current_positions == 0 && m_previous_position_count > 0)
+   {
+      Print("═══════════════════════════════════════════════");
+      Print("🔄 Todas as posições foram fechadas!");
+      Print("♻️  REINICIANDO O GRID AUTOMATICAMENTE...");
+      Print("═══════════════════════════════════════════════");
+      
+      // Reseta todas as variáveis para reiniciar
+      m_first_buy_price = 0.0;
+      m_last_buy_price = 0.0;
+      m_last_sell_price = 0.0;
+      m_grid_active = false;
+   }
+   
+   // Atualiza o contador anterior
+   m_previous_position_count = current_positions;
+}
+
+//+------------------------------------------------------------------+
+//| Gerencia Grid de Compras (INDEPENDENTE)                          |
+//+------------------------------------------------------------------+
 void ManageBuyGrid(double current_bid)
 {
+   // ÚNICO limite: número máximo de ordens de compra
    if(CountBuyPositions() >= MaxBuyOrders) return;
 
    double lowest_buy = GetLowestBuyPrice();
@@ -373,6 +419,7 @@ void ManageBuyGrid(double current_bid)
    double next_buy_price = NormalizePrice(lowest_buy - m_buy_grid_points * m_point);
    
    // Verifica se o preço atual CRUZOU o nível do próximo grid
+   // IMPORTANTE: Compras continuam SEMPRE, independente do range de vendas
    if(current_bid > next_buy_price) return;
 
    double ask = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
@@ -387,8 +434,12 @@ void ManageBuyGrid(double current_bid)
    }
 }
 
+//+------------------------------------------------------------------+
+//| Gerencia Grid de Vendas (INDEPENDENTE)                           |
+//+------------------------------------------------------------------+
 void ManageSellGrid(double current_ask)
 {
+   // ÚNICO limite: número máximo de ordens de venda
    if(CountSellPositions() >= MaxSellOrders) return;
 
    double highest_sell = GetHighestSellPrice();
@@ -399,6 +450,7 @@ void ManageSellGrid(double current_ask)
    double next_sell_price = NormalizePrice(reference_price + m_sell_grid_points * m_point);
    
    // Verifica se o preço atual CRUZOU o nível do próximo grid
+   // IMPORTANTE: Vendas continuam SEMPRE, independente do range de compras
    if(current_ask < next_sell_price) return;
 
    double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
@@ -422,9 +474,15 @@ bool CheckGlobalFinancialStop()
    {
       Print("🛑 STOP FINANCEIRO ATIVADO! Prejuízo: ", total_profit);
       CloseAllTrades();
+      
+      // Reseta as variáveis mas NÃO reativa o grid automaticamente
       m_first_buy_price = 0.0;
       m_last_buy_price = 0.0;
       m_last_sell_price = 0.0;
+      m_grid_active = false;
+      m_previous_position_count = 0;
+      
+      Print("⚠️  Grid desativado por Stop Financeiro. Aguardando próximo tick para reiniciar...");
       return true;
    }
    return false;
@@ -563,4 +621,4 @@ double GetHighestSellPrice()
    }
    return highest;
 }
-//+------------------------------------------------------------------+
+//+----------------------------------------------------------------
