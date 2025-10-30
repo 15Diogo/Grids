@@ -1,0 +1,566 @@
+//+------------------------------------------------------------------+
+//|                                              GridDuploComStop.mq5 |
+//|                                  EA de Grid Duplo com Painel     |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "EA Grid Duplo Profissional"
+#property link      "https://www.mql5.com"
+#property version   "3.10"
+#property description "Grid duplo simultâneo com execução a mercado instantânea"
+
+#include <Trade\Trade.mqh>
+
+//--- Entradas do Usuário
+input group           "=== Configurações Gerais ==="
+input ulong           MagicNumber = 12345;
+input double          Slippage = 3.0;
+
+input group           "=== Grid de Compra (15 pips) ==="
+input double          BuyLot = 0.01;
+input double          BuyGridPips = 15.0;
+input double          BuyTakeProfitPips = 15.0;
+
+input group           "=== Grid de Venda (60 pips) ==="
+input double          SellLot = 0.02;
+input double          SellGridPips = 60.0;
+input double          SellTakeProfitPips = 60.0;
+
+input group           "=== Gerenciamento de Risco ==="
+input double          StopLossPips = 0.0;
+input double          GlobalStopLossAmount = 0.0;
+input int             MaxBuyOrders = 20;
+input int             MaxSellOrders = 10;
+
+input group           "=== Painel Visual ==="
+input bool            ShowPanel = true;
+input int             PanelX = 20;
+input int             PanelY = 50;
+input color           PanelColor = clrNavy;
+input color           TextColor = clrWhite;
+
+//--- Variáveis Globais
+CTrade m_trade;
+string m_symbol;
+int    m_digits;
+double m_point;
+double m_tick_size;
+
+int m_buy_grid_points;
+int m_buy_tp_points;
+int m_sell_grid_points;
+int m_sell_tp_points;
+int m_sl_points;
+
+double m_first_buy_price = 0.0;
+double m_last_buy_price = 0.0;
+double m_last_sell_price = 0.0;
+
+//--- Variáveis do Painel
+string m_panel_prefix = "GridPanel_";
+int m_panel_width = 300;
+int m_panel_height = 380;
+
+//+------------------------------------------------------------------+
+//| Inicialização                                                     |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   m_symbol = _Symbol;
+   m_digits = (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS);
+   m_point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+   m_tick_size = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
+   
+   if(m_point == 0 || m_digits == 0)
+   {
+      Print("❌ Erro: Informações do símbolo inválidas");
+      return(INIT_FAILED);
+   }
+
+   m_trade.SetExpertMagicNumber(MagicNumber);
+   m_trade.SetDeviationInPoints((int)Slippage);
+   m_trade.SetTypeFilling(GetFillingMode());
+
+   NormalizeAllPips();
+   
+   if(ShowPanel)
+      CreatePanel();
+
+   Print("═══════════════════════════════════════════════");
+   Print("✅ EA Grid Duplo (Ordens a Mercado) Iniciado");
+   Print("Símbolo: ", m_symbol, " | Dígitos: ", m_digits);
+   Print("Compras: ", BuyGridPips, " pips | Vendas: ", SellGridPips, " pips");
+   Print("═══════════════════════════════════════════════");
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Desinicialização                                                  |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   DeletePanel();
+   Print("EA Grid Duplo Finalizado");
+}
+
+//+------------------------------------------------------------------+
+//| OnTick                                                            |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   double ask = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+
+   if(ask == 0 || bid == 0) return;
+
+   // 1. Stop Financeiro
+   if(CheckGlobalFinancialStop()) return;
+
+   // 2. Inicialização
+   if(!InitializeGrid(ask)) return;
+
+   // 3. Gerencia grids com execução a mercado
+   ManageBuyGrid(bid);
+   ManageSellGrid(ask);
+   
+   // 4. Atualiza painel
+   if(ShowPanel)
+      UpdatePanel();
+}
+
+//+------------------------------------------------------------------+
+//| Cria o Painel Visual                                             |
+//+------------------------------------------------------------------+
+void CreatePanel()
+{
+   // Fundo principal
+   CreateRectangle(m_panel_prefix + "BG", PanelX, PanelY, m_panel_width, m_panel_height, PanelColor, clrWhite, 2);
+   
+   // Header
+   CreateRectangle(m_panel_prefix + "Header", PanelX, PanelY, m_panel_width, 40, clrDarkSlateGray, clrGold, 2);
+   CreateLabel(m_panel_prefix + "Title", PanelX + 10, PanelY + 10, "📊 GRID DUPLO EA", clrGold, 12, "Arial Black");
+   
+   // Seção de Estatísticas
+   int y = PanelY + 50;
+   CreateLabel(m_panel_prefix + "Stats", PanelX + 10, y, "━━━ ESTATÍSTICAS ━━━", clrLightBlue, 10, "Arial Bold");
+   
+   y += 25;
+   CreateLabel(m_panel_prefix + "BuyPosLabel", PanelX + 15, y, "Compras:", TextColor, 9, "Arial");
+   CreateLabel(m_panel_prefix + "BuyPosValue", PanelX + 200, y, "0", clrLime, 9, "Arial Bold");
+   
+   y += 20;
+   CreateLabel(m_panel_prefix + "SellPosLabel", PanelX + 15, y, "Vendas:", TextColor, 9, "Arial");
+   CreateLabel(m_panel_prefix + "SellPosValue", PanelX + 200, y, "0", clrOrange, 9, "Arial Bold");
+   
+   y += 20;
+   CreateLabel(m_panel_prefix + "TotalPosLabel", PanelX + 15, y, "Total de Posições:", TextColor, 9, "Arial");
+   CreateLabel(m_panel_prefix + "TotalPosValue", PanelX + 200, y, "0", clrYellow, 9, "Arial Bold");
+   
+   y += 20;
+   CreateLabel(m_panel_prefix + "ProfitLabel", PanelX + 15, y, "Lucro/Prejuízo:", TextColor, 9, "Arial");
+   CreateLabel(m_panel_prefix + "ProfitValue", PanelX + 200, y, "0.00", clrWhite, 9, "Arial Bold");
+   
+   // Seção de Preços
+   y += 30;
+   CreateLabel(m_panel_prefix + "Prices", PanelX + 10, y, "━━━ PREÇOS DO GRID ━━━", clrLightBlue, 10, "Arial Bold");
+   
+   y += 25;
+   CreateLabel(m_panel_prefix + "FirstBuyLabel", PanelX + 15, y, "1ª Compra:", TextColor, 9, "Arial");
+   CreateLabel(m_panel_prefix + "FirstBuyValue", PanelX + 150, y, "-", clrLime, 9, "Arial Bold");
+   
+   y += 20;
+   CreateLabel(m_panel_prefix + "LastBuyLabel", PanelX + 15, y, "Última Compra:", TextColor, 9, "Arial");
+   CreateLabel(m_panel_prefix + "LastBuyValue", PanelX + 150, y, "-", clrLime, 9, "Arial Bold");
+   
+   y += 20;
+   CreateLabel(m_panel_prefix + "LastSellLabel", PanelX + 15, y, "Última Venda:", TextColor, 9, "Arial");
+   CreateLabel(m_panel_prefix + "LastSellValue", PanelX + 150, y, "-", clrOrange, 9, "Arial Bold");
+   
+   y += 20;
+   CreateLabel(m_panel_prefix + "NextBuyLabel", PanelX + 15, y, "Próx. Compra:", TextColor, 9, "Arial");
+   CreateLabel(m_panel_prefix + "NextBuyValue", PanelX + 150, y, "-", clrAqua, 9, "Arial Bold");
+   
+   y += 20;
+   CreateLabel(m_panel_prefix + "NextSellLabel", PanelX + 15, y, "Próx. Venda:", TextColor, 9, "Arial");
+   CreateLabel(m_panel_prefix + "NextSellValue", PanelX + 150, y, "-", clrYellow, 9, "Arial Bold");
+   
+   // Seção de Status
+   y += 30;
+   CreateLabel(m_panel_prefix + "Status", PanelX + 10, y, "━━━ STATUS ━━━", clrLightBlue, 10, "Arial Bold");
+   
+   y += 25;
+   CreateLabel(m_panel_prefix + "StatusText", PanelX + 15, y, "🟢 A MERCADO", clrLime, 10, "Arial Bold");
+   
+   y += 25;
+   CreateLabel(m_panel_prefix + "StopLabel", PanelX + 15, y, "Stop Global:", TextColor, 8, "Arial");
+   CreateLabel(m_panel_prefix + "StopValue", PanelX + 150, y, 
+               (GlobalStopLossAmount > 0 ? DoubleToString(GlobalStopLossAmount, 2) : "Desativado"), 
+               clrYellow, 8, "Arial Bold");
+   
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Atualiza o Painel                                                 |
+//+------------------------------------------------------------------+
+void UpdatePanel()
+{
+   // Estatísticas
+   int buy_count = CountBuyPositions();
+   int sell_count = CountSellPositions();
+   int total_count = buy_count + sell_count;
+   double total_profit = GetTotalProfit();
+   
+   ObjectSetString(0, m_panel_prefix + "BuyPosValue", OBJPROP_TEXT, IntegerToString(buy_count));
+   ObjectSetString(0, m_panel_prefix + "SellPosValue", OBJPROP_TEXT, IntegerToString(sell_count));
+   ObjectSetString(0, m_panel_prefix + "TotalPosValue", OBJPROP_TEXT, IntegerToString(total_count));
+   
+   // Profit com cor dinâmica
+   string profit_str = DoubleToString(total_profit, 2) + " " + AccountInfoString(ACCOUNT_CURRENCY);
+   color profit_color = (total_profit >= 0) ? clrLime : clrRed;
+   ObjectSetString(0, m_panel_prefix + "ProfitValue", OBJPROP_TEXT, profit_str);
+   ObjectSetInteger(0, m_panel_prefix + "ProfitValue", OBJPROP_COLOR, profit_color);
+   
+   // Preços
+   if(m_first_buy_price > 0)
+      ObjectSetString(0, m_panel_prefix + "FirstBuyValue", OBJPROP_TEXT, DoubleToString(m_first_buy_price, m_digits));
+   
+   double lowest_buy = GetLowestBuyPrice();
+   if(lowest_buy > 0)
+   {
+      ObjectSetString(0, m_panel_prefix + "LastBuyValue", OBJPROP_TEXT, DoubleToString(lowest_buy, m_digits));
+      double next_buy = NormalizePrice(lowest_buy - m_buy_grid_points * m_point);
+      ObjectSetString(0, m_panel_prefix + "NextBuyValue", OBJPROP_TEXT, DoubleToString(next_buy, m_digits));
+   }
+   
+   double highest_sell = GetHighestSellPrice();
+   if(highest_sell > 0)
+   {
+      ObjectSetString(0, m_panel_prefix + "LastSellValue", OBJPROP_TEXT, DoubleToString(highest_sell, m_digits));
+      double next_sell = NormalizePrice(highest_sell + m_sell_grid_points * m_point);
+      ObjectSetString(0, m_panel_prefix + "NextSellValue", OBJPROP_TEXT, DoubleToString(next_sell, m_digits));
+   }
+   else if(m_first_buy_price > 0)
+   {
+      double next_sell = NormalizePrice(m_first_buy_price + m_sell_grid_points * m_point);
+      ObjectSetString(0, m_panel_prefix + "NextSellValue", OBJPROP_TEXT, DoubleToString(next_sell, m_digits));
+   }
+   
+   // Status
+   string status_text = "🟢 A MERCADO";
+   color status_color = clrLime;
+   
+   if(GlobalStopLossAmount > 0 && total_profit <= -GlobalStopLossAmount * 0.8)
+   {
+      status_text = "⚠️ ATENÇÃO";
+      status_color = clrYellow;
+   }
+   
+   ObjectSetString(0, m_panel_prefix + "StatusText", OBJPROP_TEXT, status_text);
+   ObjectSetInteger(0, m_panel_prefix + "StatusText", OBJPROP_COLOR, status_color);
+}
+
+//+------------------------------------------------------------------+
+//| Deleta o Painel                                                   |
+//+------------------------------------------------------------------+
+void DeletePanel()
+{
+   ObjectsDeleteAll(0, m_panel_prefix);
+}
+
+//+------------------------------------------------------------------+
+//| Cria Retângulo                                                    |
+//+------------------------------------------------------------------+
+void CreateRectangle(string name, int x, int y, int width, int height, color bg_color, color border_color, int border_width)
+{
+   ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bg_color);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, border_color);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, border_width);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_BACK, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+}
+
+//+------------------------------------------------------------------+
+//| Cria Label                                                        |
+//+------------------------------------------------------------------+
+void CreateLabel(string name, int x, int y, string text, color clr, int font_size, string font)
+{
+   ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, font_size);
+   ObjectSetString(0, name, OBJPROP_FONT, font);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+}
+
+//+------------------------------------------------------------------+
+//| Funções de Gerenciamento do Grid                                 |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE_FILLING GetFillingMode()
+{
+   int filling_mode = (int)SymbolInfoInteger(m_symbol, SYMBOL_FILLING_MODE);
+   if((filling_mode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+      return ORDER_FILLING_FOK;
+   else if((filling_mode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+      return ORDER_FILLING_IOC;
+   else
+      return ORDER_FILLING_RETURN;
+}
+
+double NormalizePrice(double price)
+{
+   return NormalizeDouble(MathRound(price / m_tick_size) * m_tick_size, m_digits);
+}
+
+void NormalizeAllPips()
+{
+   int multiplier = (m_digits == 3 || m_digits == 5) ? 10 : 1;
+   m_buy_grid_points = (int)MathRound(BuyGridPips * multiplier);
+   m_buy_tp_points = (int)MathRound(BuyTakeProfitPips * multiplier);
+   m_sell_grid_points = (int)MathRound(SellGridPips * multiplier);
+   m_sell_tp_points = (int)MathRound(SellTakeProfitPips * multiplier);
+   m_sl_points = (int)MathRound(StopLossPips * multiplier);
+}
+
+bool InitializeGrid(double current_ask)
+{
+   if(m_first_buy_price > 0.0) return true;
+
+   int total_positions = CountPositions();
+
+   if(total_positions == 0)
+   {
+      Print("🚀 Iniciando Grid - Primeira COMPRA em ", current_ask);
+      
+      double buy_tp = NormalizePrice(current_ask + m_buy_tp_points * m_point);
+      double buy_sl = (m_sl_points > 0) ? NormalizePrice(current_ask - m_sl_points * m_point) : 0.0;
+      
+      if(m_trade.Buy(BuyLot, m_symbol, current_ask, buy_sl, buy_tp, "Compra Inicial"))
+      {
+         m_first_buy_price = current_ask;
+         m_last_buy_price = current_ask;
+         Print("✅ Primeira compra executada: ", m_first_buy_price);
+      }
+      return false;
+   }
+   
+   if(m_first_buy_price == 0.0)
+   {
+      m_first_buy_price = GetLowestBuyPrice();
+      m_last_buy_price = m_first_buy_price;
+   }
+
+   return true;
+}
+
+void ManageBuyGrid(double current_bid)
+{
+   if(CountBuyPositions() >= MaxBuyOrders) return;
+
+   double lowest_buy = GetLowestBuyPrice();
+   if(lowest_buy == 0.0) return;
+
+   double next_buy_price = NormalizePrice(lowest_buy - m_buy_grid_points * m_point);
+   
+   // Verifica se o preço atual CRUZOU o nível do próximo grid
+   if(current_bid > next_buy_price) return;
+
+   double ask = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+   double tp = NormalizePrice(ask + m_buy_tp_points * m_point);
+   double sl = (m_sl_points > 0) ? NormalizePrice(ask - m_sl_points * m_point) : 0.0;
+   
+   // Abre ordem A MERCADO quando o preço atinge o nível
+   if(m_trade.Buy(BuyLot, m_symbol, ask, sl, tp, "Compra Grid"))
+   {
+      Print("📈 Compra a Mercado executada: ", ask, " | TP: ", tp);
+      m_last_buy_price = ask;
+   }
+}
+
+void ManageSellGrid(double current_ask)
+{
+   if(CountSellPositions() >= MaxSellOrders) return;
+
+   double highest_sell = GetHighestSellPrice();
+   double reference_price = (highest_sell > 0) ? highest_sell : m_first_buy_price;
+   
+   if(reference_price == 0.0) return;
+
+   double next_sell_price = NormalizePrice(reference_price + m_sell_grid_points * m_point);
+   
+   // Verifica se o preço atual CRUZOU o nível do próximo grid
+   if(current_ask < next_sell_price) return;
+
+   double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+   double tp = NormalizePrice(bid - m_sell_tp_points * m_point);
+   double sl = (m_sl_points > 0) ? NormalizePrice(bid + m_sl_points * m_point) : 0.0;
+   
+   // Abre ordem A MERCADO quando o preço atinge o nível
+   if(m_trade.Sell(SellLot, m_symbol, bid, sl, tp, "Venda Grid"))
+   {
+      Print("📉 Venda a Mercado executada: ", bid, " | TP: ", tp);
+      m_last_sell_price = bid;
+   }
+}
+
+bool CheckGlobalFinancialStop()
+{
+   if(GlobalStopLossAmount <= 0.0) return false;
+   double total_profit = GetTotalProfit();
+
+   if(total_profit <= -GlobalStopLossAmount)
+   {
+      Print("🛑 STOP FINANCEIRO ATIVADO! Prejuízo: ", total_profit);
+      CloseAllTrades();
+      m_first_buy_price = 0.0;
+      m_last_buy_price = 0.0;
+      m_last_sell_price = 0.0;
+      return true;
+   }
+   return false;
+}
+
+void CloseAllTrades()
+{
+   // Fecha todas as posições
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber && 
+            PositionGetString(POSITION_SYMBOL) == m_symbol)
+         {
+            m_trade.PositionClose(ticket);
+         }
+      }
+   }
+   
+   // Remove todas as ordens pendentes (caso existam)
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket > 0 && OrderSelect(ticket))
+      {
+         if(OrderGetInteger(ORDER_MAGIC) == MagicNumber && 
+            OrderGetString(ORDER_SYMBOL) == m_symbol)
+         {
+            m_trade.OrderDelete(ticket);
+         }
+      }
+   }
+}
+
+double GetTotalProfit()
+{
+   double profit = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber && 
+            PositionGetString(POSITION_SYMBOL) == m_symbol)
+         {
+            profit += PositionGetDouble(POSITION_PROFIT);
+         }
+      }
+   }
+   return profit;
+}
+
+int CountPositions()
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber && PositionGetString(POSITION_SYMBOL) == m_symbol)
+            count++;
+   }
+   return count;
+}
+
+int CountBuyPositions()
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber && 
+            PositionGetString(POSITION_SYMBOL) == m_symbol &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+            count++;
+   }
+   return count;
+}
+
+int CountSellPositions()
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber && 
+            PositionGetString(POSITION_SYMBOL) == m_symbol &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+            count++;
+   }
+   return count;
+}
+
+double GetLowestBuyPrice()
+{
+   double lowest = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == m_symbol &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+         {
+            double price = PositionGetDouble(POSITION_PRICE_OPEN);
+            if(lowest == 0.0 || price < lowest)
+               lowest = price;
+         }
+      }
+   }
+   return lowest;
+}
+
+double GetHighestSellPrice()
+{
+   double highest = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == m_symbol &&
+            PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+         {
+            double price = PositionGetDouble(POSITION_PRICE_OPEN);
+            if(highest == 0.0 || price > highest)
+               highest = price;
+         }
+      }
+   }
+   return highest;
+}
+//+------------------------------------------------------------------+
