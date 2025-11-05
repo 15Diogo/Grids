@@ -1,0 +1,659 @@
+//+------------------------------------------------------------------+
+//|                      Painel de Gerenciamento - DualGrid EA        |
+//+------------------------------------------------------------------+
+#property copyright "Diogo + ChatGPT"
+#property version   "2.30"
+#property strict
+
+#include <Trade/Trade.mqh>
+CTrade Trade;
+
+// ===================== Inputs =====================
+input string   InpSymbol              = "";
+input double   InpLotBuy              = 0.1;
+input double   InpLotSell             = 0.3;
+input int      InpBuyStepPips         = 200;
+input int      InpSellStepPips        = 3000;
+input int      InpBuyTP_Pips          = 200;
+input int      InpSellTP_Pips         = 3000;
+input int      InpSlippagePoints      = 3;
+input bool     InpOnlyOnePerStep      = true;
+input int      InpBuyOrdersPerGrid    = 1;
+input int      InpSellOrdersPerGrid   = 1;
+input bool     InpUseMultiplierLot    = false;
+input double   InpLotMultiplier       = 1.5;
+input int      InpOrderSpacingPips    = 2;
+input int      InpMinDistancePips     = 50;  // Distância mínima entre ordens
+
+// ===================== Constantes =====================
+const long MAGIC_BUY_15  = 15150001;
+const long MAGIC_SELL_30 = 30300002;
+
+// ===================== Variáveis do Painel =====================
+string PREFIX = "DG_PANEL_";
+int PANEL_X = 15;
+int PANEL_Y = 25;
+int PANEL_WIDTH = 360;
+int BUTTON_HEIGHT = 28;
+int BUTTON_MARGIN = 6;
+color PANEL_BG = C'15,20,30';
+color PANEL_BORDER = C'40,50,70';
+color BUTTON_BG = C'30,40,55';
+color BUTTON_ACTIVE = C'34,139,34';
+color BUTTON_INACTIVE = C'178,34,34';
+color TEXT_COLOR = clrWhiteSmoke;
+color ACCENT_COLOR = C'255,215,0';
+
+// ===================== Estados do Robô =====================
+bool EA_ACTIVE = true;
+bool BUY_ENABLED = true;
+bool SELL_ENABLED = true;
+bool SHOW_DETAILS = true;
+
+// ===================== Variáveis Globais =====================
+double buy_anchor  = 0.0;
+double sell_anchor = 0.0;
+datetime last_trade_time_buy  = 0;
+datetime last_trade_time_sell = 0;
+
+// ===================== Utilidades =====================
+string Sym() { return (InpSymbol=="" ? _Symbol : InpSymbol); }
+int DigitsOfSymbol() { return (int)SymbolInfoInteger(Sym(), SYMBOL_DIGITS); }
+double PointOfSymbol() { return SymbolInfoDouble(Sym(), SYMBOL_POINT); }
+
+double PipSize()
+{
+   int d = DigitsOfSymbol();
+   double p = PointOfSymbol();
+   if(d==3 || d==5) return 10.0*p;
+   return p;
+}
+
+double PipsToPrice(const double pips) { return pips * PipSize(); }
+
+double NormalizeVolume(double lots)
+{
+   double minlot = SymbolInfoDouble(Sym(), SYMBOL_VOLUME_MIN);
+   double maxlot = SymbolInfoDouble(Sym(), SYMBOL_VOLUME_MAX);
+   double step = SymbolInfoDouble(Sym(), SYMBOL_VOLUME_STEP);
+   lots = MathMax(minlot, MathMin(maxlot, lots));
+   return MathRound(lots/step)*step;
+}
+
+int CountOpenByMagicAndType(long magic, ENUM_POSITION_TYPE posType)
+{
+   int total=0;
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         string s = PositionGetString(POSITION_SYMBOL);
+         long m = PositionGetInteger(POSITION_MAGIC);
+         ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+         if(s==Sym() && m==magic && type==posType) total++;
+      }
+   }
+   return total;
+}
+
+// Verifica se há ordem próxima ao preço
+bool HasOrderNearPrice(double price, long magic, double minDistancePips)
+{
+   double minDistance = PipsToPrice(minDistancePips);
+   
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         string s = PositionGetString(POSITION_SYMBOL);
+         long m = PositionGetInteger(POSITION_MAGIC);
+         
+         if(s==Sym() && m==magic)
+         {
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            if(MathAbs(price - openPrice) < minDistance)
+            {
+               return true;
+            }
+         }
+      }
+   }
+   return false;
+}
+
+double CalculateLotSize(double baseLot, int orderIndex)
+{
+   if(!InpUseMultiplierLot || orderIndex == 0) return baseLot;
+   double calculatedLot = baseLot * MathPow(InpLotMultiplier, orderIndex);
+   return NormalizeVolume(calculatedLot);
+}
+
+// ===================== Funções de Estatísticas =====================
+double GetTotalProfit()
+{
+   double total = 0;
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         string s = PositionGetString(POSITION_SYMBOL);
+         long m = PositionGetInteger(POSITION_MAGIC);
+         if(s==Sym() && (m==MAGIC_BUY_15 || m==MAGIC_SELL_30))
+            total += PositionGetDouble(POSITION_PROFIT);
+      }
+   }
+   return total;
+}
+
+double GetBuyProfit()
+{
+   double total = 0;
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         string s = PositionGetString(POSITION_SYMBOL);
+         long m = PositionGetInteger(POSITION_MAGIC);
+         if(s==Sym() && m==MAGIC_BUY_15)
+            total += PositionGetDouble(POSITION_PROFIT);
+      }
+   }
+   return total;
+}
+
+double GetSellProfit()
+{
+   double total = 0;
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         string s = PositionGetString(POSITION_SYMBOL);
+         long m = PositionGetInteger(POSITION_MAGIC);
+         if(s==Sym() && m==MAGIC_SELL_30)
+            total += PositionGetDouble(POSITION_PROFIT);
+      }
+   }
+   return total;
+}
+
+// ===================== Criação do Painel =====================
+void CreatePanel()
+{
+   DeletePanel();
+   
+   int currentY = PANEL_Y;
+   
+   // Background principal com borda
+   CreateRectangle(PREFIX+"BORDER", PANEL_X-2, currentY-2, PANEL_WIDTH+4, 560, PANEL_BORDER);
+   CreateRectangle(PREFIX+"BG", PANEL_X, currentY, PANEL_WIDTH, 556, PANEL_BG);
+   
+   // Título com destaque
+   currentY += 8;
+   CreateLabel(PREFIX+"TITLE", PANEL_X+PANEL_WIDTH/2-140, currentY, 280, 22, 
+               "⚡ DUALGRID BIDIRECIONAL ⚡", PANEL_BG, 12, ACCENT_COLOR, "Arial Black");
+   
+   currentY += 26;
+   CreateLabel(PREFIX+"SUBTITLE", PANEL_X+PANEL_WIDTH/2-80, currentY, 160, 16, 
+               "Painel de Controle", PANEL_BG, 8, clrSilver, "Arial");
+   
+   // Status do EA
+   currentY += 28;
+   CreateButton(PREFIX+"BTN_EA", PANEL_X+10, currentY, 165, BUTTON_HEIGHT, 
+                EA_ACTIVE ? "🟢 EA ATIVO" : "🔴 EA PAUSADO", 
+                EA_ACTIVE ? BUTTON_ACTIVE : BUTTON_INACTIVE);
+   
+   CreateButton(PREFIX+"BTN_DETAILS", PANEL_X+185, currentY, 165, BUTTON_HEIGHT, 
+                SHOW_DETAILS ? "👁 DETALHES ON" : "👁 DETALHES OFF", 
+                SHOW_DETAILS ? C'70,130,180' : C'50,50,60');
+   
+   // Controles de Buy/Sell
+   currentY += BUTTON_HEIGHT + BUTTON_MARGIN + 8;
+   CreateSectionLabel(PREFIX+"LBL_CONTROL", PANEL_X+10, currentY, "━━━ CONTROLE DE OPERAÇÕES ━━━");
+   
+   currentY += 22;
+   CreateButton(PREFIX+"BTN_BUY", PANEL_X+10, currentY, 165, BUTTON_HEIGHT, 
+                BUY_ENABLED ? "📈 COMPRAS ON" : "📈 COMPRAS OFF", 
+                BUY_ENABLED ? C'46,125,50' : BUTTON_INACTIVE);
+   
+   CreateButton(PREFIX+"BTN_SELL", PANEL_X+185, currentY, 165, BUTTON_HEIGHT, 
+                SELL_ENABLED ? "📉 VENDAS ON" : "📉 VENDAS OFF", 
+                SELL_ENABLED ? C'46,125,50' : BUTTON_INACTIVE);
+   
+   // Fechar posições
+   currentY += BUTTON_HEIGHT + BUTTON_MARGIN + 10;
+   CreateSectionLabel(PREFIX+"LBL_CLOSE", PANEL_X+10, currentY, "━━━ FECHAR POSIÇÕES ━━━");
+   
+   currentY += 22;
+   CreateButton(PREFIX+"BTN_CLOSE_BUY", PANEL_X+10, currentY, 108, BUTTON_HEIGHT, 
+                "✖ BUY", C'139,0,0');
+   
+   CreateButton(PREFIX+"BTN_CLOSE_SELL", PANEL_X+126, currentY, 108, BUTTON_HEIGHT, 
+                "✖ SELL", C'139,0,0');
+   
+   CreateButton(PREFIX+"BTN_CLOSE_ALL", PANEL_X+242, currentY, 108, BUTTON_HEIGHT, 
+                "✖ TUDO", C'178,34,34');
+   
+   // Reset Anchors
+   currentY += BUTTON_HEIGHT + BUTTON_MARGIN + 10;
+   CreateSectionLabel(PREFIX+"LBL_ANCHOR", PANEL_X+10, currentY, "━━━ RESET DE ÂNCORAS ━━━");
+   
+   currentY += 22;
+   CreateButton(PREFIX+"BTN_RESET_BUY", PANEL_X+10, currentY, 108, BUTTON_HEIGHT, 
+                "🔄 BUY", C'255,140,0');
+   
+   CreateButton(PREFIX+"BTN_RESET_SELL", PANEL_X+126, currentY, 108, BUTTON_HEIGHT, 
+                "🔄 SELL", C'255,140,0');
+   
+   CreateButton(PREFIX+"BTN_RESET_ALL", PANEL_X+242, currentY, 108, BUTTON_HEIGHT, 
+                "🔄 TUDO", C'255,165,0');
+   
+   // Estatísticas
+   currentY += BUTTON_HEIGHT + BUTTON_MARGIN + 10;
+   CreateLabel(PREFIX+"STATS", PANEL_X+10, currentY, PANEL_WIDTH-20, 220, "", PANEL_BG, 8, TEXT_COLOR, "Consolas");
+   
+   ChartRedraw();
+}
+
+void CreateButton(string name, int x, int y, int width, int height, string text, color bgColor)
+{
+   if(ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0))
+   {
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+      ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+      ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+      ObjectSetString(0, name, OBJPROP_TEXT, text);
+      ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+      ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+      ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bgColor);
+      ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, clrBlack);
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   }
+}
+
+void CreateLabel(string name, int x, int y, int width, int height, string text, 
+                 color bgColor, int fontSize, color textColor, string font="Arial")
+{
+   if(ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
+   {
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+      ObjectSetString(0, name, OBJPROP_TEXT, text);
+      ObjectSetString(0, name, OBJPROP_FONT, font);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, textColor);
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   }
+}
+
+void CreateSectionLabel(string name, int x, int y, string text)
+{
+   CreateLabel(name, x, y, 300, 16, text, PANEL_BG, 9, ACCENT_COLOR, "Arial");
+}
+
+void CreateRectangle(string name, int x, int y, int width, int height, color bgColor)
+{
+   if(ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0))
+   {
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+      ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+      ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+      ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bgColor);
+      ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_BACK, true);
+   }
+}
+
+void DeletePanel()
+{
+   ObjectsDeleteAll(0, PREFIX);
+}
+
+void UpdatePanel()
+{
+   // Atualizar botões
+   ObjectSetString(0, PREFIX+"BTN_EA", OBJPROP_TEXT, EA_ACTIVE ? "🟢 EA ATIVO" : "🔴 EA PAUSADO");
+   ObjectSetInteger(0, PREFIX+"BTN_EA", OBJPROP_BGCOLOR, EA_ACTIVE ? BUTTON_ACTIVE : BUTTON_INACTIVE);
+   
+   ObjectSetString(0, PREFIX+"BTN_BUY", OBJPROP_TEXT, BUY_ENABLED ? "📈 COMPRAS ON" : "📈 COMPRAS OFF");
+   ObjectSetInteger(0, PREFIX+"BTN_BUY", OBJPROP_BGCOLOR, BUY_ENABLED ? C'46,125,50' : BUTTON_INACTIVE);
+   
+   ObjectSetString(0, PREFIX+"BTN_SELL", OBJPROP_TEXT, SELL_ENABLED ? "📉 VENDAS ON" : "📉 VENDAS OFF");
+   ObjectSetInteger(0, PREFIX+"BTN_SELL", OBJPROP_BGCOLOR, SELL_ENABLED ? C'46,125,50' : BUTTON_INACTIVE);
+   
+   ObjectSetString(0, PREFIX+"BTN_DETAILS", OBJPROP_TEXT, SHOW_DETAILS ? "👁 DETALHES ON" : "👁 DETALHES OFF");
+   ObjectSetInteger(0, PREFIX+"BTN_DETAILS", OBJPROP_BGCOLOR, SHOW_DETAILS ? C'70,130,180' : C'50,50,60');
+   
+   // Atualizar estatísticas
+   if(SHOW_DETAILS)
+   {
+      int buyOrders = CountOpenByMagicAndType(MAGIC_BUY_15, POSITION_TYPE_BUY);
+      int sellOrders = CountOpenByMagicAndType(MAGIC_SELL_30, POSITION_TYPE_SELL);
+      double totalProfit = GetTotalProfit();
+      double buyProfit = GetBuyProfit();
+      double sellProfit = GetSellProfit();
+      
+      double bid=0, ask=0;
+      SymbolInfoDouble(Sym(), SYMBOL_BID, bid);
+      SymbolInfoDouble(Sym(), SYMBOL_ASK, ask);
+      
+      // Calcular distâncias em ambas direções
+      double buyDistUpPips = (ask - buy_anchor) / PipSize();
+      double buyDistDownPips = (buy_anchor - ask) / PipSize();
+      double buyMaxDist = MathMax(buyDistUpPips, buyDistDownPips);
+      
+      double sellDistUpPips = (bid - sell_anchor) / PipSize();
+      double sellDistDownPips = (sell_anchor - bid) / PipSize();
+      double sellMaxDist = MathMax(sellDistUpPips, sellDistDownPips);
+      
+      string profitColor = totalProfit >= 0 ? "+" : "";
+      string buyProfitColor = buyProfit >= 0 ? "+" : "";
+      string sellProfitColor = sellProfit >= 0 ? "+" : "";
+      
+      string stats = StringFormat(
+         "╔═══════════════════════════════════╗\n"
+         "║ MODO: BIDIRECIONAL INDEPENDENTE  ║\n"
+         "╠═══════════════════════════════════╣\n"
+         "║ MERCADO                           ║\n"
+         "╠═══════════════════════════════════╣\n"
+         "║ Símbolo: %-8s  Spread: %5.1f  ║\n"
+         "║ BID: %9.5f  ASK: %9.5f  ║\n"
+         "╠═══════════════════════════════════╣\n"
+         "║ POSIÇÕES ABERTAS                  ║\n"
+         "╠═══════════════════════════════════╣\n"
+         "║ 📈 Compras:  %3d posições         ║\n"
+         "║ 📉 Vendas:   %3d posições         ║\n"
+         "║ 📊 Total:    %3d posições         ║\n"
+         "╠═══════════════════════════════════╣\n"
+         "║ RESULTADO FINANCEIRO              ║\n"
+         "╠═══════════════════════════════════╣\n"
+         "║ BUY:   %s%-10.2f %s        ║\n"
+         "║ SELL:  %s%-10.2f %s        ║\n"
+         "║ TOTAL: %s%-10.2f %s        ║\n"
+         "╠═══════════════════════════════════╣\n"
+         "║ ÂNCORAS DE REFERÊNCIA             ║\n"
+         "╠═══════════════════════════════════╣\n"
+         "║ Buy:  %.5f                   ║\n"
+         "║ Sell: %.5f                   ║\n"
+         "╠═══════════════════════════════════╣\n"
+         "║ PRÓXIMA ORDEM (qualquer direção) ║\n"
+         "╠═══════════════════════════════════╣\n"
+         "║ BUY ±:  %s%6.1f / %4d pips      ║\n"
+         "║ SELL ±: %s%6.1f / %4d pips      ║\n"
+         "╚═══════════════════════════════════╝",
+         Sym(), (ask-bid)/PipSize(),
+         bid, ask,
+         buyOrders,
+         sellOrders,
+         buyOrders + sellOrders,
+         buyProfitColor, buyProfit, AccountInfoString(ACCOUNT_CURRENCY),
+         sellProfitColor, sellProfit, AccountInfoString(ACCOUNT_CURRENCY),
+         profitColor, totalProfit, AccountInfoString(ACCOUNT_CURRENCY),
+         buy_anchor, sell_anchor,
+         (buyMaxDist >= InpBuyStepPips ? "✓" : " "), buyMaxDist, InpBuyStepPips,
+         (sellMaxDist >= InpSellStepPips ? "✓" : " "), sellMaxDist, InpSellStepPips
+      );
+      
+      ObjectSetString(0, PREFIX+"STATS", OBJPROP_TEXT, stats);
+   }
+   else
+   {
+      ObjectSetString(0, PREFIX+"STATS", OBJPROP_TEXT, "");
+   }
+   
+   ChartRedraw();
+}
+
+// ===================== Handlers de Eventos =====================
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK)
+   {
+      if(sparam == PREFIX+"BTN_EA")
+      {
+         EA_ACTIVE = !EA_ACTIVE;
+         Print(EA_ACTIVE ? "[EA ATIVADO]" : "[EA PAUSADO]");
+      }
+      else if(sparam == PREFIX+"BTN_BUY")
+      {
+         BUY_ENABLED = !BUY_ENABLED;
+         Print(BUY_ENABLED ? "[COMPRAS ATIVADAS]" : "[COMPRAS DESATIVADAS]");
+      }
+      else if(sparam == PREFIX+"BTN_SELL")
+      {
+         SELL_ENABLED = !SELL_ENABLED;
+         Print(SELL_ENABLED ? "[VENDAS ATIVADAS]" : "[VENDAS DESATIVADAS]");
+      }
+      else if(sparam == PREFIX+"BTN_DETAILS")
+      {
+         SHOW_DETAILS = !SHOW_DETAILS;
+      }
+      else if(sparam == PREFIX+"BTN_CLOSE_BUY")
+      {
+         ClosePositions(MAGIC_BUY_15);
+      }
+      else if(sparam == PREFIX+"BTN_CLOSE_SELL")
+      {
+         ClosePositions(MAGIC_SELL_30);
+      }
+      else if(sparam == PREFIX+"BTN_CLOSE_ALL")
+      {
+         ClosePositions(MAGIC_BUY_15);
+         ClosePositions(MAGIC_SELL_30);
+      }
+      else if(sparam == PREFIX+"BTN_RESET_BUY")
+      {
+         double ask = SymbolInfoDouble(Sym(), SYMBOL_ASK);
+         buy_anchor = ask;
+         Print("[RESET BUY] Nova âncora: ", buy_anchor);
+      }
+      else if(sparam == PREFIX+"BTN_RESET_SELL")
+      {
+         double bid = SymbolInfoDouble(Sym(), SYMBOL_BID);
+         sell_anchor = bid;
+         Print("[RESET SELL] Nova âncora: ", sell_anchor);
+      }
+      else if(sparam == PREFIX+"BTN_RESET_ALL")
+      {
+         double bid = SymbolInfoDouble(Sym(), SYMBOL_BID);
+         double ask = SymbolInfoDouble(Sym(), SYMBOL_ASK);
+         buy_anchor = ask;
+         sell_anchor = bid;
+         Print("[RESET ALL] Buy: ", buy_anchor, " | Sell: ", sell_anchor);
+      }
+      
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      UpdatePanel();
+   }
+}
+
+void ClosePositions(long magic)
+{
+   int closed = 0;
+   for(int i=PositionsTotal()-1; i>=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         string s = PositionGetString(POSITION_SYMBOL);
+         long m = PositionGetInteger(POSITION_MAGIC);
+         if(s==Sym() && m==magic)
+         {
+            if(Trade.PositionClose(ticket))
+               closed++;
+         }
+      }
+   }
+   PrintFormat("[FECHAMENTO] %d posições fechadas (Magic: %I64d)", closed, magic);
+}
+
+// ===================== Lógica de Trading BIDIRECIONAL =====================
+void PlaceMultipleBuyOrders(double basePrice)
+{
+   if(!BUY_ENABLED) return;
+   
+   // Verifica se já tem ordem próxima
+   if(HasOrderNearPrice(basePrice, MAGIC_BUY_15, InpMinDistancePips))
+   {
+      Print("[BUY] Ordem próxima detectada, pulando...");
+      return;
+   }
+   
+   int ordersToPlace = MathMax(1, MathMin(10, InpBuyOrdersPerGrid));
+   double spacing = PipsToPrice(InpOrderSpacingPips);
+   
+   for(int i = 0; i < ordersToPlace; i++)
+   {
+      double orderPrice = basePrice + (i * spacing);
+      double volume = CalculateLotSize(InpLotBuy, i);
+      double tp_price = orderPrice + PipsToPrice(InpBuyTP_Pips);
+      
+      Trade.SetExpertMagicNumber(MAGIC_BUY_15);
+      Trade.SetDeviationInPoints(InpSlippagePoints);
+      
+      if(Trade.Buy(volume, Sym(), orderPrice, 0.0, tp_price))
+      {
+         PrintFormat("[BUY ±] Grid %d/%d - ticket=%I64u @%.5f lot=%.3f", 
+                     i+1, ordersToPlace, Trade.ResultOrder(), orderPrice, volume);
+      }
+   }
+   
+   buy_anchor = basePrice;
+   last_trade_time_buy = TimeCurrent();
+}
+
+void PlaceMultipleSellOrders(double basePrice)
+{
+   if(!SELL_ENABLED) return;
+   
+   // Verifica se já tem ordem próxima
+   if(HasOrderNearPrice(basePrice, MAGIC_SELL_30, InpMinDistancePips))
+   {
+      Print("[SELL] Ordem próxima detectada, pulando...");
+      return;
+   }
+   
+   int ordersToPlace = MathMax(1, MathMin(10, InpSellOrdersPerGrid));
+   double spacing = PipsToPrice(InpOrderSpacingPips);
+   
+   for(int i = 0; i < ordersToPlace; i++)
+   {
+      double orderPrice = basePrice - (i * spacing);
+      double volume = CalculateLotSize(InpLotSell, i);
+      double tp_price = orderPrice - PipsToPrice(InpSellTP_Pips);
+      
+      Trade.SetExpertMagicNumber(MAGIC_SELL_30);
+      Trade.SetDeviationInPoints(InpSlippagePoints);
+      
+      if(Trade.Sell(volume, Sym(), orderPrice, 0.0, tp_price))
+      {
+         PrintFormat("[SELL ±] Grid %d/%d - ticket=%I64u @%.5f lot=%.3f", 
+                     i+1, ordersToPlace, Trade.ResultOrder(), orderPrice, volume);
+      }
+   }
+   
+   sell_anchor = basePrice;
+   last_trade_time_sell = TimeCurrent();
+}
+
+// ===================== Inicialização =====================
+int OnInit()
+{
+   if(!SymbolSelect(Sym(), true))
+   {
+      Print("[ERRO] Não foi possível selecionar símbolo ", Sym());
+      return(INIT_FAILED);
+   }
+
+   double bid=0, ask=0;
+   SymbolInfoDouble(Sym(), SYMBOL_BID, bid);
+   SymbolInfoDouble(Sym(), SYMBOL_ASK, ask);
+   
+   buy_anchor = ask;
+   sell_anchor = bid;
+   
+   CreatePanel();
+   
+   PrintFormat("[INIT] Painel criado | Buy anchor: %.5f | Sell anchor: %.5f", buy_anchor, sell_anchor);
+   Print("[MODO] BIDIRECIONAL - Compras e vendas em qualquer direção, independentes");
+   
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason)
+{
+   DeletePanel();
+}
+
+// ===================== Loop Principal - BIDIRECIONAL =====================
+void OnTick()
+{
+   if(!EA_ACTIVE)
+   {
+      UpdatePanel();
+      return;
+   }
+   
+   double bid=0, ask=0;
+   if(!SymbolInfoDouble(Sym(), SYMBOL_BID, bid)) return;
+   if(!SymbolInfoDouble(Sym(), SYMBOL_ASK, ask)) return;
+
+   // ========== COMPRAS - QUALQUER DIREÇÃO ==========
+   if(BUY_ENABLED)
+   {
+      double buyDistUpPips = (ask - buy_anchor) / PipSize();
+      double buyDistDownPips = (buy_anchor - ask) / PipSize();
+      
+      // Compra se movimentou 200 pips para CIMA
+      if(buyDistUpPips >= InpBuyStepPips)
+      {
+         if(!(InpOnlyOnePerStep && last_trade_time_buy == TimeCurrent()))
+         {
+            PlaceMultipleBuyOrders(ask);
+         }
+      }
+      // Compra se movimentou 200 pips para BAIXO
+      else if(buyDistDownPips >= InpBuyStepPips)
+      {
+         if(!(InpOnlyOnePerStep && last_trade_time_buy == TimeCurrent()))
+         {
+            PlaceMultipleBuyOrders(ask);
+         }
+      }
+   }
+
+   // ========== VENDAS - QUALQUER DIREÇÃO ==========
+   if(SELL_ENABLED)
+   {
+      double sellDistUpPips = (bid - sell_anchor) / PipSize();
+      double sellDistDownPips = (sell_anchor - bid) / PipSize();
+      
+      // Vende se movimentou 3000 pips para CIMA
+      if(sellDistUpPips >= InpSellStepPips)
+      {
+         if(!(InpOnlyOnePerStep && last_trade_time_sell == TimeCurrent()))
+         {
+            PlaceMultipleSellOrders(bid);
+         }
+      }
+      // Vende se movimentou 3000 pips para BAIXO
+      else if(sellDistDownPips >= InpSellStepPips)
+      {
+         if(!(InpOnlyOnePerStep && last_trade_time_sell == TimeCurrent()))
+         {
+            PlaceMultipleSellOrders(bid);
+         }
+      }
+   }
+
+   UpdatePanel();
+}
