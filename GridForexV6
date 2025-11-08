@@ -1,0 +1,452 @@
+//+------------------------------------------------------------------+
+//|                                          Grid Trader Híbrido.mq5 |
+//|                                                                  |
+//+------------------------------------------------------------------+
+#property copyright "Grid Trader Híbrido"
+#property version   "1.00"
+#property description "EA com Grid de Compras e Vendas Contra-Tendência"
+
+#include <Trade\Trade.mqh>
+
+// Parâmetros de Entrada
+input group "=== Estratégia de Compra (Grid) ==="
+input double   Lote_Compra = 0.01;                    // Lote para ordens de compra
+input int      Distancia_Grid_Compra = 200;           // Distância entre compras (pontos)
+input int      Take_Profit_Compra = 200;              // Take Profit compras (pontos)
+
+input group "=== Estratégia de Venda (Contra-Tendência) ==="
+input double   Lote_Venda = 0.10;                     // Lote para ordem de venda
+input int      Distancia_Gatilho_Venda = 1000;        // Gatilho venda (pontos)
+input int      Take_Profit_Venda = 200;               // Take Profit venda (pontos)
+
+input group "=== Configurações Gerais ==="
+input int      Magic_Number = 123456;                 // Número mágico do EA
+input color    Cor_Painel = clrDarkBlue;              // Cor de fundo do painel
+input color    Cor_Texto = clrWhite;                  // Cor do texto
+
+// Variáveis Globais
+CTrade trade;
+double preco_primeira_compra = 0;
+double preco_ultima_compra = 0;
+double preco_ultima_venda = 0;
+bool primeira_compra_aberta = false;
+bool pode_abrir_venda = true;
+
+string painel_nome = "PainelInfo";
+
+//+------------------------------------------------------------------+
+//| Função de Inicialização                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(Magic_Number);
+   trade.SetDeviationInPoints(10);
+   
+   // Define o tipo de preenchimento apropriado
+   ENUM_SYMBOL_TRADE_EXECUTION exe_mode = (ENUM_SYMBOL_TRADE_EXECUTION)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_EXEMODE);
+   
+   if(exe_mode == SYMBOL_TRADE_EXECUTION_EXCHANGE || exe_mode == SYMBOL_TRADE_EXECUTION_INSTANT)
+      trade.SetTypeFilling(ORDER_FILLING_RETURN);
+   else
+      trade.SetTypeFilling(ORDER_FILLING_FOK);
+   
+   CriarPainel();
+   
+   // Verifica se já existem ordens abertas (recuperação após restart)
+   VerificarOrdensExistentes();
+   
+   Print("Grid Trader Híbrido inicializado com sucesso!");
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Função de Desinicialização                                        |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // Remove o painel
+   ObjectDelete(0, painel_nome);
+   ObjectDelete(0, painel_nome + "_texto");
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Função Principal (Tick)                                           |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Atualiza o painel
+   AtualizarPainel();
+   
+   // Executa estratégia de compra (Grid)
+   ExecutarEstrategiaCompra();
+   
+   // Executa estratégia de venda (Contra-Tendência)
+   ExecutarEstrategiaVenda();
+}
+
+//+------------------------------------------------------------------+
+//| Estratégia de Compra - Grid Bidirecional                          |
+//+------------------------------------------------------------------+
+void ExecutarEstrategiaCompra()
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   // Se não tem nenhuma compra aberta, abre a primeira
+   if(!primeira_compra_aberta)
+   {
+      if(AbrirOrdemCompra(ask))
+      {
+         preco_primeira_compra = ask;
+         preco_ultima_compra = ask;
+         primeira_compra_aberta = true;
+         pode_abrir_venda = true;
+         Print("Primeira ordem de compra aberta em: ", ask);
+      }
+      return;
+   }
+   
+   // Verifica se existe alguma ordem próxima ao preço atual
+   if(ExisteCompraProxima(ask, Distancia_Grid_Compra))
+      return; // Já tem ordem nessa região
+   
+   // Verifica se precisa abrir nova ordem de compra (para BAIXO ou para CIMA)
+   double menor_distancia = 999999;
+   
+   // Calcula a menor distância de qualquer ordem de compra existente
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if(tipo != POSITION_TYPE_BUY) continue;
+      
+      double preco_ordem = PositionGetDouble(POSITION_PRICE_OPEN);
+      double distancia = MathAbs((ask - preco_ordem) / point);
+      
+      if(distancia < menor_distancia)
+         menor_distancia = distancia;
+   }
+   
+   // Se a menor distância for maior ou igual à distância do grid, abre nova compra
+   if(menor_distancia >= Distancia_Grid_Compra)
+   {
+      if(AbrirOrdemCompra(ask))
+      {
+         Print("Nova ordem de compra no grid em: ", ask, " (distância: ", menor_distancia, " pontos)");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Verifica se existe compra próxima ao preço                        |
+//+------------------------------------------------------------------+
+bool ExisteCompraProxima(double preco, int distancia_minima)
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if(tipo != POSITION_TYPE_BUY) continue;
+      
+      double preco_ordem = PositionGetDouble(POSITION_PRICE_OPEN);
+      double distancia = MathAbs((preco - preco_ordem) / point);
+      
+      // Se tem ordem muito próxima, retorna true
+      if(distancia < distancia_minima * 0.5) // 50% da distância para evitar duplicatas
+         return true;
+   }
+   
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Estratégia de Venda - Contra-Tendência                            |
+//+------------------------------------------------------------------+
+void ExecutarEstrategiaVenda()
+{
+   if(!primeira_compra_aberta || !pode_abrir_venda)
+      return;
+   
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   double referencia = (preco_ultima_venda > 0) ? preco_ultima_venda : preco_primeira_compra;
+   double distancia_pontos = MathAbs((bid - referencia) / point);
+   
+   // Se o preço se afastou 1000 pontos (para cima OU para baixo)
+   if(distancia_pontos >= Distancia_Gatilho_Venda)
+   {
+      if(AbrirOrdemVenda(bid))
+      {
+         preco_ultima_venda = bid;
+         pode_abrir_venda = false;
+         Print("Ordem de venda contra-tendência aberta em: ", bid);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Abre ordem de compra                                              |
+//+------------------------------------------------------------------+
+bool AbrirOrdemCompra(double preco)
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double tp = preco + (Take_Profit_Compra * point);
+   
+   tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+   
+   bool resultado = trade.Buy(Lote_Compra, _Symbol, 0, 0, tp, "Grid Buy");
+   
+   if(resultado)
+      Print("Compra executada: ", trade.ResultOrder());
+   else
+      Print("Erro ao abrir compra: ", trade.ResultRetcodeDescription());
+   
+   return resultado;
+}
+
+//+------------------------------------------------------------------+
+//| Abre ordem de venda                                               |
+//+------------------------------------------------------------------+
+bool AbrirOrdemVenda(double preco)
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double tp = preco - (Take_Profit_Venda * point);
+   
+   tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+   
+   bool resultado = trade.Sell(Lote_Venda, _Symbol, 0, 0, tp, "Counter Sell");
+   
+   if(resultado)
+      Print("Venda executada: ", trade.ResultOrder());
+   else
+      Print("Erro ao abrir venda: ", trade.ResultRetcodeDescription());
+   
+   return resultado;
+}
+
+//+------------------------------------------------------------------+
+//| Verifica ordens existentes (recuperação)                          |
+//+------------------------------------------------------------------+
+void VerificarOrdensExistentes()
+{
+   double preco_compra_mais_baixa = 0;
+   double preco_venda_mais_recente = 0;
+   bool tem_compra = false;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double preco_abertura = PositionGetDouble(POSITION_PRICE_OPEN);
+      
+      if(tipo == POSITION_TYPE_BUY)
+      {
+         tem_compra = true;
+         if(preco_compra_mais_baixa == 0 || preco_abertura < preco_compra_mais_baixa)
+         {
+            preco_compra_mais_baixa = preco_abertura;
+         }
+         if(preco_primeira_compra == 0 || preco_abertura > preco_primeira_compra)
+         {
+            preco_primeira_compra = preco_abertura;
+         }
+      }
+      else if(tipo == POSITION_TYPE_SELL)
+      {
+         if(preco_venda_mais_recente == 0 || preco_abertura > preco_venda_mais_recente)
+         {
+            preco_venda_mais_recente = preco_abertura;
+         }
+      }
+   }
+   
+   if(tem_compra)
+   {
+      primeira_compra_aberta = true;
+      preco_ultima_compra = preco_compra_mais_baixa;
+      preco_ultima_venda = preco_venda_mais_recente;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Cria o painel de informações                                      |
+//+------------------------------------------------------------------+
+void CriarPainel()
+{
+   int x = 10, y = 20;
+   int largura = 280, altura = 140;
+   
+   // Cria retângulo de fundo
+   ObjectCreate(0, painel_nome, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, painel_nome, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, painel_nome, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, painel_nome, OBJPROP_XSIZE, largura);
+   ObjectSetInteger(0, painel_nome, OBJPROP_YSIZE, altura);
+   ObjectSetInteger(0, painel_nome, OBJPROP_BGCOLOR, Cor_Painel);
+   ObjectSetInteger(0, painel_nome, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, painel_nome, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, painel_nome, OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, painel_nome, OBJPROP_BACK, false);
+   
+   // Cria texto
+   ObjectCreate(0, painel_nome + "_texto", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, painel_nome + "_texto", OBJPROP_XDISTANCE, x + 10);
+   ObjectSetInteger(0, painel_nome + "_texto", OBJPROP_YDISTANCE, y + 10);
+   ObjectSetInteger(0, painel_nome + "_texto", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, painel_nome + "_texto", OBJPROP_COLOR, Cor_Texto);
+   ObjectSetString(0, painel_nome + "_texto", OBJPROP_FONT, "Courier New");
+   ObjectSetInteger(0, painel_nome + "_texto", OBJPROP_FONTSIZE, 9);
+   
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Atualiza as informações do painel                                 |
+//+------------------------------------------------------------------+
+void AtualizarPainel()
+{
+   double lucro_total = CalcularLucroEA();
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double spread = (ask - bid) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   string timeframe = EnumToString((ENUM_TIMEFRAMES)Period());
+   StringReplace(timeframe, "PERIOD_", "");
+   
+   string texto = StringFormat(
+      "═══ GRID TRADER HÍBRIDO ═══\n" +
+      "Ativo: %s | TF: %s\n" +
+      "─────────────────────────\n" +
+      "Lucro EA: %s$%.2f\n" +
+      "─────────────────────────\n" +
+      "Ask: %.5f | Bid: %.5f\n" +
+      "Spread: %.1f pontos\n" +
+      "─────────────────────────\n" +
+      "Compras: %d | Vendas: %d",
+      _Symbol,
+      timeframe,
+      (lucro_total >= 0 ? "+" : ""),
+      lucro_total,
+      ask,
+      bid,
+      spread,
+      ContarOrdens(POSITION_TYPE_BUY),
+      ContarOrdens(POSITION_TYPE_SELL)
+   );
+   
+   ObjectSetString(0, painel_nome + "_texto", OBJPROP_TEXT, texto);
+   ChartRedraw(0);
+}
+
+//+------------------------------------------------------------------+
+//| Calcula lucro/prejuízo do EA                                      |
+//+------------------------------------------------------------------+
+double CalcularLucroEA()
+{
+   double lucro = 0;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      
+      lucro += PositionGetDouble(POSITION_PROFIT);
+      lucro += PositionGetDouble(POSITION_SWAP);
+   }
+   
+   // Adiciona lucro de ordens já fechadas do histórico de hoje
+   datetime hoje = TimeCurrent() - (TimeCurrent() % 86400);
+   HistorySelect(hoje, TimeCurrent());
+   
+   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket <= 0) continue;
+      
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != Magic_Number) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_IN) continue;
+      
+      lucro += HistoryDealGetDouble(ticket, DEAL_PROFIT);
+      lucro += HistoryDealGetDouble(ticket, DEAL_SWAP);
+      lucro += HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+   }
+   
+   return lucro;
+}
+
+//+------------------------------------------------------------------+
+//| Conta número de ordens abertas por tipo                           |
+//+------------------------------------------------------------------+
+int ContarOrdens(ENUM_POSITION_TYPE tipo)
+{
+   int count = 0;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == tipo)
+         count++;
+   }
+   
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Event handler para fechamento de ordens                           |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                        const MqlTradeRequest& request,
+                        const MqlTradeResult& result)
+{
+   // Quando uma venda é fechada, libera para abrir nova venda
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   {
+      ulong deal_ticket = trans.deal;
+      if(HistoryDealSelect(deal_ticket))
+      {
+         if(HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) == Magic_Number &&
+            HistoryDealGetString(deal_ticket, DEAL_SYMBOL) == _Symbol)
+         {
+            ENUM_DEAL_TYPE deal_type = (ENUM_DEAL_TYPE)HistoryDealGetInteger(deal_ticket, DEAL_TYPE);
+            ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+            
+            // Se uma venda foi fechada (saída)
+            if(deal_type == DEAL_TYPE_BUY && deal_entry == DEAL_ENTRY_OUT)
+            {
+               pode_abrir_venda = true;
+               Print("Venda fechada, liberado para nova venda");
+            }
+         }
+      }
+   }
+}
+//+------------------------------------------------------------------+
