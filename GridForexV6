@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Grid Trader Híbrido"
 #property version   "1.00"
-#property description "EA com Grid de Compras e Vendas Contra-Tendência"
+#property description "EA com Grid de Compras e Vendas Bidirecionais"
 
 #include <Trade\Trade.mqh>
 
@@ -14,10 +14,11 @@ input double   Lote_Compra = 0.01;                    // Lote para ordens de com
 input int      Distancia_Grid_Compra = 200;           // Distância entre compras (pontos)
 input int      Take_Profit_Compra = 200;              // Take Profit compras (pontos)
 
-input group "=== Estratégia de Venda (Contra-Tendência) ==="
+input group "=== Estratégia de Venda (Grid) ==="
 input double   Lote_Venda = 0.10;                     // Lote para ordem de venda
-input int      Distancia_Gatilho_Venda = 1000;        // Gatilho venda (pontos)
+input int      Distancia_Grid_Venda = 200;            // Distância entre vendas (pontos)
 input int      Take_Profit_Venda = 200;               // Take Profit venda (pontos)
+input int      Max_Vendas = 5;                        // Máximo de vendas simultâneas
 
 input group "=== Configurações Gerais ==="
 input int      Magic_Number = 123456;                 // Número mágico do EA
@@ -27,12 +28,19 @@ input color    Cor_Texto = clrWhite;                  // Cor do texto
 // Variáveis Globais
 CTrade trade;
 double preco_primeira_compra = 0;
-double preco_ultima_compra = 0;
-double preco_ultima_venda = 0;
+double preco_primeira_venda = 0;
 bool primeira_compra_aberta = false;
-bool pode_abrir_venda = true;
+bool primeira_venda_aberta = false;
 
 string painel_nome = "PainelInfo";
+
+// Declaração de funções
+bool ExisteCompraProxima(double preco, int distancia_minima);
+bool ExisteVendaProxima(double preco, int distancia_minima);
+bool AbrirOrdemCompra(double preco);
+bool AbrirOrdemVenda(double preco);
+int ContarOrdens(ENUM_POSITION_TYPE tipo);
+double CalcularLucroEA();
 
 //+------------------------------------------------------------------+
 //| Função de Inicialização                                           |
@@ -81,7 +89,7 @@ void OnTick()
    // Executa estratégia de compra (Grid)
    ExecutarEstrategiaCompra();
    
-   // Executa estratégia de venda (Contra-Tendência)
+   // Executa estratégia de venda (Grid)
    ExecutarEstrategiaVenda();
 }
 
@@ -100,9 +108,7 @@ void ExecutarEstrategiaCompra()
       if(AbrirOrdemCompra(ask))
       {
          preco_primeira_compra = ask;
-         preco_ultima_compra = ask;
          primeira_compra_aberta = true;
-         pode_abrir_venda = true;
          Print("Primeira ordem de compra aberta em: ", ask);
       }
       return;
@@ -145,6 +151,78 @@ void ExecutarEstrategiaCompra()
 }
 
 //+------------------------------------------------------------------+
+//| Estratégia de Venda - Grid Bidirecional                           |
+//+------------------------------------------------------------------+
+void ExecutarEstrategiaVenda()
+{
+   // Verifica se já atingiu o limite de vendas
+   int vendas_abertas = ContarOrdens(POSITION_TYPE_SELL);
+   if(vendas_abertas >= Max_Vendas)
+      return;
+   
+   // Precisa ter pelo menos uma compra aberta para usar como referência
+   if(!primeira_compra_aberta)
+      return;
+   
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   // Se não tem nenhuma venda aberta, verifica distância da primeira compra
+   if(!primeira_venda_aberta)
+   {
+      double distancia_compra = MathAbs((bid - preco_primeira_compra) / point);
+      
+      // Só abre a primeira venda se estiver à distância mínima da primeira compra
+      if(distancia_compra >= Distancia_Grid_Venda)
+      {
+         if(AbrirOrdemVenda(bid))
+         {
+            preco_primeira_venda = bid;
+            primeira_venda_aberta = true;
+            Print("Primeira ordem de venda aberta em: ", bid, " (distância da compra: ", distancia_compra, " pontos)");
+         }
+      }
+      return;
+   }
+   
+   // Verifica se existe alguma ordem próxima ao preço atual
+   if(ExisteVendaProxima(bid, Distancia_Grid_Venda))
+      return; // Já tem ordem nessa região
+   
+   // Verifica se precisa abrir nova ordem de venda (para BAIXO ou para CIMA)
+   double menor_distancia = 999999;
+   
+   // Calcula a menor distância de qualquer ordem de venda existente
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if(tipo != POSITION_TYPE_SELL) continue;
+      
+      double preco_ordem = PositionGetDouble(POSITION_PRICE_OPEN);
+      double distancia = MathAbs((bid - preco_ordem) / point);
+      
+      if(distancia < menor_distancia)
+         menor_distancia = distancia;
+   }
+   
+   // Se a menor distância for maior ou igual à distância do grid, abre nova venda
+   if(menor_distancia >= Distancia_Grid_Venda)
+   {
+      if(AbrirOrdemVenda(bid))
+      {
+         Print("Nova ordem de venda no grid em: ", bid, " (distância: ", menor_distancia, " pontos) - Total: ", vendas_abertas + 1, "/", Max_Vendas);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Verifica se existe compra próxima ao preço                        |
 //+------------------------------------------------------------------+
 bool ExisteCompraProxima(double preco, int distancia_minima)
@@ -174,29 +252,32 @@ bool ExisteCompraProxima(double preco, int distancia_minima)
 }
 
 //+------------------------------------------------------------------+
-//| Estratégia de Venda - Contra-Tendência                            |
+//| Verifica se existe venda próxima ao preço                         |
 //+------------------------------------------------------------------+
-void ExecutarEstrategiaVenda()
+bool ExisteVendaProxima(double preco, int distancia_minima)
 {
-   if(!primeira_compra_aberta || !pode_abrir_venda)
-      return;
-   
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    
-   double referencia = (preco_ultima_venda > 0) ? preco_ultima_venda : preco_primeira_compra;
-   double distancia_pontos = MathAbs((bid - referencia) / point);
-   
-   // Se o preço se afastou 1000 pontos (para cima OU para baixo)
-   if(distancia_pontos >= Distancia_Gatilho_Venda)
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(AbrirOrdemVenda(bid))
-      {
-         preco_ultima_venda = bid;
-         pode_abrir_venda = false;
-         Print("Ordem de venda contra-tendência aberta em: ", bid);
-      }
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if(tipo != POSITION_TYPE_SELL) continue;
+      
+      double preco_ordem = PositionGetDouble(POSITION_PRICE_OPEN);
+      double distancia = MathAbs((preco - preco_ordem) / point);
+      
+      // Se tem ordem muito próxima, retorna true
+      if(distancia < distancia_minima * 0.5) // 50% da distância para evitar duplicatas
+         return true;
    }
+   
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -229,7 +310,7 @@ bool AbrirOrdemVenda(double preco)
    
    tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
    
-   bool resultado = trade.Sell(Lote_Venda, _Symbol, 0, 0, tp, "Counter Sell");
+   bool resultado = trade.Sell(Lote_Venda, _Symbol, 0, 0, tp, "Grid Sell");
    
    if(resultado)
       Print("Venda executada: ", trade.ResultOrder());
@@ -244,9 +325,8 @@ bool AbrirOrdemVenda(double preco)
 //+------------------------------------------------------------------+
 void VerificarOrdensExistentes()
 {
-   double preco_compra_mais_baixa = 0;
-   double preco_venda_mais_recente = 0;
    bool tem_compra = false;
+   bool tem_venda = false;
    
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -262,10 +342,6 @@ void VerificarOrdensExistentes()
       if(tipo == POSITION_TYPE_BUY)
       {
          tem_compra = true;
-         if(preco_compra_mais_baixa == 0 || preco_abertura < preco_compra_mais_baixa)
-         {
-            preco_compra_mais_baixa = preco_abertura;
-         }
          if(preco_primeira_compra == 0 || preco_abertura > preco_primeira_compra)
          {
             preco_primeira_compra = preco_abertura;
@@ -273,19 +349,19 @@ void VerificarOrdensExistentes()
       }
       else if(tipo == POSITION_TYPE_SELL)
       {
-         if(preco_venda_mais_recente == 0 || preco_abertura > preco_venda_mais_recente)
+         tem_venda = true;
+         if(preco_primeira_venda == 0 || preco_abertura > preco_primeira_venda)
          {
-            preco_venda_mais_recente = preco_abertura;
+            preco_primeira_venda = preco_abertura;
          }
       }
    }
    
    if(tem_compra)
-   {
       primeira_compra_aberta = true;
-      preco_ultima_compra = preco_compra_mais_baixa;
-      preco_ultima_venda = preco_venda_mais_recente;
-   }
+   
+   if(tem_venda)
+      primeira_venda_aberta = true;
 }
 
 //+------------------------------------------------------------------+
@@ -342,7 +418,7 @@ void AtualizarPainel()
       "Ask: %.5f | Bid: %.5f\n" +
       "Spread: %.1f pontos\n" +
       "─────────────────────────\n" +
-      "Compras: %d | Vendas: %d",
+      "Compras: %d | Vendas: %d/%d",
       _Symbol,
       timeframe,
       (lucro_total >= 0 ? "+" : ""),
@@ -351,7 +427,8 @@ void AtualizarPainel()
       bid,
       spread,
       ContarOrdens(POSITION_TYPE_BUY),
-      ContarOrdens(POSITION_TYPE_SELL)
+      ContarOrdens(POSITION_TYPE_SELL),
+      Max_Vendas
    );
    
    ObjectSetString(0, painel_nome + "_texto", OBJPROP_TEXT, texto);
@@ -421,32 +498,16 @@ int ContarOrdens(ENUM_POSITION_TYPE tipo)
 }
 
 //+------------------------------------------------------------------+
-//| Event handler para fechamento de ordens                           |
+//| Event handler para transações de trade                            |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest& request,
                         const MqlTradeResult& result)
 {
-   // Quando uma venda é fechada, libera para abrir nova venda
+   // Atualiza painel quando há mudanças nas posições
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
    {
-      ulong deal_ticket = trans.deal;
-      if(HistoryDealSelect(deal_ticket))
-      {
-         if(HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) == Magic_Number &&
-            HistoryDealGetString(deal_ticket, DEAL_SYMBOL) == _Symbol)
-         {
-            ENUM_DEAL_TYPE deal_type = (ENUM_DEAL_TYPE)HistoryDealGetInteger(deal_ticket, DEAL_TYPE);
-            ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
-            
-            // Se uma venda foi fechada (saída)
-            if(deal_type == DEAL_TYPE_BUY && deal_entry == DEAL_ENTRY_OUT)
-            {
-               pode_abrir_venda = true;
-               Print("Venda fechada, liberado para nova venda");
-            }
-         }
-      }
+      AtualizarPainel();
    }
 }
 //+------------------------------------------------------------------+
