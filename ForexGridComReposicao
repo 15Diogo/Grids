@@ -1,0 +1,222 @@
+//+------------------------------------------------------------------+
+//|                                              GridScalperMT5.mq5  |
+//|                                  Copyright 2024, Trading Expert  |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2024, Trading Expert"
+#property link      "https://www.mql5.com"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//--- INPUT PARAMETERS
+input double   InitialBuyDist  = 30.0;     // Distância Inicial Compra (Pips)
+input double   InitialSellDist = 30.0;     // Distância Inicial Venda (Pips)
+input double   BuyOrderDist    = 15.0;     // Intervalo Grid Compra (Pips)
+input double   SellOrderDist   = 15.0;     // Intervalo Grid Venda (Pips)
+input double   TakeProfitPips  = 15.0;     // Take Profit (Pips)
+input double   LotSize         = 0.10;     // Lote das Ordens
+input int      GridLevels      = 5;        // Níveis de ordens pendentes simultâneas
+input long     MagicNumber     = 123456;   // Magic Number
+input int      MaxSlippage     = 30;       // Slippage Máximo
+
+//--- GLOBAL VARIABLES
+double         InitialPrice = 0;
+CTrade         trade;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+   InitialPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(InitialPrice == 0) return(INIT_FAILED);
+   
+   DrawInitialLine();
+   Print("Robô Alta Performance (Com Reposição) Iniciado. Preço Base: ", InitialPrice);
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   ObjectsDeleteAll(0, "Grid_");
+   Comment("");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double point = _Point;
+   double pipsToValue = (_Digits == 3 || _Digits == 5) ? 10 * point : point;
+
+   // Região de Venda
+   double sellStart = InitialPrice - (InitialSellDist * pipsToValue);
+   if(currentBid <= sellStart)
+   {
+      MaintainSellGrid(currentBid, pipsToValue);
+   }
+
+   // Região de Compra
+   double buyStart = InitialPrice + (InitialBuyDist * pipsToValue);
+   if(currentAsk >= buyStart)
+   {
+      MaintainBuyGrid(currentAsk, pipsToValue);
+   }
+   
+   UpdateChartInfo(currentBid, sellStart, buyStart);
+}
+
+//+------------------------------------------------------------------+
+//| Maintain Sell Grid with Pending Orders (With Refill)             |
+//+------------------------------------------------------------------+
+void MaintainSellGrid(double currentPrice, double pipsVal)
+{
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   double distFromStart = InitialPrice - currentPrice;
+   int currentLevel = (int)MathFloor((distFromStart - (InitialSellDist * pipsVal)) / (SellOrderDist * pipsVal));
+   if(currentLevel < 0) currentLevel = 0;
+
+   // Mantém uma janela de ordens pendentes à frente do preço atual
+   for(int i = currentLevel; i < currentLevel + GridLevels; i++)
+   {
+      double targetPrice = NormalizeDouble(InitialPrice - (InitialSellDist * pipsVal) - (i * SellOrderDist * pipsVal), digits);
+      double tpPrice = NormalizeDouble(targetPrice - (TakeProfitPips * pipsVal), digits);
+
+      // Se o nível já passou (acima do preço), tenta abrir a mercado ou garantir posição
+      if(currentPrice <= targetPrice)
+      {
+         if(!PositionExistsAtLevel(targetPrice, pipsVal, POSITION_TYPE_SELL, SellOrderDist))
+         {
+            trade.Sell(LotSize, _Symbol, currentPrice, 0, tpPrice, "Grid Sell");
+         }
+      }
+      else // Se está abaixo do preço, coloca ordem pendente
+      {
+         if(!OrderExistsAtLevel(targetPrice, pipsVal, ORDER_TYPE_SELL_LIMIT))
+         {
+            trade.SellLimit(LotSize, targetPrice, _Symbol, 0, tpPrice, ORDER_TIME_GTC, 0, "Grid Sell Limit L" + IntegerToString(i));
+            DrawLevelLine("Grid_Sell_Lim_" + IntegerToString(i), targetPrice, clrOrangeRed);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Maintain Buy Grid with Pending Orders (With Refill)              |
+//+------------------------------------------------------------------+
+void MaintainBuyGrid(double currentPrice, double pipsVal)
+{
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   double distFromStart = currentPrice - InitialPrice;
+   int currentLevel = (int)MathFloor((distFromStart - (InitialBuyDist * pipsVal)) / (BuyOrderDist * pipsVal));
+   if(currentLevel < 0) currentLevel = 0;
+
+   for(int i = currentLevel; i < currentLevel + GridLevels; i++)
+   {
+      double targetPrice = NormalizeDouble(InitialPrice + (InitialBuyDist * pipsVal) + (i * BuyOrderDist * pipsVal), digits);
+      double tpPrice = NormalizeDouble(targetPrice + (TakeProfitPips * pipsVal), digits);
+
+      if(currentPrice >= targetPrice)
+      {
+         if(!PositionExistsAtLevel(targetPrice, pipsVal, POSITION_TYPE_BUY, BuyOrderDist))
+         {
+            trade.Buy(LotSize, _Symbol, currentPrice, 0, tpPrice, "Grid Buy");
+         }
+      }
+      else
+      {
+         if(!OrderExistsAtLevel(targetPrice, pipsVal, ORDER_TYPE_BUY_LIMIT))
+         {
+            trade.BuyLimit(LotSize, targetPrice, _Symbol, 0, tpPrice, ORDER_TIME_GTC, 0, "Grid Buy Limit L" + IntegerToString(i));
+            DrawLevelLine("Grid_Buy_Lim_" + IntegerToString(i), targetPrice, clrSkyBlue);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check if position exists near a specific price level             |
+//+------------------------------------------------------------------+
+bool PositionExistsAtLevel(double price, double pipsVal, ENUM_POSITION_TYPE type, double orderDist)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber && 
+            PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_TYPE) == type)
+         {
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            if(MathAbs(openPrice - price) < (orderDist * pipsVal * 0.4)) return true;
+         }
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check if pending order exists near a specific price level        |
+//+------------------------------------------------------------------+
+bool OrderExistsAtLevel(double price, double pipsVal, ENUM_ORDER_TYPE type)
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(OrderSelect(ticket))
+      {
+         if(OrderGetInteger(ORDER_MAGIC) == MagicNumber && 
+            OrderGetString(ORDER_SYMBOL) == _Symbol &&
+            OrderGetInteger(ORDER_TYPE) == type)
+         {
+            double openPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+            if(MathAbs(openPrice - price) < (pipsVal * 1.0)) return true;
+         }
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Visual Helpers                                                   |
+//+------------------------------------------------------------------+
+void DrawInitialLine()
+{
+   ObjectCreate(0, "Grid_InitialPrice", OBJ_HLINE, 0, 0, InitialPrice);
+   ObjectSetInteger(0, "Grid_InitialPrice", OBJPROP_COLOR, clrYellow);
+   ObjectSetInteger(0, "Grid_InitialPrice", OBJPROP_STYLE, STYLE_DASH);
+   ObjectSetString(0, "Grid_InitialPrice", OBJPROP_TEXT, "Preço Base");
+}
+
+void DrawLevelLine(string name, double price, color col)
+{
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, col);
+      ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DOT);
+   }
+}
+
+void UpdateChartInfo(double bid, double sellT, double buyT)
+{
+   string text = "--- MONITOR GRID MT5 ---\n";
+   text += "Preço Base: " + DoubleToString(InitialPrice, _Digits) + "\n";
+   text += "Gatilho Venda: < " + DoubleToString(sellT, _Digits) + "\n";
+   text += "Gatilho Compra: > " + DoubleToString(buyT, _Digits) + "\n";
+   text += "Status: " + ((bid < InitialPrice) ? "Monitorando Vendas" : "Monitorando Compras");
+   
+   Comment(text);
+}
