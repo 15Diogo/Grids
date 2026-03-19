@@ -10,15 +10,15 @@
 
 // Parâmetros de Entrada
 input group "=== Estratégia de Compra (Grid) ==="
-input double   Lote_Compra = 0.03;                   // Lote para ordens de compra
-input int      Distancia_Grid_Compra = 1000;         // Distância entre compras (pontos)
+input double   Lote_Compra = 0.01;                   // Lote para ordens de compra
+input int      Distancia_Grid_Compra = 500;         // Distância entre compras (pontos)
 input int      Take_Profit_Compra = 500;             // Take Profit compras (pontos)
 
 input group "=== Estratégia de Venda (Grid) ==="
-input double   Lote_Venda = 0.10;                    // Lote para ordem de venda
-input int      Distancia_Grid_Venda = 3000;          // Distância entre vendas (pontos)
-input int      Take_Profit_Venda = 3000;             // Take Profit venda (pontos)
-input int      Max_Vendas = 3;                       // Máximo de vendas simultâneas
+input double   Lote_Venda = 0.03;                    // Lote para ordem de venda
+input int      Distancia_Grid_Venda = 2000;          // Distância entre vendas (pontos)
+input int      Take_Profit_Venda = 2000;             // Take Profit venda (pontos)
+input int      Max_Vendas = 5;                       // Máximo de vendas simultâneas
 
 input group "=== Gestão de Risco ==="
 input double   Stop_Loss_Financeiro = 200.0;         // Stop Loss Global em USD (Reset Automático)
