@@ -11,31 +11,31 @@
 // Parâmetros de Entrada
 input group "=== Estratégia de Compra (Grid) ==="
 input double   Lote_Compra = 0.03;                   // Lote para ordens de compra
-input int      Distancia_Grid_Compra = 1000;          // Distância entre compras (pontos)
+input int      Distancia_Grid_Compra = 1000;         // Distância entre compras (pontos)
 input int      Take_Profit_Compra = 500;             // Take Profit compras (pontos)
 
 input group "=== Estratégia de Venda (Grid) ==="
 input double   Lote_Venda = 0.10;                    // Lote para ordem de venda
-input int      Distancia_Grid_Venda = 3000;           // Distância entre vendas (pontos)
-input int      Take_Profit_Venda = 3000;              // Take Profit venda (pontos)
+input int      Distancia_Grid_Venda = 3000;          // Distância entre vendas (pontos)
+input int      Take_Profit_Venda = 3000;             // Take Profit venda (pontos)
 input int      Max_Vendas = 3;                       // Máximo de vendas simultâneas
 
 input group "=== Gestão de Risco ==="
 input double   Stop_Loss_Financeiro = 200.0;         // Stop Loss Global em USD (Reset Automático)
 
 input group "=== Configurações do Painel ==="
-input int      Magic_Number = 123456;                 // Número mágico do EA
-input int      Painel_X = 15;                         // Posição X do painel
-input int      Painel_Y = 25;                         // Posição Y do painel
-input bool     Mostrar_Botao_Reset = true;            // Mostrar botão de reset manual
-input color    Cor_Fundo = C'15,15,25';               // Cor de fundo
-input color    Cor_Header = C'30,144,255';            // Cor do cabeçalho (azul)
-input color    Cor_Positivo = C'0,230,118';           // Cor lucro (verde)
-input color    Cor_Negativo = C'255,82,82';           // Cor prejuízo (vermelho)
-input color    Cor_Texto = C'220,220,220';            // Cor texto principal
-input color    Cor_Texto_Sec = C'150,150,150';        // Cor texto secundário
-input color    Cor_Borda = C'50,50,70';               // Cor da borda
-input color    Cor_Botao = C'220,53,69';              // Cor do botão reset
+input int      Magic_Number = 123456;                // Número mágico do EA
+input int      Painel_X = 15;                        // Posição X do painel
+input int      Painel_Y = 25;                        // Posição Y do painel
+input bool     Mostrar_Botao_Reset = true;           // Mostrar botão de reset manual
+input color    Cor_Fundo = C'15,15,25';              // Cor de fundo
+input color    Cor_Header = C'30,144,255';           // Cor do cabeçalho (azul)
+input color    Cor_Positivo = C'0,230,118';          // Cor lucro (verde)
+input color    Cor_Negativo = C'255,82,82';          // Cor prejuízo (vermelho)
+input color    Cor_Texto = C'220,220,220';           // Cor texto principal
+input color    Cor_Texto_Sec = C'150,150,150';       // Cor texto secundário
+input color    Cor_Borda = C'50,50,70';              // Cor da borda
+input color    Cor_Botao = C'220,53,69';             // Cor do botão reset
 
 // Variáveis Globais
 CTrade trade;
@@ -111,14 +111,9 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // Atualiza o painel visual
    AtualizarPainelModerno();
-   
-   // 1. Verifica Stop Financeiro (Prioridade Máxima)
-   // Se acionar, ele reseta tudo dentro desta função e retorna
    VerificarStopFinanceiro();
-
-   // 2. Execução da Estratégia
+   
    ExecutarEstrategiaCompra();
    ExecutarEstrategiaVenda();
 }
@@ -130,23 +125,16 @@ void VerificarStopFinanceiro()
 {
    double lucro_flutuante = CalcularLucroEA();
    
-   // Verifica se o prejuízo atingiu o limite (ex: -200)
    if(lucro_flutuante <= -MathAbs(Stop_Loss_Financeiro))
    {
       Print("⚠️ STOP FINANCEIRO ATINGIDO! Prejuízo: $", DoubleToString(lucro_flutuante, 2));
       Print("🔄 Iniciando RESET AUTOMÁTICO...");
       
-      // Fecha todas as posições
       FecharTodasPosicoes();
-      
-      // Incrementa contador de stops
       contador_resets++;
-      
-      // Reseta a estratégia (zera referências e inicia nova sessão)
       ResetarEstrategia();
       
-      // Notificação
-      Print("✅ RESET CONCLUÍDO. Iniciando novo ciclo de operações imediamente.");
+      Print("✅ RESET CONCLUÍDO. Iniciando novo ciclo de operações imediatamente.");
    }
 }
 
@@ -181,7 +169,6 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
 //+------------------------------------------------------------------+
 void ExecutarEstrategiaCompra()
 {
-   // Se houver qualquer ordem de VENDA aberta, NÃO abre novas compras
    if(ContarOrdens(POSITION_TYPE_SELL) > 0)
       return;
 
@@ -214,6 +201,8 @@ void ExecutarEstrategiaCompra()
       if(tipo != POSITION_TYPE_BUY) continue;
       
       double preco_ordem = PositionGetDouble(POSITION_PRICE_OPEN);
+      
+      // O MathAbs garante que ele pegue "qualquer movimento de distância", tanto em ALTA quanto em QUEDA!
       double distancia = MathAbs((ask - preco_ordem) / point);
       
       if(distancia < menor_distancia)
@@ -227,7 +216,7 @@ void ExecutarEstrategiaCompra()
 }
 
 //+------------------------------------------------------------------+
-//| Estratégia de Venda                                              |
+//| Estratégia de Venda (Abre SOMENTE SE o preço CAIR)               |
 //+------------------------------------------------------------------+
 void ExecutarEstrategiaVenda()
 {
@@ -241,11 +230,13 @@ void ExecutarEstrategiaVenda()
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    
+   // Abertura da PRIMEIRA Venda (somente se CAIR em relação à compra inicial)
    if(!primeira_venda_aberta)
    {
-      double distancia_compra = MathAbs((bid - preco_primeira_compra) / point);
+      // Subtraindo bid do preco compra: assim o valor positivo só ocorre na queda de preços.
+      double queda_da_compra = (preco_primeira_compra - bid) / point;
       
-      if(distancia_compra >= Distancia_Grid_Venda)
+      if(queda_da_compra >= Distancia_Grid_Venda)
       {
          if(AbrirOrdemVenda(bid))
          {
@@ -259,7 +250,9 @@ void ExecutarEstrategiaVenda()
    if(ExisteVendaProxima(bid, Distancia_Grid_Venda))
       return;
    
-   double menor_distancia = 999999;
+   // Abertura das PRÓXIMAS Vendas (somente se CAIR a partir da venda mais baixa)
+   double menor_preco_venda = 999999;
+   bool tem_venda = false;
    
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -267,19 +260,27 @@ void ExecutarEstrategiaVenda()
       if(ticket <= 0) continue;
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
       if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      
       ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
       if(tipo != POSITION_TYPE_SELL) continue;
       
       double preco_ordem = PositionGetDouble(POSITION_PRICE_OPEN);
-      double distancia = MathAbs((bid - preco_ordem) / point);
-      
-      if(distancia < menor_distancia)
-         menor_distancia = distancia;
+      if(preco_ordem < menor_preco_venda)
+      {
+         menor_preco_venda = preco_ordem;
+         tem_venda = true;
+      }
    }
    
-   if(menor_distancia >= Distancia_Grid_Venda)
+   // Se encontrou alguma venda, checa se o preço atual está caindo (bid MENOR que a última venda efetuada pela distância)
+   if(tem_venda)
    {
-      AbrirOrdemVenda(bid);
+      double queda_limite = (menor_preco_venda - bid) / point;
+      
+      if(queda_limite >= Distancia_Grid_Venda)
+      {
+         AbrirOrdemVenda(bid);
+      }
    }
 }
 
