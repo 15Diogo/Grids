@@ -10,15 +10,15 @@
 
 // Parâmetros de Entrada
 input group "=== Estratégia de Compra (Grid) ==="
-input double   Lote_Compra = 0.01;                   // Lote para ordens de compra
-input int      Distancia_Grid_Compra = 500;         // Distância entre compras (pontos)
+input double   Lote_Compra = 0.03;                   // Lote para ordens de compra
+input int      Distancia_Grid_Compra = 1000;         // Distância entre compras (pontos)
 input int      Take_Profit_Compra = 500;             // Take Profit compras (pontos)
 
 input group "=== Estratégia de Venda (Grid) ==="
-input double   Lote_Venda = 0.03;                    // Lote para ordem de venda
-input int      Distancia_Grid_Venda = 2000;          // Distância entre vendas (pontos)
-input int      Take_Profit_Venda = 2000;             // Take Profit venda (pontos)
-input int      Max_Vendas = 5;                       // Máximo de vendas simultâneas
+input double   Lote_Venda = 0.10;                    // Lote para ordem de venda
+input int      Distancia_Grid_Venda = 3000;          // Distância entre vendas (pontos)
+input int      Take_Profit_Venda = 3000;             // Take Profit venda (pontos)
+input int      Max_Vendas = 3;                       // Máximo de vendas simultâneas
 
 input group "=== Gestão de Risco ==="
 input double   Stop_Loss_Financeiro = 200.0;         // Stop Loss Global em USD (Reset Automático)
@@ -165,15 +165,22 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
 }
 
 //+------------------------------------------------------------------+
-//| Estratégia de Compra (Bloqueada se houver vendas)                |
+//| Estratégia de Compra (Retoma compras ao voltar para a zona)      |
 //+------------------------------------------------------------------+
 void ExecutarEstrategiaCompra()
 {
-   if(ContarOrdens(POSITION_TYPE_SELL) > 0)
-      return;
-
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    
+   // NOVA REGRA: Se houver ordem de VENDA aberta, o robô verifica se o preço 
+   // já voltou para a "zona de compra" (que é considerada acima do preço da primeira venda).
+   if(ContarOrdens(POSITION_TYPE_SELL) > 0)
+   {
+      // Se não mapeou ainda a primeira venda, ou se o preço atual ainda está 
+      // abaixo ou igual ao preço da primeira venda (ainda em queda forte), mantém bloqueado.
+      if(!primeira_venda_aberta || ask <= preco_primeira_venda)
+         return; 
+   }
+
    if(!primeira_compra_aberta)
    {
       if(AbrirOrdemCompra(ask))
@@ -574,24 +581,4 @@ void CriarBotao(string nome, int x, int y, int largura, int altura, string texto
    ObjectSetInteger(0, nome, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    ObjectSetInteger(0, nome, OBJPROP_BGCOLOR, cor_fundo);
    ObjectSetInteger(0, nome, OBJPROP_COLOR, cor_texto);
-   ObjectSetInteger(0, nome, OBJPROP_BORDER_COLOR, C'180,40,50');
-   ObjectSetString(0, nome, OBJPROP_FONT, "Courier New");
-   ObjectSetInteger(0, nome, OBJPROP_FONTSIZE, 9);
-   ObjectSetString(0, nome, OBJPROP_TEXT, texto);
-   ObjectSetInteger(0, nome, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, nome, OBJPROP_HIDDEN, true);
-}
-
-void DeletarTodosObjetos()
-{
-   string prefixos[] = {"painel_", "txt_", "btn_"};
-   for(int p = 0; p < ArraySize(prefixos); p++)
-   {
-      for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
-      {
-         string nome = ObjectName(0, i);
-         if(StringFind(nome, prefixos[p]) >= 0) ObjectDelete(0, nome);
-      }
-   }
-   ChartRedraw();
-}
+   ObjectSetInteger(0, nome,
