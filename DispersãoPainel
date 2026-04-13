@@ -1,0 +1,219 @@
+//+------------------------------------------------------------------+
+//|                                              DispersionPanel.mq5 |
+//|                                  Copyright 2026, Antigravity     |
+//+------------------------------------------------------------------+
+#property copyright "Antigravity"
+#property link      "https://www.antigravity.ai/"
+#property version   "1.00"
+#property indicator_chart_window
+#property indicator_plots 0
+
+//--- Inputs
+input string   InpSymbols       = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,XAUUSD,BTCUSD,ETHUSD"; // Pares
+input int      InpYearsLookback = 5;                                  // Histórico de Dispersão (Anos)
+input int      InpRefreshRate   = 3;                                  // Segundos para re-analisar moedas
+input int      InpScrollSpeed   = 2;                                  // Velocidade de Rolagem (Pixels)
+
+//--- Magic Prefix for Objects
+string PREFIX = "DP_MINIMAL_";
+
+//--- Arrays for symbols
+string g_symbols[];
+int    g_handles[];
+int    g_total_symbols = 0;
+
+//--- Caching e Rolagem
+double g_values[];
+string g_display_texts[];
+color  g_display_colors[];
+int    g_scroll_x = 0;
+int    g_gap_x = 120; // Espaço reservado para cada texto
+
+//--- Base Timeframe for the 5-year lookback
+ENUM_TIMEFRAMES BASE_TF = PERIOD_D1; 
+int    g_lookback_bars = 0;
+
+//--- Cores Minimalistas
+color COLOR_GREEN    = clrLimeGreen; 
+color COLOR_ORANGE   = clrDarkOrange; 
+color COLOR_RED      = clrRed; 
+color COLOR_LOADING  = clrGray;
+
+//+------------------------------------------------------------------+
+//| Inicialização                                                    |
+//+------------------------------------------------------------------+
+int OnInit() {
+    g_lookback_bars = InpYearsLookback * 252;
+    if(g_lookback_bars <= 0) g_lookback_bars = 252; 
+    
+    StringSplit(InpSymbols, ',', g_symbols);
+    g_total_symbols = ArraySize(g_symbols);
+    
+    ArrayResize(g_handles, g_total_symbols);
+    ArrayResize(g_values, g_total_symbols);
+    ArrayResize(g_display_texts, g_total_symbols);
+    ArrayResize(g_display_colors, g_total_symbols);
+    
+    for(int i=0; i<g_total_symbols; i++) {
+        StringTrimLeft(g_symbols[i]);
+        StringTrimRight(g_symbols[i]);
+        g_handles[i] = iBands(g_symbols[i], BASE_TF, 20, 0, 2.0, PRICE_CLOSE);
+    }
+    
+    // Cálculo Imediato
+    UpdateValues();
+    
+    // Inicia Timer de Milissegundos para rolagem fluida (50ms = 20 fps)
+    EventSetMillisecondTimer(50);
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Destruição                                                       |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+    EventKillTimer();
+    ObjectsDeleteAll(0, PREFIX);
+    for(int i=0; i<g_total_symbols; i++) {
+        if(g_handles[i] != INVALID_HANDLE) IndicatorRelease(g_handles[i]);
+    }
+    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[]) {
+    return(rates_total);
+}
+
+//+------------------------------------------------------------------+
+//| Atualização dos Dados (Heavy Math)                               |
+//+------------------------------------------------------------------+
+void UpdateValues() {
+    for(int i=0; i<g_total_symbols; i++) {
+        double p = GetDispersionPercentile(i);
+        g_values[i] = p;
+        
+        if(p == -1.0 || p == -2.0) {
+            g_display_texts[i] = g_symbols[i] + " [---]";
+            g_display_colors[i] = COLOR_LOADING;
+        } else {
+            g_display_texts[i] = g_symbols[i] + " [" + DoubleToString(p, 0) + "%]";
+            if(p <= 20.0) g_display_colors[i] = COLOR_GREEN;
+            else if(p <= 60.0) g_display_colors[i] = COLOR_ORANGE;
+            else g_display_colors[i] = COLOR_RED;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Evento do Timer (Gerencia Rolagem e Atualização Temporal)        |
+//+------------------------------------------------------------------+
+void OnTimer() {
+    static uint last_update_time = 0;
+    uint now = GetTickCount();
+    
+    // Atualiza os valores a cada Xs (Não calcula tudo a cada 50ms para não travar o MT5)
+    if(now - last_update_time > (uint)(InpRefreshRate * 1000)) {
+        UpdateValues();
+        last_update_time = now;
+    }
+    
+    // Animação de Rolagem do Eixo X (- Velocidade)
+    g_scroll_x -= InpScrollSpeed;
+    
+    DrawMinimalTicker();
+}
+
+//+------------------------------------------------------------------+
+//| Helper para calcular o percentil
+//+------------------------------------------------------------------+
+double GetDispersionPercentile(int index) {
+    if(g_handles[index] == INVALID_HANDLE) return -1.0;
+    
+    double upper[], lower[];
+    ArraySetAsSeries(upper, true);
+    ArraySetAsSeries(lower, true);
+    
+    int copied_up = CopyBuffer(g_handles[index], 1, 0, g_lookback_bars, upper);
+    int copied_low = CopyBuffer(g_handles[index], 2, 0, g_lookback_bars, lower);
+    
+    if(copied_up < g_lookback_bars || copied_low < g_lookback_bars) return -2.0; 
+    
+    double min_width = 999999999.0;
+    double max_width = 0.0;
+    
+    for(int i=0; i<g_lookback_bars; i++) {
+        double width = upper[i] - lower[i];
+        if(width <= 0) continue;
+        if(width < min_width) min_width = width;
+        if(width > max_width) max_width = width;
+    }
+    
+    if(max_width - min_width == 0) return 0.0;
+    
+    double current_width = upper[0] - lower[0];
+    double percent = ((current_width - min_width) / (max_width - min_width)) * 100.0;
+    
+    if(percent < 0.0) percent = 0.0;
+    if(percent > 100.0) percent = 100.0;
+    
+    return percent;
+}
+
+//+------------------------------------------------------------------+
+//| Instancia do Texto
+//+------------------------------------------------------------------+
+void CreateMinimalText(string name, int x, int y, string text, color col) {
+    if(ObjectFind(0, name) < 0) {
+        ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0); 
+        ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER); 
+        ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+        ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+        ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9); // Tamanho bom pra letreiro
+        ObjectSetString(0, name, OBJPROP_FONT, "Segoe UI"); 
+    }
+    ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+    ObjectSetString(0, name, OBJPROP_TEXT, text);
+    ObjectSetInteger(0, name, OBJPROP_COLOR, col);
+}
+
+//+------------------------------------------------------------------+
+//| Loop Gráfico do Letreiro Infinito (Marquee)                      |
+//+------------------------------------------------------------------+
+void DrawMinimalTicker() {
+    int START_Y = 22; 
+    
+    int chart_width = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
+    int total_items_width = g_total_symbols * g_gap_x;
+    
+    // O comprimento do looping precisa ser ao menos o tamanho da tela + moedas
+    // Para que as moedas deem a volta suave.
+    int loop_width = chart_width;
+    if(total_items_width > chart_width) {
+        loop_width = total_items_width;
+    }
+    
+    for(int i=0; i<g_total_symbols; i++) {
+        // Cálculo Circular do X (Faz elas flutuarem infinitamente da direita pra esquerda)
+        long pos_x = (g_scroll_x + (i * g_gap_x)) % loop_width;
+        
+        // Em MQL5 módulo de negativo continua negativo, então empurramos pra direita:
+        if(pos_x < 0) {
+            pos_x += loop_width;
+        }
+        
+        CreateMinimalText(PREFIX+"T"+IntegerToString(i), (int)pos_x, START_Y, g_display_texts[i], g_display_colors[i]);
+    }
+    
+    ChartRedraw();
+}
