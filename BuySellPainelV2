@@ -1,0 +1,656 @@
+//+------------------------------------------------------------------+
+//|                                                Grid_Strategy.mq5 |
+//|                                  Copyright 2025, Seu Nome Aqui |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025"
+#property link      "https://www.mql5.com"
+#property version   "2.20"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+CTrade trade;
+CPositionInfo position;
+
+//+------------------------------------------------------------------+
+//| ENUM DE TEMAS                                                     |
+//+------------------------------------------------------------------+
+enum ENUM_THEME
+{
+   THEME_DARK  = 0,  // Tema Escuro
+   THEME_LIGHT = 1   // Tema Claro
+};
+
+//--- Parâmetros de entrada
+input double   Volume        = 0.01;       // Volume das ordens (0 = micro lote)
+input int      PipDistance   = 15;         // Distância em pips entre ordens
+input int      TakeProfit    = 15;         // Take Profit em pips
+input string   EA_Comment    = "Grid_EA";  // Comentário das ordens
+input int      MagicNumber   = 12345;      // Número mágico
+
+//--- Parâmetros do Painel
+input bool         ShowPanel   = true;         // Mostrar painel de informações
+input int          PanelX      = 10;           // Posição X do painel
+input int          PanelY      = 20;           // Posição Y do painel
+input int          PanelWidth  = 1000;         // Largura do painel
+input int          PanelHeight = 88;           // Altura do painel (fino)
+input ENUM_THEME   Theme       = THEME_DARK;   // Tema (Escuro / Claro)
+input bool         ApplyChartColors = true;    // Aplicar cores do tema no gráfico
+
+//--- Variáveis globais
+double lastOrderPrice      = 0;
+double pipValue;
+bool   initialOrdersPlaced = true;
+ENUM_THEME currentTheme;
+
+//+------------------------------------------------------------------+
+//| ESTRUTURA DE CORES POR TEMA                                       |
+//+------------------------------------------------------------------+
+struct ThemeColors
+{
+   // painel
+   color bgMain;
+   color border;
+   color separator;
+   color textLabel;
+   color textValue;
+   color textPositive;
+   color textNegative;
+   color textWarning;
+   color textBuy;
+   color textSell;
+   color btnBg;
+   color btnText;
+   color btnNeutralBg;
+   color btnNeutralText;
+   // gráfico
+   color chartBg;
+   color chartFg;      // eixos, texto do gráfico
+   color chartGrid;
+   color candleBull;   // corpo de alta
+   color candleBear;   // corpo de baixa
+   color candleLine;   // linhas/borda dos candles
+   color volume;
+};
+
+ThemeColors DarkPalette()
+{
+   ThemeColors c;
+   // painel
+   c.bgMain        = C'25,28,32';
+   c.border        = C'90,90,90';
+   c.separator     = C'70,70,70';
+   c.textLabel     = C'170,170,170';
+   c.textValue     = C'235,235,235';
+   c.textPositive  = C'0,210,90';
+   c.textNegative  = C'230,60,60';
+   c.textWarning   = C'255,200,40';
+   c.textBuy       = C'0,210,90';
+   c.textSell      = C'230,60,60';
+   c.btnBg         = C'235,70,60';
+   c.btnText       = clrWhite;
+   c.btnNeutralBg  = C'45,49,58';
+   c.btnNeutralText= C'220,220,220';
+   // gráfico
+   c.chartBg       = C'20,22,26';
+   c.chartFg       = C'200,200,200';
+   c.chartGrid     = C'45,49,58';
+   c.candleBull    = C'0,200,90';
+   c.candleBear    = C'230,60,60';
+   c.candleLine    = C'180,180,180';
+   c.volume        = C'120,120,120';
+   return c;
+}
+
+ThemeColors LightPalette()
+{
+   ThemeColors c;
+   // painel
+   c.bgMain        = C'244,245,247';
+   c.border        = C'180,180,180';
+   c.separator     = C'210,210,210';
+   c.textLabel     = C'80,85,95';
+   c.textValue     = C'20,25,35';
+   c.textPositive  = C'0,150,70';
+   c.textNegative  = C'200,40,40';
+   c.textWarning   = C'210,140,20';
+   c.textBuy       = C'0,150,70';
+   c.textSell      = C'200,40,40';
+   c.btnBg         = C'220,60,55';
+   c.btnText       = clrWhite;
+   c.btnNeutralBg  = C'255,255,255';
+   c.btnNeutralText= C'40,45,55';
+   // gráfico
+   c.chartBg       = C'250,250,252';
+   c.chartFg       = C'40,45,55';
+   c.chartGrid     = C'220,222,226';
+   c.candleBull    = C'0,150,70';
+   c.candleBear    = C'200,40,40';
+   c.candleLine    = C'60,60,60';
+   c.volume        = C'150,150,150';
+   return c;
+}
+
+ThemeColors GetColors()
+{
+   if(currentTheme == THEME_LIGHT) return LightPalette();
+   return DarkPalette();
+}
+
+//+------------------------------------------------------------------+
+//| APLICAR CORES DO TEMA NO GRÁFICO                                  |
+//+------------------------------------------------------------------+
+void ApplyChartTheme()
+{
+   if(!ApplyChartColors) return;
+
+   ThemeColors C = GetColors();
+   long chart = 0;
+
+   ChartSetInteger(chart, CHART_COLOR_BACKGROUND,   C.chartBg);
+   ChartSetInteger(chart, CHART_COLOR_FOREGROUND,   C.chartFg);
+   ChartSetInteger(chart, CHART_COLOR_GRID,         C.chartGrid);
+   ChartSetInteger(chart, CHART_COLOR_CHART_UP,     C.candleBull);
+   ChartSetInteger(chart, CHART_COLOR_CHART_DOWN,   C.candleBear);
+   ChartSetInteger(chart, CHART_COLOR_CHART_LINE,   C.candleLine);
+   ChartSetInteger(chart, CHART_COLOR_CANDLE_BULL,  C.candleBull);
+   ChartSetInteger(chart, CHART_COLOR_CANDLE_BEAR,  C.candleBear);
+   ChartSetInteger(chart, CHART_COLOR_VOLUME,       C.volume);
+   ChartSetInteger(chart, CHART_COLOR_BID,          C.textLabel);
+   ChartSetInteger(chart, CHART_COLOR_ASK,          C.textLabel);
+   ChartSetInteger(chart, CHART_COLOR_LAST,         C.textValue);
+   ChartSetInteger(chart, CHART_COLOR_STOP_LEVEL,   C.textWarning);
+   ChartSetInteger(chart, CHART_SHOW_GRID,          true);
+
+   ChartRedraw(chart);
+}
+
+//+------------------------------------------------------------------+
+//| INITIALIZATION / DEINIT / TICK                                    |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+
+   pipValue = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) == 5 ||
+      SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) == 3)
+      pipValue *= 10;
+
+   currentTheme = Theme;
+
+   CheckExistingPositions();
+
+   ApplyChartTheme();
+
+   if(ShowPanel)
+      CreatePanel();
+
+   Print("Grid EA v2.20 iniciado | Tema: ",
+         (currentTheme==THEME_LIGHT ? "Claro" : "Escuro"));
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason)
+{
+   if(ShowPanel)
+      RemovePanel();
+}
+
+void OnTick()
+{
+   if(!initialOrdersPlaced)
+   {
+      PlaceInitialOrders();
+      return;
+   }
+
+   CheckForNewOrders();
+
+   if(ShowPanel)
+      UpdatePanel();
+}
+
+//+------------------------------------------------------------------+
+//| TRATAMENTO DE CLIQUES                                             |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam,
+                  const double &dparam, const string &sparam)
+{
+   if(id != CHARTEVENT_OBJECT_CLICK) return;
+
+   if(sparam == "GridPanel_ThemeBtn_BTN")
+   {
+      ToggleTheme();
+      ObjectSetInteger(0, "GridPanel_ThemeBtn_BTN", OBJPROP_STATE, false);
+   }
+   else if(sparam == "GridPanel_ReinitBtn_BTN")
+   {
+      CloseAllOrders();
+      ObjectSetInteger(0, "GridPanel_ReinitBtn_BTN", OBJPROP_STATE, false);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ALTERNAR TEMA                                                     |
+//+------------------------------------------------------------------+
+void ToggleTheme()
+{
+   currentTheme = (currentTheme == THEME_DARK) ? THEME_LIGHT : THEME_DARK;
+   RemovePanel();
+   ApplyChartTheme();
+   CreatePanel();
+   UpdatePanel();
+   Print("Tema alterado para: ",
+         (currentTheme==THEME_LIGHT ? "Claro" : "Escuro"));
+}
+
+//+------------------------------------------------------------------+
+//| CRIAÇÃO DO PAINEL — FINO, LARGO, HORIZONTAL                       |
+//+------------------------------------------------------------------+
+void CreatePanel()
+{
+   ThemeColors C = GetColors();
+
+   int W = PanelWidth;
+   int H = PanelHeight;
+
+   // Bloco do botão REINICIAR à direita
+   int btnW = 150;
+   // Bloco do seletor de tema à direita do botão? Não – colocamos AO LADO
+   int themeW = 110;
+   int gap    = 6;
+
+   // Área de dados = largura total menos os dois botões e paddings
+   int dataArea = W - btnW - themeW - gap*3;
+   // 5 colunas de dados
+   int colW = dataArea / 5;
+
+   // === Fundo principal ===
+   CreateRect("GP_BG", PanelX, PanelY, W, H, C.bgMain, C.border, 1);
+
+   // === Coordenadas verticais compactas ===
+   int yLabel = PanelY + 10;   // rótulo (topo)
+   int yValue = PanelY + 26;   // valor principal
+   int yLabel2 = PanelY + 48;  // rótulo (inferior)
+   int yValue2 = PanelY + 64;  // valor inferior
+
+   int x = PanelX + 8;
+
+   // --- Coluna 1: ATIVO / STATUS ---
+   CreateLabel("GP_Ativo_Lbl",  "ATIVO",    x, yLabel,  8,  C.textLabel, "Arial");
+   CreateLabel("GP_Ativo_Val",  _Symbol,    x, yValue,  11, C.textValue, "Arial Black");
+   CreateLabel("GP_Status_Lbl", "STATUS",   x, yLabel2, 8,  C.textLabel, "Arial");
+   CreateLabel("GP_Status_V",   "OPERANDO", x, yValue2, 10, C.textPositive, "Arial Black");
+   x += colW;
+   DrawSep("GP_Sep1", x - 4, C.separator);
+
+   // --- Coluna 2: SALDO / EQUITY ---
+   CreateLabel("GP_Saldo_Lbl",  "SALDO",    x, yLabel,  8,  C.textLabel, "Arial");
+   CreateLabel("GP_Saldo_Val",  "R$ 0,00",  x, yValue,  11, C.textValue, "Arial Black");
+   CreateLabel("GP_Equity_Lbl", "EQUITY",   x, yLabel2, 8,  C.textLabel, "Arial");
+   CreateLabel("GP_Equity_Val", "R$ 0,00",  x, yValue2, 10, C.textPositive, "Arial Black");
+   x += colW;
+   DrawSep("GP_Sep2", x - 4, C.separator);
+
+   // --- Coluna 3: LUCRO FLUT. / LUCRO HIST. ---
+   CreateLabel("GP_LF_Lbl", "LUCRO FLUT.", x, yLabel,  8,  C.textLabel, "Arial");
+   CreateLabel("GP_LF_Val", "+ R$ 0,00",   x, yValue,  11, C.textPositive, "Arial Black");
+   CreateLabel("GP_LH_Lbl", "LUCRO HIST.", x, yLabel2, 8,  C.textLabel, "Arial");
+   CreateLabel("GP_LH_Val", "+ R$ 0,00",   x, yValue2, 10, C.textPositive, "Arial Black");
+   x += colW;
+   DrawSep("GP_Sep3", x - 4, C.separator);
+
+   // --- Coluna 4: ORDENS / COMPRAS / VENDAS ---
+   CreateLabel("GP_Ordens_Lbl", "ORDENS",  x, yLabel,  8,  C.textLabel, "Arial");
+   CreateLabel("GP_Ordens_Val", "0",       x, yValue,  13, C.textValue, "Arial Black");
+   CreateLabel("GP_Buy_Lbl",    "COMPRAS", x, yLabel2, 8,  C.textBuy, "Arial");
+   CreateLabel("GP_Buy_Val",    "0",       x + 55, yLabel2, 8, C.textBuy, "Arial Bold");
+   CreateLabel("GP_Sell_Lbl",   "VENDAS",  x, yValue2, 8,  C.textSell, "Arial");
+   CreateLabel("GP_Sell_Val",   "0",       x + 55, yValue2, 8, C.textSell, "Arial Bold");
+   x += colW;
+   DrawSep("GP_Sep4", x - 4, C.separator);
+
+   // --- Coluna 5: DRAWDOWN / SPREAD ---
+   CreateLabel("GP_DD_Lbl",  "DRAWDOWN", x, yLabel,  8,  C.textLabel, "Arial");
+   CreateLabel("GP_DD_Val",  "0.0%",     x, yValue,  11, C.textWarning, "Arial Black");
+   CreateLabel("GP_Spr_Lbl", "SPREAD",   x, yLabel2, 8,  C.textLabel, "Arial");
+   CreateLabel("GP_Spr_Val", "0.0 pips", x, yValue2, 10, C.textValue, "Arial Black");
+   x += colW;
+   DrawSep("GP_Sep5", x - 4, C.separator);
+
+   // === Bloco do botão REINICIAR ESTRATÉGIA ===
+   int btnX = PanelX + W - btnW - themeW - gap*2;
+   CreateRect("GP_ReinitBG", btnX, PanelY + 8, btnW, H - 16,
+              C.btnBg, C.btnBg, 1);
+   CreateBtnLabel("GridPanel_ReinitBtn", "REINICIAR\nESTRATÉGIA",
+                  btnX, PanelY + 8, btnW, H - 16,
+                  C.btnBg, C.btnText);
+
+   // === Seletor de TEMA (menor, ao lado do botão vermelho) ===
+   int themeX = PanelX + W - themeW - gap;
+   CreateBtnLabel("GridPanel_ThemeBtn",
+                  (currentTheme == THEME_DARK) ? "TEMA CLARO" : "TEMA ESCURO",
+                  themeX, PanelY + 8, themeW, H - 16,
+                  C.btnNeutralBg, C.btnNeutralText);
+}
+
+//+------------------------------------------------------------------+
+//| Separador vertical fino                                           |
+//+------------------------------------------------------------------+
+void DrawSep(string name, int x, color clr)
+{
+   CreateRect(name, x, PanelY + 8, 1, PanelHeight - 16, clr, clr, 0);
+}
+
+//+------------------------------------------------------------------+
+//| ATUALIZAÇÃO DINÂMICA                                              |
+//+------------------------------------------------------------------+
+void UpdatePanel()
+{
+   ThemeColors C = GetColors();
+
+   double initialBal = 25000.0;
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
+   double profitHist = equity - initialBal;
+
+   int    total = 0, buy = 0, sell = 0;
+   double profit = 0.0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(position.SelectByIndex(i))
+      {
+         if(position.Symbol() == _Symbol && position.Magic() == MagicNumber)
+         {
+            total++;
+            profit += position.Profit() + position.Swap() + position.Commission();
+            if(position.PositionType() == POSITION_TYPE_BUY) buy++;
+            else sell++;
+         }
+      }
+   }
+
+   double dd = 0;
+   if(balance > 0) dd = ((balance - equity) / balance) * 100.0;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double spr = (ask - bid) / pipValue;
+
+   // Fundo do painel repintado (para reagir à troca de tema)
+   ObjectSetInteger(0, "GP_BG", OBJPROP_BGCOLOR, C.bgMain);
+   ObjectSetInteger(0, "GP_BG", OBJPROP_COLOR,    C.border);
+
+   // Saldo
+   ObjectSetString (0, "GP_Saldo_Val", OBJPROP_TEXT, "R$ " + FormatNum(balance));
+   ObjectSetInteger(0, "GP_Saldo_Val", OBJPROP_COLOR, C.textValue);
+
+   // Equity
+   ObjectSetString (0, "GP_Equity_Val", OBJPROP_TEXT, "R$ " + FormatNum(equity));
+   ObjectSetInteger(0, "GP_Equity_Val", OBJPROP_COLOR,
+                    (equity >= balance ? C.textPositive : C.textNegative));
+
+   // Lucro flutuante
+   string lfSign = (profit >= 0 ? "+ " : "");
+   ObjectSetString (0, "GP_LF_Val", OBJPROP_TEXT,
+                    lfSign + "R$ " + FormatNum(profit));
+   ObjectSetInteger(0, "GP_LF_Val", OBJPROP_COLOR,
+                    (profit >= 0 ? C.textPositive : C.textNegative));
+
+   // Lucro histórico
+   string lhSign = (profitHist >= 0 ? "+ " : "");
+   ObjectSetString (0, "GP_LH_Val", OBJPROP_TEXT,
+                    lhSign + "R$ " + FormatNum(profitHist));
+   ObjectSetInteger(0, "GP_LH_Val", OBJPROP_COLOR,
+                    (profitHist >= 0 ? C.textPositive : C.textNegative));
+
+   // Ordens / compras / vendas
+   ObjectSetString(0, "GP_Ordens_Val", OBJPROP_TEXT, IntegerToString(total));
+   ObjectSetString(0, "GP_Buy_Val",    OBJPROP_TEXT, IntegerToString(buy));
+   ObjectSetString(0, "GP_Sell_Val",   OBJPROP_TEXT, IntegerToString(sell));
+
+   // Drawdown
+   color ddColor = (dd > 5.0 ? C.textNegative :
+                   (dd > 2.0 ? C.textWarning  : C.textPositive));
+   ObjectSetString (0, "GP_DD_Val", OBJPROP_TEXT, DoubleToString(dd, 1) + "%");
+   ObjectSetInteger(0, "GP_DD_Val", OBJPROP_COLOR, ddColor);
+
+   // Spread
+   ObjectSetString (0, "GP_Spr_Val", OBJPROP_TEXT, DoubleToString(spr, 1) + " pips");
+   ObjectSetInteger(0, "GP_Spr_Val", OBJPROP_COLOR, C.textValue);
+
+   // Status
+   if(total > 0)
+   {
+      ObjectSetString (0, "GP_Status_V", OBJPROP_TEXT, "OPERANDO");
+      ObjectSetInteger(0, "GP_Status_V", OBJPROP_COLOR, C.textPositive);
+   }
+   else
+   {
+      ObjectSetString (0, "GP_Status_V", OBJPROP_TEXT, "AGUARDANDO");
+      ObjectSetInteger(0, "GP_Status_V", OBJPROP_COLOR, C.textWarning);
+   }
+
+   // Botão REINICIAR (cor constante do tema)
+   ObjectSetInteger(0, "GP_ReinitBG", OBJPROP_BGCOLOR, C.btnBg);
+   ObjectSetInteger(0, "GP_ReinitBG", OBJPROP_COLOR,    C.btnBg);
+   UpdateBtnColors("GridPanel_ReinitBtn", C.btnBg, C.btnText);
+
+   // Botão TEMA (cor neutra do tema)
+   UpdateBtnColors("GridPanel_ThemeBtn", C.btnNeutralBg, C.btnNeutralText);
+}
+
+//+------------------------------------------------------------------+
+//| UTILITÁRIOS DE OBJETOS                                            |
+//+------------------------------------------------------------------+
+void CreateRect(string name, int x, int y, int w, int h,
+                color bg, color border, int bw)
+{
+   ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,      CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,   x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE,   y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,       w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,       h);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR,     bg);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,       border);
+   ObjectSetInteger(0, name, OBJPROP_STYLE,       STYLE_SOLID);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,       bw);
+   ObjectSetInteger(0, name, OBJPROP_BACK,        false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN,      true);
+}
+
+void CreateLabel(string name, string text, int x, int y,
+                 int size, color clr, string font)
+{
+   ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,     clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  size);
+   ObjectSetString (0, name, OBJPROP_FONT,      font);
+   ObjectSetString (0, name, OBJPROP_TEXT,      text);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN,    true);
+}
+
+void CreateBtnLabel(string name, string text, int x, int y,
+                    int w, int h, color bg, color textCol)
+{
+   string btnName = name + "_BTN";
+   ObjectDelete(0, btnName);
+
+   if(!ObjectCreate(0, btnName, OBJ_BUTTON, 0, 0, 0))
+   {
+      Print("Falha ao criar botão ", btnName);
+      return;
+   }
+
+   ObjectSetInteger(0, btnName, OBJPROP_CORNER,      CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, btnName, OBJPROP_XDISTANCE,   x);
+   ObjectSetInteger(0, btnName, OBJPROP_YDISTANCE,   y);
+   ObjectSetInteger(0, btnName, OBJPROP_XSIZE,       w);
+   ObjectSetInteger(0, btnName, OBJPROP_YSIZE,       h);
+   ObjectSetInteger(0, btnName, OBJPROP_BGCOLOR,     bg);
+   ObjectSetInteger(0, btnName, OBJPROP_COLOR,       textCol);
+   ObjectSetInteger(0, btnName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, btnName, OBJPROP_SELECTABLE,  true);
+   ObjectSetInteger(0, btnName, OBJPROP_HIDDEN,      true);
+
+   ObjectSetString (0, btnName, OBJPROP_TEXT,     text);
+   ObjectSetString (0, btnName, OBJPROP_FONT,     "Arial Black");
+   ObjectSetInteger(0, btnName, OBJPROP_FONTSIZE, 9);
+}
+
+void UpdateBtnColors(string baseName, color bg, color textCol)
+{
+   string btnName = baseName + "_BTN";
+   ObjectSetInteger(0, btnName, OBJPROP_BGCOLOR, bg);
+   ObjectSetInteger(0, btnName, OBJPROP_COLOR,   textCol);
+}
+
+void RemovePanel()
+{
+   ObjectsDeleteAll(0, "GP_");
+   ObjectsDeleteAll(0, "GridPanel_");
+}
+
+//+------------------------------------------------------------------+
+//| Formatador R$ 25.432,10                                           |
+//+------------------------------------------------------------------+
+string FormatNum(double v)
+{
+   string s       = DoubleToString(MathAbs(v), 2);
+   string inteiro = s;
+   string dec     = "";
+   int pos = StringFind(s, ".");
+   if(pos >= 0)
+   {
+      inteiro = StringSubstr(s, 0, pos);
+      dec     = StringSubstr(s, pos);
+   }
+
+   string fmt = "";
+   int n = StringLen(inteiro);
+   for(int i = 0; i < n; i++)
+   {
+      fmt += StringSubstr(inteiro, i, 1);
+      int restante = n - i - 1;
+      if(restante > 0 && restante % 3 == 0) fmt += ".";
+   }
+
+   if(dec == "") dec = ",00";
+   else          dec = "," + StringSubstr(dec, 1);
+
+   return fmt + dec;
+}
+
+//+------------------------------------------------------------------+
+//| LÓGICA DE NEGOCIAÇÃO                                              |
+//+------------------------------------------------------------------+
+void PlaceInitialOrders()
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double orderVolume = (Volume == 0)
+                        ? SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN)
+                        : Volume;
+   double tpPts = TakeProfit * pipValue;
+
+   trade.Buy (orderVolume, _Symbol, ask, 0, ask + tpPts,
+              EA_Comment + "_COMPRA");
+   trade.Sell(orderVolume, _Symbol, bid, 0, bid - tpPts,
+              EA_Comment + "_VENDA");
+
+   lastOrderPrice = (ask + bid) / 2;
+   initialOrdersPlaced = true;
+}
+
+void CheckForNewOrders()
+{
+   double mid  = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) +
+                 SymbolInfoDouble(_Symbol, SYMBOL_BID)) / 2;
+   double dist = MathAbs(mid - lastOrderPrice) / pipValue;
+   if(dist >= PipDistance) PlaceNewOrderPair(mid);
+}
+
+void PlaceNewOrderPair(double referencePrice)
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double orderVolume = (Volume == 0)
+                        ? SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN)
+                        : Volume;
+   double tpPts = TakeProfit * pipValue;
+
+   trade.Buy (orderVolume, _Symbol, ask, 0, ask + tpPts,
+              EA_Comment + "_COMPRA");
+   trade.Sell(orderVolume, _Symbol, bid, 0, bid - tpPts,
+              EA_Comment + "_VENDA");
+
+   lastOrderPrice = referencePrice;
+}
+
+void CheckExistingPositions()
+{
+   if(PositionsTotal() > 0)
+   {
+      double latestPrice = 0;
+      datetime latestTime = 0;
+      for(int i = 0; i < PositionsTotal(); i++)
+      {
+         if(position.SelectByIndex(i))
+         {
+            if(position.Symbol() == _Symbol && position.Magic() == MagicNumber)
+            {
+               if(position.Time() > latestTime)
+               {
+                  latestTime  = position.Time();
+                  latestPrice = position.PriceOpen();
+               }
+            }
+         }
+      }
+      if(latestPrice > 0)
+      {
+         lastOrderPrice = latestPrice;
+         initialOrdersPlaced = true;
+      }
+   }
+}
+
+void CloseAllOrders()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(position.SelectByIndex(i))
+      {
+         if(position.Symbol() == _Symbol && position.Magic() == MagicNumber)
+            trade.PositionClose(position.Ticket());
+      }
+   }
+   initialOrdersPlaced = false;
+}
+
+double CalculateLotSize()
+{
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(Volume == 0) return minLot;
+
+   double lot = Volume;
+   lot = MathMax(minLot, lot);
+   lot = MathMin(maxLot, lot);
+   lot = MathRound(lot / stepLot) * stepLot;
+   return lot;
+}
+//+------------------------------------------------------------------+
