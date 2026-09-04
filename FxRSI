@@ -1,0 +1,575 @@
+//+------------------------------------------------------------------+
+//|                                Grid Trader Compras v3.92.mq5     |
+//|                                                                  |
+//+------------------------------------------------------------------+
+#property copyright "Grid Trader Compras"
+#property version   "3.92"
+#property description "Painel Minimalista Sem Grade + Grid Perpétuo + Gatilho RSI 14 + Stop $200"
+
+#include <Trade\Trade.mqh>
+
+// Parâmetros de Entrada
+input group "=== Estratégia de Compra (Grid) ==="
+input double   Lote_Compra = 0.03;                   // Lote base para ordens de compra
+input int      Distancia_Grid_Compra = 1000;         // Distância entre compras (pontos)
+input int      Take_Profit_Compra = 1000;            // Take Profit compras (pontos)
+
+input group "=== Lote Progressivo (Compra) ==="
+input bool     Usar_Lote_Progressivo = true;         // Ativar incremento de lote
+input int      Ordens_Para_Incrementar = 10;         // A cada quantas compras ATIVAS incrementa
+input double   Incremento_Lote_Compra = 0.01;        // Quanto incrementa por nível
+
+input group "=== Filtro RSI Inicial (Apenas 1ª Vez) ==="
+input bool               Usar_Filtro_RSI = true;             // Ativar filtro de RSI para o gatilho inicial
+input int                RSI_Periodo = 14;                   // Período do RSI
+input ENUM_TIMEFRAMES    RSI_Timeframe = PERIOD_CURRENT;     // Timeframe do RSI
+input ENUM_APPLIED_PRICE RSI_Preco = PRICE_CLOSE;            // Preço aplicado ao RSI
+input double             RSI_Nivel_Sobrecompra = 70.0;       // Nível de sobrecompra (Visual)
+input double             RSI_Nivel_Sobrevenda = 30.0;        // Nível de sobrevenda (Gatilho Inicial)
+
+input group "=== Filtro Média Móvel (Tendência) ==="
+input bool               Usar_Filtro_MA200 = false;          // (Desativado) Só compra se preço estiver ACIMA da média
+input int                MA_Periodo = 200;                   // Período da média móvel
+input ENUM_MA_METHOD     MA_Metodo = MODE_SMA;               // Método da média
+input ENUM_APPLIED_PRICE MA_Preco = PRICE_CLOSE;             // Preço aplicado à média
+input ENUM_TIMEFRAMES    MA_Timeframe = PERIOD_CURRENT;      // Timeframe da média
+input int                Distancia_Banda_MA = 2330;          // Distância das bandas (pontos)
+input color              Cor_Banda_Superior = C'255,152,0';  // Cor da banda superior
+input color              Cor_Banda_Inferior = C'0,188,212';  // Cor da banda inferior
+
+input group "=== Stop Financeiro da Sessão ==="
+input bool   Usar_Stop_Financeiro = true;            // Ativar proteções financeiras da sessão
+input double Meta_Lucro_Sessao = 400.0;              // Meta de lucro da sessão em USD (Stop Gain)
+input double Stop_Loss_Sessao = 200.0;               // Perda máxima da sessão em USD (Stop Loss de $200)
+
+input group "=== Configurações do Painel ==="
+input int      Magic_Number = 123456;                // Número mágico do EA
+input int      Painel_X = 15;                        // Posição X do painel
+input int      Painel_Y = 25;                        // Posição Y do painel
+input bool     Mostrar_Botao_Reset = true;           // Mostrar botão de reset manual
+input color    Cor_Fundo = C'15,17,23';              // Cor de fundo elegante (Dark Premium)
+input color    Cor_Card = C'22,27,34';               // Cor de fundo dos cartões internos
+input color    Cor_Header = C'41,121,255';           // Cor do cabeçalho / Destaque (Azul)
+input color    Cor_Positivo = C'46,204,113';         // Cor lucro (Verde suave)
+input color    Cor_Negativo = C'231,76,60';          // Cor prejuízo (Vermelho suave)
+input color    Cor_Alerta = C'241,196,15';           // Cor alerta (Amarelo)
+input color    Cor_Texto = C'240,246,252';           // Cor texto principal (Branco suave)
+input color    Cor_Texto_Sec = C'139,148,158';       // Cor texto secundário (Cinza)
+input color    Cor_Botao = C'215,58,73';             // Cor do botão reset
+
+// Variáveis Globais
+CTrade trade;
+bool grid_ja_ativado = false; 
+
+// Controle de Sessão
+double capital_inicial_sessao = 0;
+double balance_inicial = 0;
+datetime hora_inicio_sessao = 0;
+int contador_resets = 0;
+
+// Indicadores
+int rsi_handle = INVALID_HANDLE;
+double rsi_atual = 50.0;
+
+int ma_handle = INVALID_HANDLE;
+double ma_atual = 0.0;
+
+// Layout do painel
+int PAINEL_LARGURA = 360;
+int PAINEL_ALTURA  = 0;
+
+// Declaração de funções
+bool ExisteCompraProxima(double preco, int distancia_minima);
+bool AbrirOrdemCompra(double preco);
+int ContarOrdens(ENUM_POSITION_TYPE tipo);
+double CalcularLucroEA();
+double CalcularLoteAtual();
+bool VerificarStopSessao();
+
+void CriarObjetoPainel(string nome, int x, int y, int largura, int altura, color cor, int corner = CORNER_LEFT_UPPER);
+void CriarTexto(string nome, int x, int y, string texto, color cor, int tamanho, string fonte = "Arial", int corner = CORNER_LEFT_UPPER);
+void CriarBotao(string nome, int x, int y, int largura, int altura, string texto, color cor_fundo, color cor_texto);
+void CriarSecao(string nome_base, int x, int y, string titulo);
+void DeletarTodosObjetos();
+void ResetarEstrategia();
+void FecharTodasPosicoes();
+void CriarPainelModerno();
+void AtualizarPainelModerno();
+bool AtualizarIndicadores();
+bool RSIPermiteCompra();
+bool MAPermiteCompra();
+void DesenharBandasMA();
+void CriarLinhaHorizontal(string nome, double preco, color cor);
+void AdicionarIndicadoresNoGrafico();
+
+//+------------------------------------------------------------------+
+//| Função de Inicialização                                          |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(Magic_Number);
+   trade.SetDeviationInPoints(10);
+   
+   ENUM_SYMBOL_TRADE_EXECUTION exe_mode = (ENUM_SYMBOL_TRADE_EXECUTION)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_EXEMODE);
+   if(exe_mode == SYMBOL_TRADE_EXECUTION_EXCHANGE || exe_mode == SYMBOL_TRADE_EXECUTION_INSTANT)
+      trade.SetTypeFilling(ORDER_FILLING_RETURN);
+   else
+      trade.SetTypeFilling(ORDER_FILLING_FOK);
+   
+   balance_inicial = AccountInfoDouble(ACCOUNT_BALANCE);
+   capital_inicial_sessao = AccountInfoDouble(ACCOUNT_EQUITY);
+   hora_inicio_sessao = TimeCurrent();
+   
+   rsi_handle = iRSI(_Symbol, RSI_Timeframe, RSI_Periodo, RSI_Preco);
+   ma_handle  = iMA(_Symbol, MA_Timeframe, MA_Periodo, 0, MA_Metodo, MA_Preco);
+   
+   if(rsi_handle == INVALID_HANDLE || ma_handle == INVALID_HANDLE)
+   {
+      Print("❌ ERRO: Falha ao criar os indicadores.");
+      return(INIT_FAILED);
+   }
+   
+   PAINEL_ALTURA = Mostrar_Botao_Reset ? 445 : 410;
+   
+   AdicionarIndicadoresNoGrafico();
+   CriarPainelModerno();
+   AtualizarIndicadores();
+   DesenharBandasMA();
+   
+   Print("▶️ Grid Trader Compras v3.92 (Painel Minimalista Sem Grade) Iniciado!");
+   return(INIT_SUCCEEDED);
+}
+
+void AdicionarIndicadoresNoGrafico()
+{
+   bool has_ma = false;
+   int inds_main = ChartIndicatorsTotal(0, 0);
+   for(int j = 0; j < inds_main; j++) {
+      if(StringFind(ChartIndicatorName(0, 0, j), "MA") >= 0) { has_ma = true; break; }
+   }
+   if(!has_ma) ChartIndicatorAdd(0, 0, ma_handle);
+
+   int sub_windows = (int)ChartGetInteger(0, CHART_WINDOWS_TOTAL);
+   bool has_rsi = false;
+   for(int i = 1; i < sub_windows; i++) {
+      int inds = ChartIndicatorsTotal(0, i);
+      for(int j = 0; j < inds; j++) {
+         if(StringFind(ChartIndicatorName(0, i, j), "RSI") >= 0) { has_rsi = true; break; }
+      }
+   }
+   if(!has_rsi) ChartIndicatorAdd(0, sub_windows, rsi_handle);
+}
+
+void OnDeinit(const int reason)
+{
+   if(rsi_handle != INVALID_HANDLE) IndicatorRelease(rsi_handle);
+   if(ma_handle  != INVALID_HANDLE) IndicatorRelease(ma_handle);
+   DeletarTodosObjetos();
+}
+
+void OnTick()
+{
+   AtualizarIndicadores();
+   DesenharBandasMA();
+   AtualizarPainelModerno();
+
+   if(VerificarStopSessao()) return;
+
+   ExecutarEstrategiaCompra();
+}
+
+bool AtualizarIndicadores()
+{
+   if(rsi_handle == INVALID_HANDLE || ma_handle == INVALID_HANDLE) return false;
+   double buffer_rsi[1], buffer_ma[1];
+   if(CopyBuffer(rsi_handle, 0, 0, 1, buffer_rsi) < 1) return false;
+   if(CopyBuffer(ma_handle, 0, 0, 1, buffer_ma) < 1) return false;
+   rsi_atual = buffer_rsi[0];
+   ma_atual  = buffer_ma[0];
+   return true;
+}
+
+void DesenharBandasMA()
+{
+   if(ma_handle == INVALID_HANDLE || !Usar_Filtro_MA200) return;
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double banda_superior = ma_atual + (Distancia_Banda_MA * point);
+   double banda_inferior = ma_atual - (Distancia_Banda_MA * point);
+   CriarLinhaHorizontal("linha_banda_superior", banda_superior, Cor_Banda_Superior);
+   CriarLinhaHorizontal("linha_banda_inferior", banda_inferior, Cor_Banda_Inferior);
+}
+
+void CriarLinhaHorizontal(string nome, double preco, color cor)
+{
+   if(ObjectFind(0, nome) < 0) {
+      ObjectCreate(0, nome, OBJ_HLINE, 0, 0, preco);
+      ObjectSetInteger(0, nome, OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0, nome, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, nome, OBJPROP_BACK, true);
+      ObjectSetInteger(0, nome, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, nome, OBJPROP_HIDDEN, true);
+   } else {
+      ObjectSetDouble(0, nome, OBJPROP_PRICE, preco);
+   }
+   ObjectSetInteger(0, nome, OBJPROP_COLOR, cor);
+}
+
+bool RSIPermiteCompra()
+{
+   if(!Usar_Filtro_RSI) return true;
+   return (rsi_atual < RSI_Nivel_Sobrevenda);
+}
+
+bool MAPermiteCompra()
+{
+   if(!Usar_Filtro_MA200) return true;
+   double preco_atual = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   return (preco_atual > ma_atual);
+}
+
+bool VerificarStopSessao()
+{
+   if(!Usar_Stop_Financeiro) return false;
+   double equity_atual = AccountInfoDouble(ACCOUNT_EQUITY);
+   double resultado_sessao = equity_atual - capital_inicial_sessao;
+
+   if(Meta_Lucro_Sessao > 0 && resultado_sessao >= Meta_Lucro_Sessao)
+   {
+      Print("🎯 META DE LUCRO ATINGIDA: $", DoubleToString(resultado_sessao, 2));
+      contador_resets++;
+      ResetarEstrategia();
+      return true;
+   }
+
+   if(Stop_Loss_Sessao > 0 && resultado_sessao <= -MathAbs(Stop_Loss_Sessao))
+   {
+      Print("🛑 STOP LOSS DE $200 ATINGIDO: $", DoubleToString(resultado_sessao, 2));
+      contador_resets++;
+      ResetarEstrategia();
+      return true;
+   }
+   return false;
+}
+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK && sparam == "btn_reset")
+   {
+      int resposta = MessageBox("Deseja RESETAR MANUALMENTE a estratégia?", "Confirmar", MB_YESNO | MB_ICONWARNING);
+      if(resposta == IDYES) {
+         contador_resets++;
+         ResetarEstrategia();
+      }
+      ObjectSetInteger(0, "btn_reset", OBJPROP_STATE, false);
+      ChartRedraw();
+   }
+}
+
+void ExecutarEstrategiaCompra()
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   int ordens_compradas = ContarOrdens(POSITION_TYPE_BUY);
+
+   if(!grid_ja_ativado)
+   {
+      if(ordens_compradas == 0)
+      {
+         if(!RSIPermiteCompra() || !MAPermiteCompra()) return;
+         if(AbrirOrdemCompra(ask)) grid_ja_ativado = true;
+      }
+      return;
+   }
+   
+   if(ordens_compradas == 0)
+   {
+      AbrirOrdemCompra(ask);
+      return;
+   }
+   
+   if(ExisteCompraProxima(ask, Distancia_Grid_Compra)) return;
+   
+   double menor_distancia = 999999;
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
+      
+      double preco_ordem = PositionGetDouble(POSITION_PRICE_OPEN);
+      double distancia = MathAbs((ask - preco_ordem) / point);
+      if(distancia < menor_distancia) menor_distancia = distancia;
+   }
+   
+   if(menor_distancia >= Distancia_Grid_Compra) AbrirOrdemCompra(ask);
+}
+
+bool ExisteCompraProxima(double preco, int distancia_minima)
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
+      
+      double preco_ordem = PositionGetDouble(POSITION_PRICE_OPEN);
+      double distancia = MathAbs((preco - preco_ordem) / point);
+      if(distancia < distancia_minima * 0.5) return true;
+   }
+   return false;
+}
+
+double CalcularLoteAtual()
+{
+   double lote = Lote_Compra;
+   if(Usar_Lote_Progressivo && Ordens_Para_Incrementar > 0)
+   {
+      int compras_ativas = ContarOrdens(POSITION_TYPE_BUY);
+      int nivel = compras_ativas / Ordens_Para_Incrementar;
+      lote = Lote_Compra + (nivel * Incremento_Lote_Compra);
+   }
+   double lote_min  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lote_max  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lote_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(lote_step > 0) lote = MathRound(lote / lote_step) * lote_step;
+   lote = NormalizeDouble(lote, 2);
+   if(lote < lote_min) lote = lote_min;
+   if(lote > lote_max) lote = lote_max;
+   return lote;
+}
+
+bool AbrirOrdemCompra(double preco)
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double tp = preco + (Take_Profit_Compra * point);
+   tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+   double lote_atual = CalcularLoteAtual();
+   return trade.Buy(lote_atual, _Symbol, 0, 0, tp, "Grid Buy L" + DoubleToString(lote_atual, 2));
+}
+
+void FecharTodasPosicoes()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == Magic_Number)
+         trade.PositionClose(ticket);
+   }
+}
+
+void ResetarEstrategia()
+{
+   FecharTodasPosicoes();
+   grid_ja_ativado = false;
+   balance_inicial = AccountInfoDouble(ACCOUNT_BALANCE);
+   capital_inicial_sessao = AccountInfoDouble(ACCOUNT_EQUITY);
+   hora_inicio_sessao = TimeCurrent();
+   AtualizarPainelModerno();
+}
+
+void CriarSecao(string nome_base, int x, int y, string titulo)
+{
+   CriarTexto(nome_base + "_titulo", x + 12, y, titulo, Cor_Header, 8, "Arial Black");
+}
+
+//+------------------------------------------------------------------+
+//| Painel Minimalista — Sem Grade, Design Limpo e Profissional      |
+//+------------------------------------------------------------------+
+void CriarPainelModerno()
+{
+   int x = Painel_X;
+   int y = Painel_Y;
+   int largura = PAINEL_LARGURA;
+   int altura = PAINEL_ALTURA;
+   
+   // Fundo principal limpo
+   CriarObjetoPainel("painel_fundo", x, y, largura, altura, Cor_Fundo);
+   CriarObjetoPainel("painel_header", x, y, largura, 42, Cor_Header);
+   
+   // Blocos / Cartões Flutuantes (Sem linhas de grade, apenas blocos sólidos)
+   CriarObjetoPainel("card_conta", x+10, y+50, largura-20, 105, Cor_Card);
+   CriarObjetoPainel("card_mercado", x+10, y+163, largura-20, 110, Cor_Card);
+   CriarObjetoPainel("card_ops", x+10, y+281, largura-20, 95, Cor_Card);
+   
+   // Títulos das seções limpos
+   CriarSecao("sec_conta", x+10, y+58, "SESSÃO & CONTA");
+   CriarSecao("sec_mercado", x+10, y+171, "MERCADO & INDICADOR");
+   CriarSecao("sec_ops", x+10, y+289, "OPERACIONAL & GRID");
+   
+   if(Mostrar_Botao_Reset) {
+      CriarBotao("btn_reset", x+10, y+384, largura-20, 24, "🔄  RESET MANUAL", Cor_Botao, clrWhite);
+   }
+   ChartRedraw();
+}
+
+void AtualizarPainelModerno()
+{
+   int x = Painel_X;
+   int y = Painel_Y;
+   int largura = PAINEL_LARGURA;
+   
+   // Header
+   CriarTexto("txt_titulo", x+15, y+8, "GRID TRADER PRO", clrWhite, 11, "Arial Black");
+   string timeframe = EnumToString((ENUM_TIMEFRAMES)Period());
+   StringReplace(timeframe, "PERIOD_", "");
+   CriarTexto("txt_simbolo", x+15, y+24, _Symbol + "   •   " + timeframe, C'200,220,240', 8, "Courier New");
+   
+   // Cartão Conta
+   double saldo_atual = AccountInfoDouble(ACCOUNT_BALANCE);
+   double capital_atual = AccountInfoDouble(ACCOUNT_EQUITY); 
+   double resultado_sessao = capital_atual - capital_inicial_sessao;
+   color cor_resultado = (resultado_sessao >= 0) ? Cor_Positivo : Cor_Negativo;
+   string sinal = (resultado_sessao >= 0) ? "+" : "";
+   
+   CriarTexto("txt_saldo_ini", x+20, y+78, "Saldo Inicial: $" + DoubleToString(balance_inicial, 2), Cor_Texto_Sec, 8, "Arial");
+   CriarTexto("txt_saldo_atu", x+20, y+94, "Saldo Líquido: $" + DoubleToString(saldo_atual, 2), Cor_Texto_Sec, 8, "Arial");
+   CriarTexto("txt_patrimonio", x+20, y+110, "Patrimônio:", Cor_Texto, 9, "Arial");
+   CriarTexto("txt_patrimonio_val", x+95, y+109, "$" + DoubleToString(capital_atual, 2), clrWhite, 10, "Arial Black");
+   
+   CriarTexto("txt_resultado", x+20, y+129, "Resultado:", Cor_Texto, 9, "Arial");
+   CriarTexto("txt_resultado_val", x+95, y+128, sinal + "$" + DoubleToString(MathAbs(resultado_sessao), 2), cor_resultado, 10, "Arial Black");
+   
+   // Cartão Mercado & RSI
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   CriarTexto("txt_ask_bid", x+20, y+191, "Ask: " + DoubleToString(ask, _Digits) + "   |   Bid: " + DoubleToString(bid, _Digits), Cor_Texto_Sec, 8, "Courier New");
+   
+   color cor_rsi = (rsi_atual <= RSI_Nivel_Sobrevenda) ? Cor_Positivo : ((rsi_atual >= RSI_Nivel_Sobrecompra) ? Cor_Negativo : Cor_Alerta);
+   CriarTexto("txt_rsi_lbl", x+20, y+211, "RSI(14):", Cor_Texto, 9, "Arial");
+   CriarTexto("txt_rsi_val", x+75, y+210, DoubleToString(rsi_atual, 1), cor_rsi, 10, "Arial Black");
+
+   // Pílula de Status Minimalista
+   string txt_pill = "";
+   color cor_pill;
+
+   if(!grid_ja_ativado) {
+      bool permitido = RSIPermiteCompra() && MAPermiteCompra();
+      if(permitido) {
+         txt_pill = "● GATILHO INICIAL DISPONÍVEL";
+         cor_pill = Cor_Positivo;
+      } else {
+         txt_pill = "● AGUARDANDO RSI(14) SOBREVENDA";
+         cor_pill = Cor_Alerta;
+      }
+   } else {
+      txt_pill = "● GRID PERPÉTUO ATIVO";
+      cor_pill = Cor_Header;
+   }
+   
+   CriarObjetoPainel("pill_status", x+20, y+238, largura-40, 20, Cor_Fundo);
+   CriarTexto("txt_status_val", x+30, y+242, txt_pill, cor_pill, 8, "Arial Black");
+
+   // Cartão Operacional
+   int compras_ativas = ContarOrdens(POSITION_TYPE_BUY);
+   double lote_atual = CalcularLoteAtual();
+   double lucro_posicoes = CalcularLucroEA();
+   
+   CriarTexto("txt_compras_lbl", x+20, y+307, "Ordens Compradas:", Cor_Texto, 9, "Arial");
+   CriarTexto("txt_compras_val", x+135, y+306, IntegerToString(compras_ativas), clrWhite, 10, "Arial Black");
+
+   CriarTexto("txt_lote_lbl", x+20, y+326, "Lote Atual:", Cor_Texto, 9, "Arial");
+   CriarTexto("txt_lote_val", x+135, y+325, DoubleToString(lote_atual, 2), Cor_Header, 10, "Arial Black");
+
+   color cor_lucro = (lucro_posicoes >= 0) ? Cor_Positivo : Cor_Negativo;
+   CriarTexto("txt_lucro_lbl", x+20, y+345, "Lucro Flutuante:", Cor_Texto, 9, "Arial");
+   CriarTexto("txt_lucro_val", x+135, y+344, (lucro_posicoes>=0?"+":"") + "$" + DoubleToString(MathAbs(lucro_posicoes), 2), cor_lucro, 10, "Arial Black");
+
+   ChartRedraw(0);
+}
+
+double CalcularLucroEA()
+{
+   double lucro = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == Magic_Number)
+         lucro += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+   }
+   return lucro;
+}
+
+int ContarOrdens(ENUM_POSITION_TYPE tipo)
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == Magic_Number)
+         if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == tipo) count++;
+   }
+   return count;
+}
+
+void CriarObjetoPainel(string nome, int x, int y, int largura, int altura, color cor, int corner = CORNER_LEFT_UPPER)
+{
+   if(ObjectFind(0, nome) >= 0) ObjectDelete(0, nome);
+   ObjectCreate(0, nome, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, nome, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, nome, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, nome, OBJPROP_XSIZE, largura);
+   ObjectSetInteger(0, nome, OBJPROP_YSIZE, altura);
+   ObjectSetInteger(0, nome, OBJPROP_BGCOLOR, cor);
+   ObjectSetInteger(0, nome, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, nome, OBJPROP_CORNER, corner);
+   ObjectSetInteger(0, nome, OBJPROP_COLOR, cor);
+   ObjectSetInteger(0, nome, OBJPROP_BACK, false);
+   ObjectSetInteger(0, nome, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, nome, OBJPROP_HIDDEN, true);
+}
+
+void CriarTexto(string nome, int x, int y, string texto, color cor, int tamanho, string fonte = "Arial", int corner = CORNER_LEFT_UPPER)
+{
+   if(ObjectFind(0, nome) >= 0) ObjectDelete(0, nome);
+   ObjectCreate(0, nome, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, nome, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, nome, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, nome, OBJPROP_CORNER, corner);
+   ObjectSetInteger(0, nome, OBJPROP_COLOR, cor);
+   ObjectSetString(0, nome, OBJPROP_FONT, fonte);
+   ObjectSetInteger(0, nome, OBJPROP_FONTSIZE, tamanho);
+   ObjectSetString(0, nome, OBJPROP_TEXT, texto);
+   ObjectSetInteger(0, nome, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, nome, OBJPROP_HIDDEN, true);
+}
+
+void CriarBotao(string nome, int x, int y, int largura, int altura, string texto, color cor_fundo, color cor_texto)
+{
+   if(ObjectFind(0, nome) >= 0) ObjectDelete(0, nome);
+   ObjectCreate(0, nome, OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, nome, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, nome, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, nome, OBJPROP_XSIZE, largura);
+   ObjectSetInteger(0, nome, OBJPROP_YSIZE, altura);
+   ObjectSetInteger(0, nome, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, nome, OBJPROP_BGCOLOR, cor_fundo);
+   ObjectSetInteger(0, nome, OBJPROP_COLOR, cor_texto);
+   ObjectSetString(0, nome, OBJPROP_TEXT, texto);
+   ObjectSetString(0, nome, OBJPROP_FONT, "Arial Black");
+   ObjectSetInteger(0, nome, OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, nome, OBJPROP_STATE, false);
+   ObjectSetInteger(0, nome, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, nome, OBJPROP_HIDDEN, true);
+}
+
+void DeletarTodosObjetos()
+{
+   string objetos[] = {
+      "painel_fundo", "painel_header",
+      "card_conta", "card_mercado", "card_ops",
+      "sec_conta_titulo", "sec_mercado_titulo", "sec_ops_titulo",
+      "btn_reset", "txt_titulo", "txt_simbolo",
+      "txt_saldo_ini", "txt_saldo_atu", "txt_patrimonio", "txt_patrimonio_val", "txt_resultado", "txt_resultado_val",
+      "txt_ask_bid", "txt_rsi_lbl", "txt_rsi_val", "pill_status", "txt_status_val",
+      "txt_compras_lbl", "txt_compras_val", "txt_lote_lbl", "txt_lote_val", "txt_lucro_lbl", "txt_lucro_val",
+      "linha_banda_superior", "linha_banda_inferior"
+   };
+   for(int i = 0; i < ArraySize(objetos); i++) ObjectDelete(0, objetos[i]);
+   ChartRedraw();
+}
