@@ -1,0 +1,116 @@
+//+------------------------------------------------------------------+
+//| GridTrader_Neural_Hedge.mq5                                      |
+//| Grid comprador + MLP neural + hedge total em conta HEDGING      |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "4.10"
+#property description "EURUSD H1/H4 - grid comprador, MLP neural e hedge total"
+#include <Trade/Trade.mqh>
+
+input group "=== Execucao ==="
+input ENUM_TIMEFRAMES Timeframe_Estrategia = PERIOD_H1;
+input double Lote_Compra = 0.03;
+input int Distancia_Grid_Pontos = 500;
+input int Take_Profit_Pontos = 500;
+input int Max_Ordens_Compra = 20;
+input long Magic_Number = 123456;
+input int Desvio_Pontos = 10;
+
+input group "=== Lote progressivo ==="
+input bool Usar_Lote_Progressivo = false;
+input int Ordens_Para_Incrementar = 10;
+input double Incremento_Lote_Compra = 0.01;
+
+input group "=== Indicadores de entrada ==="
+input bool Usar_Filtro_RSI = true;
+input int RSI_Periodo = 14;
+input double RSI_Sobrevenda = 30.0;
+input int MA_Periodo = 200;
+input bool Usar_Filtro_MA = false;
+input int ATR_Periodo = 14;
+
+input group "=== Rede neural para hedge ==="
+input bool Usar_Rede_Neural = true;
+input string Arquivo_Pesos = "eurusd_mlp_weights.csv";
+input double Probabilidade_Ativar_Hedge = 0.75;
+input double Probabilidade_Fechar_Hedge = 0.45;
+input double Drawdown_Minimo_Hedge_USD = 100.0;
+input double Max_Lote_Hedge = 5.0;
+input int Minutos_Entre_Acoes_Hedge = 60;
+
+input group "=== Protecao ==="
+input bool Usar_Stop_Financeiro = true;
+input double Meta_Lucro_Sessao = 400.0;
+input double Stop_Loss_Sessao = 200.0;
+input double Margem_Livre_Minima_USD = 100.0;
+
+input group "=== Painel horizontal superior ==="
+input int Painel_X = 10;
+input int Painel_Y = 10;
+input int Painel_Largura = 1180;
+input int Painel_Altura = 68;
+input bool Mostrar_Botao_Reset = true;
+input color Cor_Fundo = C'11,18,28';
+input color Cor_Texto = C'240,246,252';
+input color Cor_Texto_Sec = C'139,148,158';
+input color Cor_Header = C'0,188,212';
+input color Cor_Positivo = C'46,204,113';
+input color Cor_Negativo = C'231,76,60';
+input color Cor_Alerta = C'241,196,15';
+
+CTrade trade;
+int h_rsi=INVALID_HANDLE,h_ma=INVALID_HANDLE,h_atr=INVALID_HANDLE,h_cci=INVALID_HANDLE,h_sto=INVALID_HANDLE,h_wpr=INVALID_HANDLE;
+double rsi=50,ma=0,atr=0,cci=0,sto=50,wpr=-50,prob=0;
+double session_equity=0;
+datetime last_bar=0,last_hedge_action=0;
+bool weights_loaded=false;
+const int IN=8,HID=6;
+// O compilador MQL5 exige dimensoes literais em arrays estaticos.
+double W1[8][6],B1[6],W2[6],B2=0;
+double NORM_MEAN[8],NORM_STD[8];
+string PFX="NGRID_";
+
+void Label(string id,int x,int y,string text,color c,int size=9){
+  if(ObjectFind(0,id)<0) ObjectCreate(0,id,OBJ_LABEL,0,0,0);
+  ObjectSetInteger(0,id,OBJPROP_CORNER,CORNER_LEFT_UPPER); ObjectSetInteger(0,id,OBJPROP_XDISTANCE,x); ObjectSetInteger(0,id,OBJPROP_YDISTANCE,y);
+  ObjectSetInteger(0,id,OBJPROP_COLOR,c); ObjectSetInteger(0,id,OBJPROP_FONTSIZE,size); ObjectSetString(0,id,OBJPROP_FONT,"Arial"); ObjectSetString(0,id,OBJPROP_TEXT,text); ObjectSetInteger(0,id,OBJPROP_HIDDEN,true);
+}
+void Panel(){
+  string bg=PFX+"BG"; if(ObjectFind(0,bg)<0) ObjectCreate(0,bg,OBJ_RECTANGLE_LABEL,0,0,0);
+  ObjectSetInteger(0,bg,OBJPROP_CORNER,CORNER_LEFT_UPPER); ObjectSetInteger(0,bg,OBJPROP_XDISTANCE,Painel_X); ObjectSetInteger(0,bg,OBJPROP_YDISTANCE,Painel_Y); ObjectSetInteger(0,bg,OBJPROP_XSIZE,Painel_Largura); ObjectSetInteger(0,bg,OBJPROP_YSIZE,Painel_Altura); ObjectSetInteger(0,bg,OBJPROP_BGCOLOR,Cor_Fundo); ObjectSetInteger(0,bg,OBJPROP_COLOR,Cor_Fundo); ObjectSetInteger(0,bg,OBJPROP_BACK,false); ObjectSetInteger(0,bg,OBJPROP_HIDDEN,true);
+  int y=Painel_Y+10; Label(PFX+"T",Painel_X+12,y,"NEURAL GRID HEDGE",Cor_Header,11); Label(PFX+"TF",Painel_X+170,y, _Symbol+" / "+EnumToString(Timeframe_Estrategia),Cor_Texto,9);
+  Label(PFX+"P",Painel_X+330,y,"NN hedge: "+DoubleToString(prob*100,1)+"%",prob>=Probabilidade_Ativar_Hedge?Cor_Negativo:Cor_Alerta,9);
+  Label(PFX+"O",Painel_X+495,y,"BUY "+IntegerToString(Count(POSITION_TYPE_BUY))+" / SELL "+IntegerToString(Count(POSITION_TYPE_SELL)),Cor_Texto,9);
+  Label(PFX+"V",Painel_X+660,y,"Vol B/S "+DoubleToString(Volume(POSITION_TYPE_BUY),2)+"/"+DoubleToString(Volume(POSITION_TYPE_SELL),2),Cor_Texto,9);
+  double pl=Profit(); Label(PFX+"PL",Painel_X+830,y,"P/L "+DoubleToString(pl,2),pl>=0?Cor_Positivo:Cor_Negativo,9);
+  double dd=AccountInfoDouble(ACCOUNT_EQUITY)-session_equity; Label(PFX+"DD",Painel_X+955,y,"Sessao "+DoubleToString(dd,2),dd>=0?Cor_Positivo:Cor_Negativo,9);
+  Label(PFX+"S",Painel_X+12,y+27,"RSI "+DoubleToString(rsi,1)+" | ATR "+DoubleToString(atr,_Digits)+" | CCI "+DoubleToString(cci,0)+" | MA "+DoubleToString(ma,_Digits),Cor_Texto_Sec,8);
+  Label(PFX+"H",Painel_X+660,y+27,Count(POSITION_TYPE_SELL)>0?"HEDGE TOTAL ATIVO":"HEDGE INATIVO",Count(POSITION_TYPE_SELL)>0?Cor_Negativo:Cor_Texto_Sec,9);
+  if(Mostrar_Botao_Reset) Label(PFX+"R",Painel_X+1020,y+27,"[ RESET ]",Cor_Alerta,9);
+  ChartRedraw(0);
+}
+
+double Read(int h){double a[1]; if(h==INVALID_HANDLE || CopyBuffer(h,0,1,1,a)<1) return EMPTY_VALUE; return a[0];}
+bool Indicators(){rsi=Read(h_rsi);ma=Read(h_ma);atr=Read(h_atr);cci=Read(h_cci);sto=Read(h_sto);wpr=Read(h_wpr); return rsi!=EMPTY_VALUE && ma!=EMPTY_VALUE && atr!=EMPTY_VALUE;}
+int Count(ENUM_POSITION_TYPE type){int n=0;for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t>0&&PositionGetString(POSITION_SYMBOL)==_Symbol&&PositionGetInteger(POSITION_MAGIC)==Magic_Number&&(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)==type)n++;}return n;}
+double Volume(ENUM_POSITION_TYPE type){double v=0;for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t>0&&PositionGetString(POSITION_SYMBOL)==_Symbol&&PositionGetInteger(POSITION_MAGIC)==Magic_Number&&(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)==type)v+=PositionGetDouble(POSITION_VOLUME);}return v;}
+double Profit(){double p=0;for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t>0&&PositionGetString(POSITION_SYMBOL)==_Symbol&&PositionGetInteger(POSITION_MAGIC)==Magic_Number)p+=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);}return p;}
+double VolNorm(double v){double mn=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN),st=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP),mx=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);if(st>0)v=MathFloor(v/st+1e-8)*st;return NormalizeDouble(MathMax(mn,MathMin(mx,v)),2);}
+
+bool LoadWeights(){int f=FileOpen(Arquivo_Pesos,FILE_READ|FILE_CSV|FILE_ANSI);if(f==INVALID_HANDLE){Print("Pesos nao encontrados: ",Arquivo_Pesos);return false;}int ni=(int)FileReadNumber(f),nh=(int)FileReadNumber(f),no=(int)FileReadNumber(f);if(ni!=IN||nh!=HID||no!=1){FileClose(f);return false;}for(int i=0;i<IN;i++)for(int j=0;j<HID;j++)W1[i][j]=FileReadNumber(f);for(int j=0;j<HID;j++)B1[j]=FileReadNumber(f);for(int j=0;j<HID;j++)W2[j]=FileReadNumber(f);B2=FileReadNumber(f);for(int i=0;i<IN;i++)NORM_MEAN[i]=FileReadNumber(f);for(int i=0;i<IN;i++){NORM_STD[i]=FileReadNumber(f);if(NORM_STD[i]==0)NORM_STD[i]=1;}FileClose(f);return true;}
+double Tanh(double x){if(x>20)return 1;if(x<-20)return -1;return (MathExp(2*x)-1)/(MathExp(2*x)+1);}
+double NN(){double x[8];double dd=MathMin(1.0,MathMax(0.0,-Profit()/MathMax(1.0,Stop_Loss_Sessao*3.0)));x[0]=(rsi-50)/50;x[1]=MathMax(-1.0,MathMin(1.0,cci/200));x[2]=(sto-50)/50;x[3]=(wpr+50)/50;x[4]=MathMax(-1.0,MathMin(1.0,(SymbolInfoDouble(_Symbol,SYMBOL_BID)-ma)/MathMax(_Point*100,atr*3)));x[5]=MathMin(1.0,atr/(_Point*100));x[6]=MathMin(1.0,Count(POSITION_TYPE_BUY)/MathMax(1.0,(double)Max_Ordens_Compra));x[7]=dd;for(int i=0;i<IN;i++)x[i]=(x[i]-NORM_MEAN[i])/NORM_STD[i];double y= B2;for(int j=0;j<HID;j++){double h=B1[j];for(int i=0;i<IN;i++)h+=x[i]*W1[i][j];y+=Tanh(h)*W2[j];}return 1.0/(1.0+MathExp(-y));}
+
+bool NewBar(){datetime t=iTime(_Symbol,Timeframe_Estrategia,0);if(t==0||t==last_bar)return false;last_bar=t;return true;}
+bool MarginOK(ENUM_ORDER_TYPE typ,double vol){double m=0,price=typ==ORDER_TYPE_BUY?SymbolInfoDouble(_Symbol,SYMBOL_ASK):SymbolInfoDouble(_Symbol,SYMBOL_BID);if(!OrderCalcMargin(typ,_Symbol,vol,price,m))return false;return AccountInfoDouble(ACCOUNT_MARGIN_FREE)-m>=Margem_Livre_Minima_USD;}
+double BuyLot(){double v=Lote_Compra;if(Usar_Lote_Progressivo&&Ordens_Para_Incrementar>0)v+=MathFloor(Count(POSITION_TYPE_BUY)/(double)Ordens_Para_Incrementar)*Incremento_Lote_Compra;return VolNorm(v);}
+bool Buy(){if(Count(POSITION_TYPE_BUY)>=Max_Ordens_Compra||!MarginOK(ORDER_TYPE_BUY,BuyLot()))return false;double p=SymbolInfoDouble(_Symbol,SYMBOL_ASK),tp=NormalizeDouble(p+Take_Profit_Pontos*_Point,_Digits);return trade.Buy(BuyLot(),_Symbol,0,0,tp,"GRID_BUY");}
+void Grid(){int n=Count(POSITION_TYPE_BUY);if(n==0){if((!Usar_Filtro_RSI||rsi<RSI_Sobrevenda)&&(!Usar_Filtro_MA||SymbolInfoDouble(_Symbol,SYMBOL_ASK)>ma))Buy();return;}double low=DBL_MAX;for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t>0&&PositionGetString(POSITION_SYMBOL)==_Symbol&&PositionGetInteger(POSITION_MAGIC)==Magic_Number&&(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)low=MathMin(low,PositionGetDouble(POSITION_PRICE_OPEN));}if(SymbolInfoDouble(_Symbol,SYMBOL_ASK)<=low-Distancia_Grid_Pontos*_Point)Buy();}
+void CloseType(ENUM_POSITION_TYPE typ){for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t>0&&PositionGetString(POSITION_SYMBOL)==_Symbol&&PositionGetInteger(POSITION_MAGIC)==Magic_Number&&(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)==typ)trade.PositionClose(t);}}
+void Hedge(){if(!Usar_Rede_Neural||!weights_loaded)return;if(TimeCurrent()-last_hedge_action<Minutos_Entre_Acoes_Hedge*60)return;double buy=Volume(POSITION_TYPE_BUY),sell=Volume(POSITION_TYPE_SELL);if(buy<=0){if(sell>0)CloseType(POSITION_TYPE_SELL);return;}if(sell>0&&prob<=Probabilidade_Fechar_Hedge){CloseType(POSITION_TYPE_SELL);last_hedge_action=TimeCurrent();return;}if(sell<=0&&prob>=Probabilidade_Ativar_Hedge&&-Profit()>=Drawdown_Minimo_Hedge_USD){double v=VolNorm(MathMin(buy,Max_Lote_Hedge));if(v>0&&MarginOK(ORDER_TYPE_SELL,v)&&trade.Sell(v,_Symbol,0,0,0,"NN_TOTAL_HEDGE"))last_hedge_action=TimeCurrent();}}
+bool SessionStop(){if(!Usar_Stop_Financeiro)return false;double r=AccountInfoDouble(ACCOUNT_EQUITY)-session_equity;if((Meta_Lucro_Sessao>0&&r>=Meta_Lucro_Sessao)||(Stop_Loss_Sessao>0&&r<=-MathAbs(Stop_Loss_Sessao))){CloseType(POSITION_TYPE_BUY);CloseType(POSITION_TYPE_SELL);session_equity=AccountInfoDouble(ACCOUNT_EQUITY);last_bar=0;return true;}return false;}
+void Reset(){CloseType(POSITION_TYPE_BUY);CloseType(POSITION_TYPE_SELL);session_equity=AccountInfoDouble(ACCOUNT_EQUITY);last_bar=0;}
+int OnInit(){trade.SetExpertMagicNumber(Magic_Number);trade.SetDeviationInPoints(Desvio_Pontos);h_rsi=iRSI(_Symbol,Timeframe_Estrategia,RSI_Periodo,PRICE_CLOSE);h_ma=iMA(_Symbol,Timeframe_Estrategia,MA_Periodo,0,MODE_SMA,PRICE_CLOSE);h_atr=iATR(_Symbol,Timeframe_Estrategia,ATR_Periodo);h_cci=iCCI(_Symbol,Timeframe_Estrategia,20,PRICE_TYPICAL);h_sto=iStochastic(_Symbol,Timeframe_Estrategia,14,3,3,MODE_SMA,STO_LOWHIGH);h_wpr=iWPR(_Symbol,Timeframe_Estrategia,14);if(h_rsi==INVALID_HANDLE||h_ma==INVALID_HANDLE||h_atr==INVALID_HANDLE)return INIT_FAILED;session_equity=AccountInfoDouble(ACCOUNT_EQUITY);weights_loaded=LoadWeights();Panel();return INIT_SUCCEEDED;}
+void OnTick(){Indicators();prob=weights_loaded?NN():0;Panel();if(SessionStop())return;if(NewBar()){Grid();Hedge();}}
+void OnChartEvent(const int id,const long &l,const double &d,const string &s){if(id==CHARTEVENT_OBJECT_CLICK&&s==PFX+"R")Reset();}
+void OnDeinit(const int reason){for(int i=0;i<6;i++){} if(h_rsi!=INVALID_HANDLE)IndicatorRelease(h_rsi);if(h_ma!=INVALID_HANDLE)IndicatorRelease(h_ma);if(h_atr!=INVALID_HANDLE)IndicatorRelease(h_atr);if(h_cci!=INVALID_HANDLE)IndicatorRelease(h_cci);if(h_sto!=INVALID_HANDLE)IndicatorRelease(h_sto);if(h_wpr!=INVALID_HANDLE)IndicatorRelease(h_wpr);ObjectsDeleteAll(0,PFX);}
